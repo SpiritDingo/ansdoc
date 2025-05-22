@@ -149,11 +149,13 @@ playbook.yml
 ansible-playbook -i inventory playbook.yml
 ```
 Проверить ключи (dry-run):
-
+```
 ansible-playbook -i inventory playbook.yml --tags debug --check
+```
 Строгий режим (оставить только указанные ключи):
-
+```
 strict_mode: true
+```
 5. Безопасность
 Всегда проверяйте добавляемые SSH-ключи
 Используйте ansible-vault для защиты sensitive data
