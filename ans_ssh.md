@@ -15,7 +15,7 @@ roles/ssh_key_management/
 ```
 
 1. defaults/main.yml
-```yml
+```YAML
 ---
 # Пользователь, для которого управляем ключами
 ssh_user: "{{ ansible_user }}"
