@@ -157,7 +157,9 @@ ansible-playbook -i inventory playbook.yml --tags debug --check
 strict_mode: true
 ```
 5. Безопасность
+
 Всегда проверяйте добавляемые SSH-ключи
 Используйте ansible-vault для защиты sensitive data
-Рекомендуется использовать strict_mode: true для production-серверов
+Рекомендуется использовать
+```strict_mode: true``` для production-серверов
 Эта роль обеспечивает полный цикл управления SSH-ключами и может быть легко интегрирована в ваш Ansible workflow.
