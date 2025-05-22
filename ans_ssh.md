@@ -13,7 +13,9 @@ roles/ssh_key_management/
 │   └── authorized_keys.j2  # шаблон для authorized_keys (опционально)
 └── README.md
 ```
+
 1. defaults/main.yml
+```yml
 ---
 # Пользователь, для которого управляем ключами
 ssh_user: "{{ ansible_user }}"
@@ -30,6 +32,7 @@ strict_mode: false
 # Права для .ssh директории и authorized_keys
 ssh_dir_mode: "0700"
 authorized_keys_mode: "0600"
+```
 2. tasks/main.yml
 ---
 - name: Ensure .ssh directory exists
