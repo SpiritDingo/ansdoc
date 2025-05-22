@@ -34,6 +34,7 @@ ssh_dir_mode: "0700"
 authorized_keys_mode: "0600"
 ```
 2. tasks/main.yml
+```YAML
 ---
 - name: Ensure .ssh directory exists
   ansible.builtin.file:
@@ -109,6 +110,7 @@ authorized_keys_mode: "0600"
     msg: |
       SSH keys for {{ ssh_user }}:
       {{ final_keys | join('\n      ') }}
+```
 3. Пример использования роли
 playbook.yml
 ---
