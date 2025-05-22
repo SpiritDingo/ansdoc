@@ -145,11 +145,11 @@ playbook.yml
 ```
 Примеры запуска
 Добавить ключи:
-```bash
+```BASH
 ansible-playbook -i inventory playbook.yml
 ```
 Проверить ключи (dry-run):
-```
+```BASH
 ansible-playbook -i inventory playbook.yml --tags debug --check
 ```
 Строгий режим (оставить только указанные ключи):
