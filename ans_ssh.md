@@ -112,6 +112,7 @@ authorized_keys_mode: "0600"
       {{ final_keys | join('\n      ') }}
 ```
 3. Пример использования роли
+```YAML
 playbook.yml
 ---
 - hosts: all
@@ -126,10 +127,11 @@ playbook.yml
         ssh_public_keys_to_remove:
           - "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC0... olduser@example.com"
         strict_mode: false
+```
 4. Дополнительные возможности
 Проверка ключей без изменений
 Для проверки текущих ключей без внесения изменений:
-
+```YAML
 - hosts: all
   tasks:
     - name: Check current SSH keys
@@ -140,10 +142,12 @@ playbook.yml
     - name: Display current keys
       ansible.builtin.debug:
         var: ssh_keys.stdout_lines
+```
 Примеры запуска
 Добавить ключи:
-
+```
 ansible-playbook -i inventory playbook.yml
+```
 Проверить ключи (dry-run):
 
 ansible-playbook -i inventory playbook.yml --tags debug --check
