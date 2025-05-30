@@ -599,3 +599,158 @@ failed_when: >
    ```
 
 Эти изменения сделают вашу роль более устойчивой к ошибкам подключения к Active Directory и помогут точно диагностировать проблемы при их возникновении.
+
+
+
+Ошибка **"No logon servers are currently available to service the logon request"** при создании `keytab` файла указывает на проблемы с подключением к контроллерам домена. Давайте разберём решение поэтапно.
+
+---
+
+## 🔧 Исправленная Ansible-роль с обработкой ошибок
+
+### 1. **Проверка базовых требований перед созданием keytab**
+```yaml
+- name: Проверка доступности контроллеров домена
+  command: ping -c 2 {{ ad_servers.split(' ')|first }}
+  register: ping_check
+  failed_when: ping_check.rc != 0
+  changed_when: false
+  tags: keytab
+```
+
+### 2. **Обновлённая задача создания keytab с повторами и обработкой ошибок**
+```yaml
+- name: Создание keytab файла (с повторами)
+  vars:
+    retries: 3
+    delay: 10
+  until: keytab_result.rc == 0
+  retries: "{{ retries }}"
+  delay: "{{ delay }}"
+  register: keytab_result
+  block:
+    - name: Попытка создания keytab
+      command: net ads keytab create -k
+      register: keytab_result
+      no_log: true
+      changed_when: keytab_result.rc == 0
+      failed_when: False  # Игнорируем ошибки для until
+
+    - name: Проверка ошибки "No logon servers"
+      fail:
+        msg: |
+          Критическая ошибка: контроллеры домена недоступны!
+          Проверьте:
+          1. Сеть и DNS
+          2. Время (разница с DC должна быть < 5 мин)
+          3. Брандмауэр (порты 88, 389, 445)
+      when: "'No logon servers' in (keytab_result.stderr|default(''))"
+  tags: keytab
+```
+
+### 3. **Глубокая проверка после создания keytab**
+```yaml
+- name: Проверка содержимого keytab
+  command: klist -ke /etc/krb5.keytab
+  register: keytab_verify
+  changed_when: false
+  failed_when: 
+    - keytab_verify.rc != 0
+    - "'Principal' not in keytab_verify.stdout"
+  tags: keytab
+```
+
+---
+
+## 🕵️‍♂️ Дополнительная диагностика (добавьте в роль)
+
+```yaml
+- name: Диагностика Kerberos
+  block:
+    - name: Проверка времени
+      command: date && chronyc tracking
+      register: time_check
+      changed_when: false
+
+    - name: Проверка DNS
+      command: host -t srv _kerberos._tcp.{{ ad_domain }}
+      register: dns_check
+      changed_when: false
+
+    - name: Проверка портов KDC
+      command: nc -zv {{ ad_servers.split(' ')|first }} 88
+      register: kdc_port_check
+      ignore_errors: yes
+  tags: debug
+```
+
+---
+
+## 🛠️ Ручные команды для диагностики
+
+Если ошибка сохраняется, выполните на целевом сервере:
+
+1. **Проверка синхронизации времени**:
+   ```bash
+   chronyc sources && chronyc tracking
+   ```
+
+2. **Проверка DNS-записей**:
+   ```bash
+   host -t srv _ldap._tcp.{{ ad_domain }}
+   ```
+
+3. **Тестовый запрос билета Kerberos**:
+   ```bash
+   echo "PASSWORD" | kinit admin@DOMAIN.COM
+   klist
+   ```
+
+4. **Ручное создание keytab** (для теста):
+   ```bash
+   net ads keytab create -k -d 3
+   ```
+
+---
+
+## 🔄 Альтернативный метод создания keytab
+
+Если `net ads` не работает, попробуйте через `ktutil`:
+
+```yaml
+- name: Создание keytab вручную
+  command: |
+    ktutil <<EOF
+    addent -password -p {{ ad_admin_user }}@{{ ad_realm }} -k 1 -e aes256-cts-hmac-sha1-96
+    wkt /etc/krb5.keytab
+    EOF
+  args:
+    stdin: "{{ ad_admin_password }}"
+  no_log: true
+  when: keytab_result is defined and keytab_result.rc != 0
+  tags: keytab
+```
+
+---
+
+## ✅ Итоговые проверки
+
+Добавьте в конец роли:
+
+```yaml
+- name: Итоговая проверка
+  command: realm list
+  register: realm_status
+  changed_when: false
+  failed_when: 
+    - "'active-directory' not in realm_status.stdout"
+    - "'{{ ad_domain }}' not in realm_status.stdout"
+```
+
+**Главные причины ошибки**:
+1. 🔄 **Время рассинхронизировано** (проверьте NTP)
+2. 🌐 **Проблемы с сетью/DNS** (проверьте `ping` и `nslookup`)
+3. 🔥 **Брандмауэр блокирует порты** (88/Kerberos, 389/LDAP)
+4. 🔑 **Неверные учётные данные** (проверьте логин/пароль)
+
+После исправлений роль должна стабильно создавать keytab-файл. Для сложных случаев используйте ручную диагностику через `kinit` и `klist`.
