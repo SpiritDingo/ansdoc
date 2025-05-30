@@ -237,3 +237,104 @@ required_packages:
 3. SSSD конфигурационный файл устанавливается с правами 0600
 
 Для более полного решения можно добавить обработку различных ошибок и дополнительные проверки в зависимости от требований вашего окружения.
+
+Ошибка возникает потому, что в вашей роли есть задача по настройке `chrony`, но отсутствует шаблон `chrony.conf.j2`. Давайте исправим это.
+
+## Исправленная роль
+
+### 1. Создайте недостающий шаблон `templates/chrony.conf.j2`:
+
+```jinja2
+# Ansible managed
+
+pool {{ ad_servers.split(' ')|first }} iburst
+driftfile /var/lib/chrony/drift
+makestep 1.0 3
+rtcsync
+logdir /var/log/chrony
+```
+
+### 2. Обновите `tasks/main.yml` (раздел NTP):
+
+Замените блок NTP на этот исправленный вариант:
+
+```yaml
+- name: Настройка NTP для синхронизации времени с AD
+  block:
+    - name: Установка chrony
+      dnf:
+        name: chrony
+        state: present
+    
+    - name: Настройка chrony для использования AD серверов
+      template:
+        src: chrony.conf.j2
+        dest: /etc/chrony.conf
+        owner: root
+        group: root
+        mode: 0644
+      notify: restart chronyd
+    
+    - name: Запуск и включение chronyd
+      service:
+        name: chronyd
+        state: started
+        enabled: yes
+    
+    - name: Проверка синхронизации времени
+      command: chronyc tracking
+      register: chrony_result
+      changed_when: false
+      failed_when: >
+        "'Leap status     : Normal' not in chrony_result.stdout or
+         'System time' not in chrony_result.stdout"
+  when: configure_ntp|default(true)
+  tags: ntp
+```
+
+### 3. Добавьте обработчик (если его нет):
+
+Создайте файл `handlers/main.yml`:
+
+```yaml
+---
+- name: restart chronyd
+  service:
+    name: chronyd
+    state: restarted
+```
+
+## Альтернативное решение
+
+Если вам не нужна настройка NTP через chrony, вы можете просто отключить эту часть роли:
+
+1. В вашем playbook добавьте:
+```yaml
+vars:
+  configure_ntp: false
+```
+
+2. Или удалите весь блок NTP из `tasks/main.yml`
+
+## Полное объяснение ошибки
+
+Ошибка `chrony.conf.j2` возникает потому что:
+1. В задаче используется директиву `template` с указанием несуществующего файла
+2. Ansible не может найти шаблон в директории `templates/` роли
+
+Теперь, после добавления файла шаблона `chrony.conf.j2`, ошибка должна исчезнуть.
+
+## Дополнительные улучшения
+
+Для большей надежности вы можете добавить проверку доступности NTP серверов перед настройкой:
+
+```yaml
+- name: Проверка доступности NTP серверов
+  wait_for:
+    host: "{{ item }}"
+    port: 123
+    timeout: 5
+  loop: "{{ ad_servers.split(' ') }}"
+  when: configure_ntp|default(true)
+  tags: ntp
+```
