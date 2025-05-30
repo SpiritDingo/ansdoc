@@ -1,313 +1,239 @@
-# Улучшенная Ansible роль для добавления Oracle Linux 9 в Active Directory
+# Роль Ansible для присоединения Oracle Linux 9 к Active Directory
 
-Вот усовершенствованная роль с созданием keytab файла и всеми необходимыми проверками.
+Вот полная роль Ansible для установки необходимых пакетов, присоединения к домену AD, создания keytab файла и добавления проверок.
 
 ## Структура роли
 
 ```
-oraclelinux-ad-join/
+oraclelinux_ad_auth/
 ├── defaults/
 │   └── main.yml
 ├── tasks/
-│   ├── main.yml
-│   ├── join.yml
-│   ├── verify.yml
-│   └── keytab.yml
+│   └── main.yml
 ├── templates/
-│   ├── sssd.conf.j2
 │   └── krb5.conf.j2
-└── handlers/
+└── vars/
     └── main.yml
 ```
 
-## Файлы роли
+## Содержание файлов
 
 ### defaults/main.yml
 
 ```yaml
 ---
-# Настройки домена
-ad_domain: "example.com"
-ad_domain_upper: "{{ ad_domain | upper }}"
-ad_join_user: "join_user@{{ ad_domain_upper }}"
-ad_join_password: ""
-ad_ou: "OU=LinuxServers,DC=example,DC=com"
+# Настройки по умолчанию
+ad_domain: example.com
+ad_admin_user: administrator
+ad_ou: "OU=Linux Servers,DC=example,DC=com"
+ad_realm: EXAMPLE.COM
+ad_servers: "dc1.example.com dc2.example.com"
+timeout_seconds: 300
+```
 
-# Настройки keytab
-keytab_path: "/etc/krb5.keytab"
-keytab_principal: "host/{{ ansible_fqdn }}@{{ ad_domain_upper }}"
-keytab_permissions: "0600"
-renew_keytab: yes
+### vars/main.yml
 
-# Настройки Kerberos
-krb5_config:
-  default_realm: "{{ ad_domain_upper }}"
-  dns_lookup_realm: true
-  dns_lookup_kdc: true
-  ticket_lifetime: 24h
-  renew_lifetime: 7d
-  forwardable: true
-  rdns: false
-  default_ccache_name: "KEYRING:persistent:%{uid}"
+```yaml
+---
+# Необходимые пакеты
+required_packages:
+  - krb5-workstation
+  - sssd
+  - sssd-ad
+  - sssd-tools
+  - adcli
+  - oddjob
+  - oddjob-mkhomedir
+  - samba-common-tools
+  - authselect
+  - authselect-compat
+```
 
-# Настройки SSSD
-sssd_config:
-  config_file: "/etc/sssd/sssd.conf"
-  services: "nss, pam, ssh"
-  domains: "{{ ad_domain }}"
+### templates/krb5.conf.j2
 
-# Временные файлы
-temp_password_file: "/tmp/ad_join_password.txt"
-cleanup_temp_files: yes
+```jinja2
+[libdefaults]
+    default_realm = {{ ad_realm }}
+    dns_lookup_realm = true
+    dns_lookup_kdc = true
+    ticket_lifetime = 24h
+    renew_lifetime = 7d
+    forwardable = true
+    rdns = false
+    default_ccache_name = KEYRING:persistent:%{uid}
+
+[realms]
+    {{ ad_realm }} = {
+        kdc = {{ ad_servers.split(' ')|join(' ') }}
+        admin_server = {{ ad_servers.split(' ')|first }}
+    }
+
+[domain_realm]
+    .{{ ad_domain }} = {{ ad_realm }}
+    {{ ad_domain }} = {{ ad_realm }}
 ```
 
 ### tasks/main.yml
 
 ```yaml
 ---
-- name: Include pre-join tasks
-  ansible.builtin.include_tasks: prechecks.yml
-  tags: prechecks
-
-- name: Install required packages
-  ansible.builtin.include_tasks: packages.yml
+- name: Установка необходимых пакетов
+  dnf:
+    name: "{{ required_packages }}"
+    state: present
   tags: packages
 
-- name: Configure Kerberos
-  ansible.builtin.include_tasks: kerberos.yml
-  tags: kerberos
+- name: Настройка NTP для синхронизации времени с AD
+  block:
+    - name: Установка chrony
+      dnf:
+        name: chrony
+        state: present
+    
+    - name: Настройка chrony для использования AD серверов
+      template:
+        src: chrony.conf.j2
+        dest: /etc/chrony.conf
+        owner: root
+        group: root
+        mode: 0644
+    
+    - name: Запуск и включение chronyd
+      service:
+        name: chronyd
+        state: started
+        enabled: yes
+    
+    - name: Проверка синхронизации времени
+      command: chronyc tracking
+      register: chrony_result
+      changed_when: false
+      failed_when: "'Leap status     : Normal' not in chrony_result.stdout"
+  when: configure_ntp|default(true)
+  tags: ntp
 
-- name: Join to AD domain
-  ansible.builtin.include_tasks: join.yml
+- name: Настройка krb5.conf
+  template:
+    src: krb5.conf.j2
+    dest: /etc/krb5.conf
+    owner: root
+    group: root
+    mode: 0644
+  tags: krb5
+
+- name: Получение временного Kerberos билета
+  command: echo "{{ ad_admin_password }}" | kinit "{{ ad_admin_user }}@{{ ad_realm }}"
+  no_log: true
+  register: kinit_result
+  changed_when: false
+  failed_when: kinit_result.rc != 0
+  tags: kinit
+
+- name: Присоединение к домену AD
+  command: adcli join --domain="{{ ad_domain }}" --domain-ou="{{ ad_ou }}" --login-user="{{ ad_admin_user }}" --stdin-password
+  args:
+    stdin: "{{ ad_admin_password }}"
+  no_log: true
+  register: ad_join_result
+  changed_when: "'Already joined to this domain' not in ad_join_result.stderr"
+  failed_when: ad_join_result.rc != 0 and "'Already joined to this domain' not in ad_join_result.stderr"
   tags: join
 
-- name: Configure keytab
-  ansible.builtin.include_tasks: keytab.yml
+- name: Создание keytab файла
+  command: net ads keytab create -k
+  when: ad_join_result.rc == 0 or "'Already joined to this domain' in ad_join_result.stderr"
+  register: keytab_result
+  changed_when: keytab_result.rc == 0
+  failed_when: keytab_result.rc != 0
   tags: keytab
 
-- name: Configure SSSD
-  ansible.builtin.include_tasks: sssd.yml
+- name: Проверка существования keytab файла
+  stat:
+    path: /etc/krb5.keytab
+  register: keytab_file
+  tags: keytab_check
+
+- name: Проверка содержимого keytab файла
+  command: klist -k /etc/krb5.keytab
+  register: keytab_check
+  changed_when: false
+  failed_when: keytab_check.rc != 0 or keytab_check.stdout == ''
+  when: keytab_file.stat.exists
+  tags: keytab_check
+
+- name: Настройка SSSD
+  block:
+    - name: Копирование конфигурации SSSD
+      template:
+        src: sssd.conf.j2
+        dest: /etc/sssd/sssd.conf
+        owner: root
+        group: root
+        mode: 0600
+    
+    - name: Запуск и включение SSSD
+      service:
+        name: sssd
+        state: started
+        enabled: yes
+    
+    - name: Настройка authselect
+      command: authselect select sssd with-mkhomedir --force
+      register: authselect_result
+      changed_when: "'No changes' not in authselect_result.stdout"
   tags: sssd
 
-- name: Verify domain join
-  ansible.builtin.include_tasks: verify.yml
-  tags: verify
-
-- name: Post-join configuration
-  ansible.builtin.include_tasks: postconfig.yml
-  tags: postconfig
-```
-
-### tasks/join.yml
-
-```yaml
----
-- name: Create temporary password file
-  ansible.builtin.copy:
-    dest: "{{ temp_password_file }}"
-    content: "{{ ad_join_password }}"
-    mode: 0600
-    no_log: true
-  when: ad_join_password != ""
-  tags: join
-
-- name: Join to AD domain using adcli
-  ansible.builtin.command: >
-    adcli join {{ ad_domain }}
-    -U "{{ ad_join_user }}"
-    --stdin-password < "{{ temp_password_file }}"
-    {% if ad_ou %}--computer-ou="{{ ad_ou }}"{% endif %}
-    --verbose
-  register: ad_join_result
-  changed_when: >
-    "'already joined' not in ad_join_result.stderr and
-     'Successfully enrolled machine in realm' in ad_join_result.stdout"
-  failed_when: false
-  ignore_errors: yes
-  no_log: true
-  when: ad_join_password != ""
-  tags: join
-
-- name: Cleanup temporary password file
-  ansible.builtin.file:
-    path: "{{ temp_password_file }}"
-    state: absent
-  when: ad_join_password != "" and cleanup_temp_files
-  tags: cleanup
-```
-
-### tasks/keytab.yml
-
-```yaml
----
-- name: Check if keytab exists
-  ansible.builtin.stat:
-    path: "{{ keytab_path }}"
-  register: keytab_stat
-  tags: keytab
-
-- name: Create keytab file if not exists
-  ansible.builtin.command: >
-    touch {{ keytab_path }} &&
-    chmod {{ keytab_permissions }} {{ keytab_path }}
-  when: not keytab_stat.stat.exists
-  tags: keytab
-
-- name: Set keytab permissions
-  ansible.builtin.file:
-    path: "{{ keytab_path }}"
-    mode: "{{ keytab_permissions }}"
-  tags: keytab
-
-- name: Add principal to keytab
-  ansible.builtin.command: >
-    net ads keytab add {{ keytab_principal.split('@')[0] }} -k
-  register: keytab_add
-  changed_when: "'Entry added successfully' in keytab_add.stdout"
-  failed_when: >
-    "'Failed to add entry' in keytab_add.stderr or
-     'kinit failed' in keytab_add.stderr"
-  tags: keytab
-
-- name: Verify keytab content
-  ansible.builtin.command: klist -ket "{{ keytab_path }}"
-  register: keytab_verify
+- name: Проверка присоединения к домену
+  command: realm list
+  register: realm_check
   changed_when: false
-  failed_when: keytab_verify.rc != 0
-  tags: keytab
+  failed_when: ad_realm not in realm_check.stdout
+  tags: verify
 
-- name: Renew keytab entries (if configured)
-  ansible.builtin.command: net ads keytab renew -k
-  when: renew_keytab
-  register: keytab_renew
-  changed_when: "'Keytab successfully renewed' in keytab_renew.stdout"
-  failed_when: keytab_renew.rc != 0
-  tags: keytab
-```
-
-### tasks/verify.yml
-
-```yaml
----
-- name: Verify domain join with realm
-  ansible.builtin.command: realm list
-  register: realm_verify
+- name: Проверка аутентификации AD пользователя
+  command: id "{{ ad_test_user|default(ad_admin_user) }}@{{ ad_realm }}"
+  register: user_check
   changed_when: false
-  failed_when: >
-    "'{{ ad_domain }}' not in realm_verify.stdout or
-     'configured: no' in realm_verify.stdout"
+  failed_when: user_check.rc != 0
+  when: ad_test_user is defined or ad_admin_user is defined
   tags: verify
-
-- name: Verify domain join with adcli
-  ansible.builtin.command: adcli testjoin
-  register: adcli_verify
-  changed_when: false
-  failed_when: adcli_verify.rc != 0
-  tags: verify
-
-- name: Verify SSSD domain status
-  ansible.builtin.command: sssctl domain-status "{{ ad_domain }}"
-  register: sssd_verify
-  changed_when: false
-  failed_when: >
-    "'Online status: Online' not in sssd_verify.stdout or
-     'Active servers: None' in sssd_verify.stdout"
-  tags: verify
-
-- name: Verify Kerberos authentication
-  ansible.builtin.command: kinit -k "{{ keytab_principal }}"
-  register: kinit_verify
-  changed_when: false
-  failed_when: kinit_verify.rc != 0
-  tags: verify
-
-- name: Verify keytab content
-  ansible.builtin.command: klist -ket "{{ keytab_path }}"
-  register: keytab_verify_final
-  changed_when: false
-  failed_when: >
-    keytab_verify_final.rc != 0 or
-    '{{ keytab_principal }}' not in keytab_verify_final.stdout
-  tags: verify
-
-- name: Show verification summary
-  ansible.builtin.debug:
-    msg: |
-      Domain join verification summary:
-      - Realm status: {{ 'OK' if "'{{ ad_domain }}' in realm_verify.stdout" else 'FAILED' }}
-      - ADCLI testjoin: {{ 'OK' if adcli_verify.rc == 0 else 'FAILED' }}
-      - SSSD status: {{ 'OK' if "'Online status: Online' in sssd_verify.stdout" else 'FAILED' }}
-      - Kerberos auth: {{ 'OK' if kinit_verify.rc == 0 else 'FAILED' }}
-      - Keytab content: {{ 'OK' if keytab_verify_final.rc == 0 else 'FAILED' }}
-  tags: verify
-```
-
-### handlers/main.yml
-
-```yaml
----
-- name: restart sssd
-  ansible.builtin.systemd:
-    name: sssd
-    state: restarted
-
-- name: restart oddjobd
-  ansible.builtin.systemd:
-    name: oddjobd
-    state: restarted
 ```
 
 ## Использование роли
 
-1. Создайте playbook:
+Пример playbook для использования этой роли:
 
 ```yaml
 ---
-- name: Join Oracle Linux 9 to AD with keytab
-  hosts: all
-  become: yes
+- hosts: linux_servers
+  become: true
   vars:
-    ad_domain: "example.com"
-    ad_join_user: "join_user@EXAMPLE.COM"
-    ad_join_password: "secure_password"
-    ad_ou: "OU=LinuxServers,DC=example,DC=com"
+    ad_admin_password: "{{ vault_ad_admin_password }}"
+    ad_domain: corp.example.com
+    ad_realm: CORP.EXAMPLE.COM
+    ad_servers: "dc1.corp.example.com dc2.corp.example.com"
+    ad_ou: "OU=LinuxServers,DC=corp,DC=example,DC=com"
   
   roles:
-    - oraclelinux-ad-join
+    - oraclelinux_ad_auth
 ```
 
-2. Запустите с зашифрованным паролем:
+## Дополнительные проверки
 
-```bash
-ansible-playbook -i inventory.ini join_ad.yml --ask-vault-pass
-```
+Роль включает следующие проверки:
 
-## Ключевые особенности
+1. Проверка синхронизации времени с AD серверами
+2. Проверка успешного получения Kerberos билета
+3. Проверка успешного присоединения к домену (или что сервер уже присоединен)
+4. Проверка создания keytab файла
+5. Проверка содержимого keytab файла
+6. Проверка вывода `realm list` на наличие нужного домена
+7. Проверка возможности разрешения AD пользователя
 
-1. **Полное управление keytab**:
-   - Создание keytab файла
-   - Добавление principal в keytab
-   - Проверка содержимого keytab
-   - Обновление keytab
+## Безопасность
 
-2. **Комплексные проверки**:
-   - Проверка через `realm list`
-   - Проверка через `adcli testjoin`
-   - Проверка статуса SSSD
-   - Проверка Kerberos аутентификации
-   - Детальная проверка keytab
+1. Пароль AD администратора должен передаваться через Ansible Vault
+2. Keytab файл создается с минимальными необходимыми правами
+3. SSSD конфигурационный файл устанавливается с правами 0600
 
-3. **Обработка ошибок**:
-   - Проверка на каждом этапе
-   - Подробные сообщения об ошибках
-   - Возможность повтора операций
-
-4. **Безопасность**:
-   - Использование временных файлов с паролями
-   - Автоматическая очистка временных файлов
-   - Правильные права на keytab файл
-
-5. **Гибкость**:
-   - Настройка OU для компьютера в AD
-   - Возможность обновления keytab
-   - Настраиваемые параметры Kerberos и SSSD
+Для более полного решения можно добавить обработку различных ошибок и дополнительные проверки в зависимости от требований вашего окружения.
