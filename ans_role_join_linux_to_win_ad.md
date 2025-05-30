@@ -338,3 +338,90 @@ vars:
   when: configure_ntp|default(true)
   tags: ntp
 ```
+
+Эта ошибка возникает, когда вы пытаетесь отобразить или использовать результат задачи, которая была помечена как `no_log: true`, но при этом пытаетесь использовать её вывод для проверки условий (`changed_when`, `failed_when` и т.д.).
+
+Давайте исправим проблему в вашей роли:
+
+## Основные исправления
+
+1. **В задаче kinit**:
+```yaml
+- name: Получение временного Kerberos билета
+  command: echo "{{ ad_admin_password }}" | kinit "{{ ad_admin_user }}@{{ ad_realm }}"
+  no_log: true
+  register: kinit_result
+  changed_when: false
+  # Изменяем failed_when чтобы не проверять вывод (который скрыт no_log)
+  failed_when: kinit_result.rc != 0
+```
+
+2. **В задаче присоединения к домену**:
+```yaml
+- name: Присоединение к домену AD
+  command: adcli join --domain="{{ ad_domain }}" --domain-ou="{{ ad_ou }}" --login-user="{{ ad_admin_user }}" --stdin-password
+  args:
+    stdin: "{{ ad_admin_password }}"
+  no_log: true
+  register: ad_join_result
+  # Изменяем проверки чтобы не полагаться на stdout/stderr
+  changed_when: ad_join_result.rc == 0
+  failed_when: >
+    ad_join_result.rc != 0 and
+    ad_join_result.rc != 5  # RC 5 обычно означает "уже присоединен"
+```
+
+## Полное исправление для всех проблемных задач
+
+Вот полный исправленный вариант проблемных задач:
+
+```yaml
+- name: Получение временного Kerberos билета
+  command: echo "{{ ad_admin_password }}" | kinit "{{ ad_admin_user }}@{{ ad_realm }}"
+  no_log: true
+  register: kinit_result
+  changed_when: false
+  failed_when: kinit_result.rc != 0
+  tags: kinit
+
+- name: Присоединение к домену AD
+  command: adcli join --domain="{{ ad_domain }}" --domain-ou="{{ ad_ou }}" --login-user="{{ ad_admin_user }}" --stdin-password
+  args:
+    stdin: "{{ ad_admin_password }}"
+  no_log: true
+  register: ad_join_result
+  changed_when: ad_join_result.rc == 0
+  failed_when: >
+    ad_join_result.rc != 0 and
+    ad_join_result.rc != 5  # 5 обычно означает "уже присоединен"
+  tags: join
+
+- name: Проверка присоединения к домену (безопасная альтернатива)
+  command: realm list
+  register: realm_check
+  changed_when: false
+  failed_when: >
+    ad_realm not in realm_check.stdout or
+    "configured: kerberos-member" not in realm_check.stdout
+  tags: verify
+```
+
+## Почему это работает лучше?
+
+1. Мы больше не полагаемся на анализ stdout/stderr в задачах с `no_log: true`
+2. Используем только коды возврата (rc) для определения успеха/ошибки
+3. Для проверки присоединения используем отдельную безопасную задачу `realm list`
+4. Учитываем специальные коды возврата (например, 5 для "уже присоединен")
+
+## Дополнительные рекомендации
+
+1. Для отладки вы можете временно отключить `no_log: true` при тестировании роли
+2. Добавьте обработку известных кодов ошибок:
+```yaml
+failed_when: >
+  ad_join_result.rc not in [0, 5]  # 0 - успех, 5 - уже присоединен
+```
+
+3. Для более сложных проверок используйте отдельные задачи без `no_log`
+
+Эти изменения должны решить проблему с ошибкой `the output has been due to the fact that 'no_log: true' was specified` при сохранении безопасности (не показывая пароли в логах).
