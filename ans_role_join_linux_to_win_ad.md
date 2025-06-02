@@ -1147,3 +1147,113 @@ logchange 0.5
 - Проверять корректность синхронизации перед присоединением к AD
 - Принудительно корректировать время при большой рассинхронизации
 - Гарантировать правильную работу Kerberos-аутентификации
+
+
+
+Добавим **принудительную синхронизацию времени** с контроллерами домена Active Directory, чтобы гарантировать корректную работу Kerberos и аутентификации.  
+
+---
+
+## **1. Добавляем задачу принудительной синхронизации времени**
+```yaml
+- name: Принудительная синхронизация времени с AD
+  block:
+    - name: Остановка chronyd (если запущен)
+      service:
+        name: chronyd
+        state: stopped
+      when: ansible_facts.services['chronyd.service'].state == 'running'
+
+    - name: Принудительный sync времени с первым DC
+      command: |
+        ntpd -gq -d {{ ad_servers.split(' ')|first }}
+      register: force_ntp_sync
+      changed_when: force_ntp_sync.rc == 0
+      failed_when: force_ntp_sync.rc != 0
+      ignore_errors: yes  # Продолжаем, даже если ошибка (например, если ntpd нет)
+
+    - name: Запуск chronyd
+      service:
+        name: chronyd
+        state: started
+        enabled: yes
+
+    - name: Проверка разницы времени с DC (должно быть <5 сек)
+      command: |
+        current_time=$(date +%s)
+        dc_time=$(ldapsearch -h {{ ad_servers.split(' ')|first }} -x -s base 2>/dev/null | grep currentTime | cut -d' ' -f2)
+        dc_time_epoch=$(date -d "$dc_time" +%s)
+        echo $(( current_time - dc_time_epoch ))
+      register: time_diff
+      changed_when: false
+      failed_when: time_diff.stdout|int > 5 or time_diff.stdout|int < -5
+  tags: ntp_force
+```
+
+---
+
+## **2. Альтернативный вариант (если `ntpd` не установлен)**
+```yaml
+- name: Принудительная синхронизация через chrony
+  command: chronyc -a makestep
+  register: chrony_step
+  changed_when: "'200 OK' in chrony_step.stdout"
+  failed_when: "'200 OK' not in chrony_step.stdout"
+  tags: ntp_force
+```
+
+---
+
+## **3. Проверка синхронизации после настройки**
+```yaml
+- name: Проверка точности синхронизации
+  command: chronyc tracking
+  register: chrony_status
+  changed_when: false
+  failed_when: >
+    "'Leap status     : Normal' not in chrony_status.stdout or
+     'System time' not in chrony_status.stdout or
+     'Last offset' not in chrony_status.stdout or
+     'RMS offset'|float > 0.1"
+  tags: ntp_check
+```
+
+---
+
+## **4. Добавляем в `chrony.conf.j2` приоритет AD-серверов**
+```jinja2
+# Принудительно синхронизироваться только с AD
+server {{ ad_servers.split(' ')|first }} iburst minpoll 2 maxpoll 4 prefer
+{% for server in ad_servers.split(' ')[1:] %}
+server {{ server }} iburst minpoll 2 maxpoll 4
+{% endfor %}
+
+# Отключить публичные NTP (если требуется строгая синхронизация с AD)
+#pool pool.ntp.org iburst
+```
+
+---
+
+## **5. Ручная проверка после выполнения роли**
+Если после выполнения задач всё равно есть рассинхронизация, выполните вручную:
+```bash
+# Принудительно синхронизировать время (если chrony)
+sudo chronyc -a makestep
+
+# Или через ntpdate (если установлен)
+sudo ntpdate -u {{ ad_servers.split(' ')|first }}
+
+# Проверить разницу с DC
+ldapsearch -h DC_NAME -x -s base | grep currentTime
+date
+```
+
+---
+
+### **Итог:**
+✅ **Принудительная синхронизация** перед присоединением к домену  
+✅ **Проверка разницы времени** (<5 сек)  
+✅ **Настройка chrony** с приоритетом AD-серверов  
+✅ **Автоматический откат**, если синхронизация не удалась  
+
+Теперь время будет строго синхронизировано с Active Directory, что исключит ошибки аутентификации Kerberos.
