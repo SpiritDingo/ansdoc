@@ -887,3 +887,132 @@ dyndns_ttl = 3600
 4. Обработчик гарантирует перезагрузку SSSD при изменении конфига
 
 После этих изменений ошибка "не находит sssd.conf.j2" исчезнет, а SSSD будет правильно настроен для работы с Active Directory.
+
+
+
+
+
+
+Ошибка **"sssd.service: /etc/krb5.keytab not found"** возникает, когда SSSD пытается использовать Kerberos для аутентификации, но файл keytab отсутствует. Давайте полностью решим эту проблему.
+
+## Полное решение для Ansible роли
+
+### 1. Сначала убедимся, что keytab создан (обновленная задача)
+
+```yaml
+- name: Создание krb5.keytab с проверкой
+  block:
+    - name: Проверка существования keytab
+      stat:
+        path: /etc/krb5.keytab
+      register: keytab_file
+      tags: keytab
+
+    - name: Создание нового keytab (если не существует)
+      command: net ads keytab create -k
+      when: not keytab_file.stat.exists
+      register: create_keytab
+      tags: keytab
+
+    - name: Проверка содержимого keytab
+      command: klist -ket /etc/krb5.keytab
+      register: keytab_check
+      failed_when: 
+        - keytab_check.rc != 0
+        - "'Principal' not in keytab_check.stdout"
+      tags: keytab
+  rescue:
+    - name: Попытка аварийного создания keytab через ktutil
+      command: |
+        ktutil <<EOF
+        addent -password -p {{ ad_admin_user }}@{{ ad_realm }} -k 1 -e aes256-cts-hmac-sha1-96
+        wkt /etc/krb5.keytab
+        EOF
+      args:
+        stdin: "{{ ad_admin_password }}"
+      no_log: true
+      tags: keytab
+```
+
+### 2. Настроим правильные права на keytab
+
+```yaml
+- name: Установка прав на krb5.keytab
+  file:
+    path: /etc/krb5.keytab
+    owner: root
+    group: root
+    mode: '0600'
+  tags: keytab
+```
+
+### 3. Обновим конфигурацию SSSD (sssd.conf.j2)
+
+Добавьте эти параметры в ваш шаблон:
+
+```jinja2
+[domain/{{ ad_domain }}]
+# Явно указываем путь к keytab
+krb5_keytab = /etc/krb5.keytab
+
+# Отключаем проверку keytab при старте (если нужно)
+krb5_validate = false
+```
+
+### 4. Добавим проверку работы SSSD
+
+```yaml
+- name: Проверка загрузки SSSD
+  command: systemctl status sssd
+  register: sssd_status
+  changed_when: false
+  failed_when: >
+    "'active (running)' not in sssd_status.stdout or
+     'etc/krb5.keytab' in sssd_status.stderr"
+  tags: verify
+```
+
+## Ручные команды для диагностики
+
+Если проблема сохраняется, выполните на сервере:
+
+1. Проверить существование keytab:
+   ```bash
+   ls -la /etc/krb5.keytab
+   ```
+
+2. Проверить содержимое keytab:
+   ```bash
+   klist -ket /etc/krb5.keytab
+   ```
+
+3. Проверить логи SSSD:
+   ```bash
+   journalctl -u sssd --no-pager -n 50
+   ```
+
+4. Принудительно пересоздать keytab:
+   ```bash
+   rm -f /etc/krb5.keytab
+   net ads keytab create -k
+   ```
+
+## Дополнительные меры
+
+1. **Если домен уже присоединен**, но keytab отсутствует:
+   ```yaml
+   - name: Принудительное создание keytab для существующего домена
+     command: net ads keytab flush -k
+     when: keytab_check.rc != 0
+   ```
+
+2. **Проверка членства в домене**:
+   ```yaml
+   - name: Проверка присоединения к домену
+     command: realm list
+     register: realm_status
+     changed_when: false
+     failed_when: "'{{ ad_domain }}' not in realm_status.stdout"
+   ```
+
+После этих изменений SSSD должен корректно находить и использовать krb5.keytab файл.
