@@ -1016,3 +1016,134 @@ krb5_validate = false
    ```
 
 После этих изменений SSSD должен корректно находить и использовать krb5.keytab файл.
+
+
+Добавим синхронизацию времени в Ansible-роль для надежного присоединения к Active Directory. Вот полное решение:
+
+### 1. Добавляем задачи синхронизации времени в `tasks/main.yml`
+
+```yaml
+- name: Установка и настройка chrony
+  block:
+    - name: Установка chrony
+      dnf:
+        name: chrony
+        state: present
+        update_cache: yes
+
+    - name: Настройка chrony.conf
+      template:
+        src: chrony.conf.j2
+        dest: /etc/chrony.conf
+        owner: root
+        group: root
+        mode: 0644
+      notify: restart chronyd
+
+    - name: Включение и запуск chronyd
+      service:
+        name: chronyd
+        state: started
+        enabled: yes
+
+    - name: Проверка синхронизации времени
+      command: chronyc tracking
+      register: chrony_status
+      changed_when: false
+      failed_when: >
+        "'Leap status     : Normal' not in chrony_status.stdout or
+        'System time' not in chrony_status.stdout"
+  tags: ntp
+```
+
+### 2. Создаем шаблон `templates/chrony.conf.j2`
+
+```jinja2
+# Ansible managed - AD time synchronization
+pool {{ ad_servers.split(' ')|first }} iburst
+driftfile /var/lib/chrony/drift
+makestep 1.0 3
+rtcsync
+logdir /var/log/chrony
+keyfile /etc/chrony.keys
+leapsectz right/UTC
+logchange 0.5
+```
+
+### 3. Добавляем обработчик в `handlers/main.yml`
+
+```yaml
+- name: restart chronyd
+  service:
+    name: chronyd
+    state: restarted
+```
+
+### 4. Добавляем проверку перед присоединением к домену
+
+```yaml
+- name: Проверка рассинхронизации времени
+  command: chronyc tracking | grep 'System time'
+  register: time_offset
+  changed_when: false
+  failed_when: >
+    (time_offset.stdout | regex_replace('^.* ([0-9.]+) seconds (slow|fast).*$', '\1') | float) > 5.0
+  tags: ntp
+```
+
+### 5. Обновляем порядок выполнения задач
+
+Убедитесь, что задачи выполняются в правильном порядке:
+1. Установка chrony
+2. Настройка NTP
+3. Проверка синхронизации времени
+4. Присоединение к домену
+
+### 6. Добавляем обработку ошибок времени
+
+```yaml
+- name: Принудительная синхронизация времени при большой рассинхронизации
+  command: chronyc makestep
+  when: >
+    (time_offset.stdout | regex_replace('^.* ([0-9.]+) seconds (slow|fast).*$', '\1') | float) > 30.0
+  tags: ntp
+```
+
+### Полная проверка временной синхронизации:
+
+```yaml
+- name: Полная проверка NTP
+  block:
+    - name: Проверка службы chronyd
+      command: systemctl is-active chronyd
+      register: chronyd_active
+      changed_when: false
+      failed_when: chronyd_active.rc != 0
+
+    - name: Проверка источников времени
+      command: chronyc sources
+      register: chrony_sources
+      changed_when: false
+      failed_when: "'^\\*' not in chrony_sources.stdout"
+
+    - name: Проверка точности времени
+      command: chronyc tracking
+      register: chrony_tracking
+      changed_when: false
+      failed_when: >
+        "'Leap status     : Normal' not in chrony_tracking.stdout or
+        'System time' not in chrony_tracking.stdout"
+  tags: ntp
+```
+
+### Важные замечания:
+
+1. Разница времени с DC не должна превышать 5 минут (лучше держать в пределах 1 секунды)
+2. Для работы команды `net ads keytab create` требуется точное время
+3. При большой рассинхронизации (>30 сек) используем `chronyc makestep` для мгновенной коррекции
+
+После добавления этих задач ваша система будет:
+- Автоматически синхронизировать время с контроллерами домена
+- Проверять корректность синхронизации перед присоединением к AD
+- Принудительно корректировать время при большой рассинхронизации
+- Гарантировать правильную работу Kerberos-аутентификации
