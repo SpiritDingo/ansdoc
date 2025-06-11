@@ -1,3 +1,318 @@
+Вот готовая Ansible роль на основе вашего плейбука. Я структурировал её в соответствии с лучшими практиками организации ролей.
+
+```
+roles/nexus_repo_connection/
+├── defaults
+│   └── main.yml
+├── files
+│   ├── certificates
+│   │   ├── nexus.crt
+│   │   └── CisEntCA.cer
+│   ├── gpg_keys
+│   │   ├── RPM-GPG-KEY-CentOS-5
+│   │   ├── RPM-GPG-KEY-CentOS-6
+│   │   ├── RPM-GPG-KEY-CentOS-7
+│   │   ├── RPM-GPG-KEY-oracle
+│   │   └── ubuntu-keyring-2018-archive.gpg
+│   └── repo_files
+│       ├── centos5
+│       │   └── CentOS-Base.repo
+│       ├── centos6
+│       │   └── CentOS-Base.repo
+│       ├── centos7
+│       │   └── CentOS-Base.repo
+│       ├── oracle_linux_9
+│       │   └── oracle-linux-ol9.repo
+│       ├── ubuntu22.04
+│       │   └── sources.list
+│       ├── ubuntu24.04
+│       │   └── sources.list
+│       └── nexus.conf
+├── handlers
+│   └── main.yml
+├── tasks
+│   ├── certificates.yml
+│   ├── gpg_keys.yml
+│   ├── repo_files.yml
+│   ├── ubuntu_fix.yml
+│   └── main.yml
+└── vars
+    └── main.yml
+```
+
+Содержимое файлов:
+
+1. `defaults/main.yml`:
+```yaml
+---
+# Default variables for nexus_repo_connection role
+cert_src_path: "{{ role_path }}/files/certificates/nexus.crt"
+cisentca_src_path: "{{ role_path }}/files/certificates/CisEntCA.cer"
+
+cert_dest_ubuntu: /usr/local/share/ca-certificates/nexus.crt
+cert_dest_rhel: /etc/pki/ca-trust/source/anchors/nexus.crt
+cisentca_dest_ubuntu: /usr/local/share/ca-certificates/CisEntCA.cer
+cisentca_dest_rhel: /etc/pki/ca-trust/source/anchors/CisEntCA.cer
+```
+
+2. `tasks/main.yml`:
+```yaml
+---
+- name: Include certificate tasks
+  include_tasks: certificates.yml
+
+- name: Include GPG keys tasks
+  include_tasks: gpg_keys.yml
+
+- name: Include repository files tasks
+  include_tasks: repo_files.yml
+
+- name: Include Ubuntu fix tasks
+  include_tasks: ubuntu_fix.yml
+  when: ansible_distribution == "Ubuntu"
+
+- name: Update package manager cache
+  include_tasks: update_cache.yml
+```
+
+3. `tasks/certificates.yml`:
+```yaml
+---
+- name: Copy Nexus SSL certificate to Ubuntu hosts
+  copy:
+    src: "{{ cert_src_path }}"
+    dest: "{{ cert_dest_ubuntu }}"
+    mode: '0644'
+  when: ansible_distribution == "Ubuntu"
+
+- name: Copy CisEntCA SSL certificate to Ubuntu hosts
+  copy:
+    src: "{{ cisentca_src_path }}"
+    dest: "{{ cisentca_dest_ubuntu }}"
+    mode: '0644'
+  when: ansible_distribution == "Ubuntu"
+
+- name: Copy Nexus SSL certificate to RHEL-like hosts
+  copy:
+    src: "{{ cert_src_path }}"
+    dest: "{{ cert_dest_rhel }}"
+    mode: '0644'
+  when: >
+    ansible_distribution in ["CentOS", "OracleLinux"] and
+    ansible_distribution_major_version is version('5', '>=') and
+    ansible_distribution_major_version is version('9', '<=')
+    
+- name: Copy CisEntCA SSL certificate to RHEL-like hosts
+  copy:
+    src: "{{ cisentca_src_path }}"
+    dest: "{{ cisentca_dest_rhel }}"
+    mode: '0644'
+  when: >
+    ansible_distribution in ["CentOS", "OracleLinux"] and
+    ansible_distribution_major_version is version('5', '>=') and
+    ansible_distribution_major_version is version('9', '<=')
+
+- name: Update CA certificates on Ubuntu
+  command: update-ca-certificates
+  when: ansible_distribution == "Ubuntu"
+
+- name: Update CA certificates on RHEL-like systems
+  command: update-ca-trust extract
+  when: >
+    ansible_distribution in ["CentOS", "OracleLinux"] and
+    ansible_distribution_major_version is version('7', '>=')
+```
+
+4. `tasks/gpg_keys.yml`:
+```yaml
+---
+- name: Copy CentOS 5 GPG key
+  copy:
+    src: "{{ role_path }}/files/gpg_keys/RPM-GPG-KEY-CentOS-5"
+    dest: /etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-5
+    mode: '0644'
+  when:
+    - ansible_distribution == "CentOS"
+    - ansible_distribution_major_version == "5"
+
+- name: Copy CentOS 6 GPG key
+  copy:
+    src: "{{ role_path }}/files/gpg_keys/RPM-GPG-KEY-CentOS-6"
+    dest: /etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-6
+    mode: '0644'
+  when:
+    - ansible_distribution == "CentOS"
+    - ansible_distribution_major_version == "6"
+
+- name: Copy CentOS 7 GPG key
+  copy:
+    src: "{{ role_path }}/files/gpg_keys/RPM-GPG-KEY-CentOS-7"
+    dest: /etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+    mode: '0644'
+  when:
+    - ansible_distribution == "CentOS"
+    - ansible_distribution_major_version == "7"
+
+- name: Copy Oracle Linux 9 GPG key
+  copy:
+    src: "{{ role_path }}/files/gpg_keys/RPM-GPG-KEY-oracle"
+    dest: /etc/pki/rpm-gpg/RPM-GPG-KEY-oracle
+    mode: '0644'
+  when:
+    - ansible_distribution == "OracleLinux"
+    - ansible_distribution_major_version == "9"
+
+- name: Copy Ubuntu archive GPG key
+  copy:
+    src: "{{ role_path }}/files/gpg_keys/ubuntu-keyring-2018-archive.gpg"
+    dest: /etc/apt/trusted.gpg.d/
+    mode: '0644'
+  when:
+    - ansible_distribution == "Ubuntu"
+```
+
+5. `tasks/repo_files.yml`:
+```yaml
+---
+- name: Copy CentOS 5 repo file
+  copy:
+    src: "{{ role_path }}/files/repo_files/centos5/CentOS-Base.repo"
+    dest: /etc/yum.repos.d/CentOS-Base.repo
+    owner: root
+    group: root
+    mode: '0644'
+  when: ansible_distribution == "CentOS" and ansible_distribution_major_version == "5"
+
+- name: Copy CentOS 6 repo file
+  copy:
+    src: "{{ role_path }}/files/repo_files/centos6/CentOS-Base.repo"
+    dest: /etc/yum.repos.d/CentOS-Base.repo
+    owner: root
+    group: root
+    mode: '0644'
+  when: ansible_distribution == "CentOS" and ansible_distribution_major_version == "6"
+
+- name: Copy CentOS 7 repo file
+  copy:
+    src: "{{ role_path }}/files/repo_files/centos7/CentOS-Base.repo"
+    dest: /etc/yum.repos.d/CentOS-Base.repo
+    owner: root
+    group: root
+    mode: '0644'
+  when: ansible_distribution == "CentOS" and ansible_distribution_major_version == "7"
+
+- name: Copy Oracle Linux 9 repo file
+  copy:
+    src: "{{ role_path }}/files/repo_files/oracle_linux_9/oracle-linux-ol9.repo"
+    dest: /etc/yum.repos.d/oracle-linux-ol9.repo
+    owner: root
+    group: root
+    mode: '0644'
+  when: ansible_distribution == "OracleLinux" and ansible_distribution_major_version == "9"
+
+- name: Copy Ubuntu 22.04 sources.list file
+  copy:
+    src: "{{ role_path }}/files/repo_files/ubuntu22.04/sources.list"
+    dest: /etc/apt/sources.list
+    owner: root
+    group: root
+    mode: '0644'
+  when: ansible_distribution == "Ubuntu" and ansible_distribution_version == "22.04"
+
+- name: Copy Ubuntu 24.04 sources.list file
+  copy:
+    src: "{{ role_path }}/files/repo_files/ubuntu24.04/sources.list"
+    dest: /etc/apt/sources.list
+    owner: root
+    group: root
+    mode: '0644'
+  when: ansible_distribution == "Ubuntu" and ansible_distribution_version == "24.04"
+
+- name: Deploy Nexus auth.conf for Ubuntu hosts
+  copy:
+    src: "{{ role_path }}/files/repo_files/nexus.conf"
+    dest: /etc/apt/auth.conf.d/nexus.conf
+    owner: root
+    group: root
+    mode: '0600'
+  when: ansible_distribution == "Ubuntu"
+```
+
+6. `tasks/ubuntu_fix.yml`:
+```yaml
+---
+- name: Check if dpkg is blocked
+  command: "fuser /var/lib/dpkg/lock-frontend"
+  register: dpkg_lock
+  ignore_errors: yes
+
+- name: Kill block process
+  command: "kill -9 {{ dpkg_lock.stdout }}"
+  when: dpkg_lock.stdout != ""
+  ignore_errors: yes
+
+- name: Wait unblocking process
+  shell: |
+    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+      sleep 1;
+    done
+  when: dpkg_lock.stdout != ""
+
+- name: Try to fix broken installation process (dpkg --configure -a)
+  shell: "DEBIAN_FRONTEND=noninteractive dpkg --configure -a --force-confdef --force-confold"
+  register: dpkg_configure
+  ignore_errors: yes
+```
+
+7. `tasks/update_cache.yml`:
+```yaml
+---
+- name: Update APT cache on Ubuntu
+  apt:
+    update_cache: yes
+  when: ansible_distribution == "Ubuntu"
+
+- name: Clean YUM cache
+  command: yum clean all
+  when: >
+    (ansible_distribution == "OracleLinux" and ansible_distribution_major_version == "9") or
+    (ansible_distribution == "CentOS" and ansible_distribution_major_version in ["5", "6", "7"])
+
+- name: Rebuild YUM cache
+  command: yum makecache
+  when: >
+    (ansible_distribution == "OracleLinux" and ansible_distribution_major_version == "9") or
+    (ansible_distribution == "CentOS" and ansible_distribution_major_version in ["5", "6", "7"])
+```
+
+8. `handlers/main.yml`:
+```yaml
+---
+# handlers file for nexus_repo_connection
+```
+
+Теперь вы можете использовать эту роль в своих плейбуках. Пример использования:
+
+```yaml
+- name: Connect host to Nexus repository
+  hosts: t1er
+  become: yes
+  gather_facts: yes
+
+  roles:
+    - nexus_repo_connection
+```
+
+Преимущества такой структуры:
+1. Логическое разделение задач по файлам
+2. Использование переменных по умолчанию
+3. Возможность переопределения переменных
+4. Удобство поддержки и масштабирования
+5. Соответствие best practices Ansible
+
+Все файлы сертификатов, ключей и репозиториев должны быть размещены в соответствующих поддиректориях директории `files`.
+
+
 Добавлю задачи для подключения к Sonatype Nexus репозиторию. Вот обновленная структура роли с новыми задачами:
 
 1. Сначала добавим новые переменные в `defaults/main.yml`:
