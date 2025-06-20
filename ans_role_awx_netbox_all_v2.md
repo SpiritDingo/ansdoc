@@ -286,3 +286,323 @@ ansible-galaxy collection install community.docker
 ```
 
 Также убедитесь, что на целевых хостах установлены Docker и Docker Compose, как вы указали в требованиях.
+
+
+
+Давайте детально разберём каждую Ansible-роль, включая структуру, основные задачи, переменные и примеры конфигурационных файлов.
+
+---
+
+## **1. Роль `nginx_awx_docker`: Установка Nginx + AWX в Docker Compose**
+
+### **Структура роли**
+```
+roles/nginx_awx_docker/
+├── defaults/           # Переменные по умолчанию
+│   └── main.yml
+├── tasks/              # Основные задачи
+│   └── main.yml
+├── templates/          # Jinja2-шаблоны
+│   ├── awx_docker-compose.yml.j2
+│   └── nginx_awx.conf.j2
+└── vars/               # Дополнительные переменные (опционально)
+    └── main.yml
+```
+
+### **Основные задачи (`tasks/main.yml`)**
+```yaml
+---
+- name: "Создание директорий для AWX"
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - "{{ awx_data_dir }}/postgres"
+    - "{{ awx_data_dir }}/projects"
+    - "{{ awx_data_dir }}/nginx"
+
+- name: "Развёртывание docker-compose для AWX"
+  template:
+    src: "awx_docker-compose.yml.j2"
+    dest: "{{ awx_data_dir }}/docker-compose.yml"
+  notify: "Запуск контейнеров AWX"
+
+- name: "Развёртывание конфига Nginx для AWX"
+  template:
+    src: "nginx_awx.conf.j2"
+    dest: "/etc/nginx/conf.d/awx.conf"
+  notify: "Перезапуск Nginx"
+
+- name: "Запуск контейнеров AWX"
+  community.docker.docker_compose:
+    project_src: "{{ awx_data_dir }}"
+    build: yes
+    pull: yes
+    state: present
+```
+
+### **Шаблон `awx_docker-compose.yml.j2`**
+```yaml
+version: '3.7'
+services:
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: "{{ awx_db_user }}"
+      POSTGRES_PASSWORD: "{{ awx_db_password }}"
+    volumes:
+      - "{{ awx_data_dir }}/postgres:/var/lib/postgresql/data"
+
+  awx:
+    image: ansible/awx:latest
+    depends_on:
+      - postgres
+    environment:
+      AWX_POSTGRES_USER: "{{ awx_db_user }}"
+      AWX_POSTGRES_PASSWORD: "{{ awx_db_password }}"
+    ports:
+      - "8052:8052"
+```
+
+### **Шаблон `nginx_awx.conf.j2`**
+```nginx
+server {
+    listen 80;
+    server_name awx.example.com;
+
+    location / {
+        proxy_pass http://localhost:8052;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+```
+
+### **Переменные (`defaults/main.yml`)**
+```yaml
+awx_data_dir: "/opt/awx"
+awx_db_user: "awx"
+awx_db_password: "secure_password"
+```
+
+---
+
+## **2. Роль `gitlab_awx_integration`: Интеграция GitLab и AWX**
+
+### **Структура роли**
+```
+roles/gitlab_awx_integration/
+├── defaults/
+│   └── main.yml
+├── tasks/
+│   └── main.yml
+└── templates/
+    └── gitlab_webhook.sh.j2
+```
+
+### **Основные задачи (`tasks/main.yml`)**
+```yaml
+---
+- name: "Создание проекта в AWX из GitLab"
+  uri:
+    url: "{{ awx_api_url }}/api/v2/projects/"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ awx_api_token }}"
+      Content-Type: "application/json"
+    body_format: json
+    body:
+      name: "{{ item.name }}"
+      scm_type: git
+      scm_url: "{{ item.repo_url }}"
+      scm_branch: "{{ item.branch | default('main') }}"
+  loop: "{{ gitlab_projects }}"
+
+- name: "Создание Webhook в GitLab"
+  uri:
+    url: "{{ gitlab_api_url }}/projects/{{ item.id }}/hooks"
+    method: POST
+    headers:
+      PRIVATE-TOKEN: "{{ gitlab_api_token }}"
+    body_format: json
+    body:
+      url: "{{ awx_webhook_url }}"
+      push_events: true
+  loop: "{{ gitlab_projects }}"
+```
+
+### **Переменные (`defaults/main.yml`)**
+```yaml
+awx_api_url: "http://awx.example.com"
+awx_api_token: "your_awx_token"
+gitlab_api_url: "https://gitlab.example.com/api/v4"
+gitlab_api_token: "your_gitlab_token"
+gitlab_projects:
+  - name: "ansible-playbooks"
+    repo_url: "git@gitlab.example.com:devops/ansible-playbooks.git"
+    branch: "main"
+    id: "123"  # GitLab Project ID
+```
+
+---
+
+## **3. Роль `netbox_awx_inventory`: Динамический инвентарь NetBox → AWX**
+
+### **Структура роли**
+```
+roles/netbox_awx_inventory/
+├── defaults/
+│   └── main.yml
+├── tasks/
+│   └── main.yml
+└── files/
+    └── netbox_inventory.py
+```
+
+### **Основные задачи (`tasks/main.yml`)**
+```yaml
+---
+- name: "Копирование скрипта динамического инвентаря"
+  copy:
+    src: "netbox_inventory.py"
+    dest: "/usr/local/bin/netbox_inventory.py"
+    mode: "0755"
+
+- name: "Создание Inventory в AWX"
+  uri:
+    url: "{{ awx_api_url }}/api/v2/inventories/"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ awx_api_token }}"
+    body_format: json
+    body:
+      name: "NetBox Dynamic Inventory"
+      organization: 1
+
+- name: "Добавление источника инвентаря"
+  uri:
+    url: "{{ awx_api_url }}/api/v2/inventory_sources/"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ awx_api_token }}"
+    body_format: json
+    body:
+      name: "NetBox Source"
+      source: "script"
+      script: "netbox_inventory.py"
+      inventory: "{{ inventory_id }}"
+```
+
+### **Пример `netbox_inventory.py`**
+```python
+#!/usr/bin/env python3
+import requests
+import json
+
+NETBOX_URL = "http://netbox.example.com"
+NETBOX_TOKEN = "your_netbox_token"
+
+response = requests.get(
+    f"{NETBOX_URL}/api/dcim/devices/",
+    headers={"Authorization": f"Token {NETBOX_TOKEN}"}
+)
+devices = response.json()["results"]
+
+inventory = {
+    "_meta": {"hostvars": {}},
+    "all": {"hosts": []}
+}
+
+for device in devices:
+    inventory["all"]["hosts"].append(device["name"])
+    inventory["_meta"]["hostvars"][device["name"]] = {
+        "ansible_host": device["primary_ip"]["address"].split("/")[0]
+    }
+
+print(json.dumps(inventory))
+```
+
+---
+
+## **4. Роль `netbox_nginx_docker`: Установка NetBox + Nginx в Docker**
+
+### **Структура роли**
+```
+roles/netbox_nginx_docker/
+├── defaults/
+│   └── main.yml
+├── tasks/
+│   └── main.yml
+└── templates/
+    ├── netbox_docker-compose.yml.j2
+    └── nginx_netbox.conf.j2
+```
+
+### **Основные задачи (`tasks/main.yml`)**
+```yaml
+---
+- name: "Развёртывание docker-compose для NetBox"
+  template:
+    src: "netbox_docker-compose.yml.j2"
+    dest: "/opt/netbox/docker-compose.yml"
+  notify: "Запуск NetBox"
+
+- name: "Настройка Nginx для NetBox"
+  template:
+    src: "nginx_netbox.conf.j2"
+    dest: "/etc/nginx/conf.d/netbox.conf"
+  notify: "Перезапуск Nginx"
+
+- name: "Запуск NetBox"
+  community.docker.docker_compose:
+    project_src: "/opt/netbox"
+    build: yes
+    pull: yes
+    state: present
+```
+
+### **Шаблон `netbox_docker-compose.yml.j2`**
+```yaml
+version: '3.7'
+services:
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: netbox
+      POSTGRES_PASSWORD: "{{ netbox_db_password }}"
+
+  netbox:
+    image: netboxcommunity/netbox:latest
+    depends_on:
+      - postgres
+    environment:
+      DB_NAME: netbox
+      DB_USER: netbox
+      DB_PASSWORD: "{{ netbox_db_password }}"
+    ports:
+      - "8000:8000"
+```
+
+### **Шаблон `nginx_netbox.conf.j2`**
+```nginx
+server {
+    listen 80;
+    server_name netbox.example.com;
+
+    location / {
+        proxy_pass http://localhost:8000;
+        proxy_set_header Host $host;
+    }
+}
+```
+
+---
+
+## **Итог**
+- Все роли используют **Jinja2-шаблоны** для гибкой настройки.
+- **Docker Compose** управляется через модуль `community.docker.docker_compose`.
+- **AWX API** используется для автоматизации задач.
+- **Динамический инвентарь** NetBox позволяет автоматически обновлять список хостов.
+
+Можно расширить роли, добавив обработку ошибок, тегирование задач и дополнительные настройки безопасности (TLS, аутентификация).
