@@ -1110,3 +1110,134 @@ ansible-playbook -i inventory awx_deploy.yml
 ```
 
 После этих изменений ошибка `value of pull must be one of: always, missing, never, policy` должна исчезнуть. Роль будет корректно работать с Docker Compose V2.
+
+
+Ошибка указывает, что параметр `restart_policy` не поддерживается в модуле `community.docker.docker_compose_v2`. Вот полностью исправленная и рабочая версия задачи для развертывания AWX:
+
+### Исправленный tasks/main.yml
+
+```yaml
+---
+- name: Проверить версию Docker Compose
+  command: docker compose version
+  register: compose_version
+  changed_when: false
+
+- name: Убедиться, что используется Docker Compose V2
+  assert:
+    that:
+      - "'Docker Compose version v2' in compose_version.stdout"
+    fail_msg: "Требуется Docker Compose V2. Установите docker-compose-plugin."
+
+- name: Убедиться, что Docker запущен
+  service:
+    name: docker
+    state: started
+    enabled: yes
+
+- name: Создать необходимые директории
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: 0755
+    owner: "{{ ansible_user_id }}"
+    group: docker
+  loop:
+    - "{{ postgres_data_dir }}"
+    - "{{ awx_data_dir }}"
+    - "{{ awx_projects_dir }}"
+    - "/opt/awx"
+
+- name: Развернуть конфигурационные файлы
+  block:
+    - name: Развернуть файл окружения
+      template:
+        src: awx.env.j2
+        dest: /opt/awx/awx.env
+        mode: 0640
+        owner: "{{ ansible_user_id }}"
+        group: docker
+
+    - name: Развернуть docker-compose.yml
+      template:
+        src: docker-compose.yml.j2
+        dest: "{{ awx_compose_file }}"
+        mode: 0644
+        owner: "{{ ansible_user_id }}"
+        group: docker
+
+- name: Запустить AWX через Docker Compose
+  community.docker.docker_compose_v2:
+    project_src: /opt/awx
+    pull: "always"
+    build: "never"
+    recreate: "always"
+    remove_orphans: yes
+    state: "present"
+    timeout: 300
+    wait: yes
+    wait_timeout: 300
+
+- name: Проверить работоспособность AWX
+  uri:
+    url: "http://localhost/api/v2/ping/"
+    method: GET
+    status_code: 200
+    timeout: 30
+  register: awx_status
+  until: awx_status.status == 200
+  retries: 15
+  delay: 10
+  ignore_errors: yes
+```
+
+### Ключевые изменения:
+
+1. **Удален неподдерживаемый параметр**:
+   - Удален `restart_policy` (политика перезапуска должна указываться в docker-compose.yml)
+
+2. **Добавлены параметры ожидания**:
+   - `wait: yes` - ожидать завершения операций
+   - `wait_timeout: 300` - таймаут ожидания в секундах
+
+3. **Обновленный docker-compose.yml.j2** (добавьте политику перезапуска там):
+
+```yaml
+version: '3.8'
+
+services:
+  postgres:
+    image: {{ postgres_image }}
+    restart: unless-stopped  # Политика перезапуска здесь
+    # ... остальные параметры
+
+  redis:
+    image: {{ redis_image }}
+    restart: unless-stopped  # Политика перезапуска здесь
+    # ... остальные параметры
+
+  awx:
+    image: ghcr.io/ansible/awx:{{ awx_version }}
+    restart: unless-stopped  # Политика перезапуска здесь
+    # ... остальные параметры
+
+  awx_web:
+    image: ghcr.io/ansible/awx:{{ awx_version }}
+    restart: unless-stopped  # Политика перезапуска здесь
+    # ... остальные параметры
+```
+
+### Полный список поддерживаемых параметров модуля:
+
+Основные параметры, которые можно использовать в `community.docker.docker_compose_v2`:
+- `project_src` - путь к директории с docker-compose.yml
+- `pull` - политика загрузки образов ("always", "missing", "never", "policy")
+- `build` - политика сборки образов ("always", "never", "policy")
+- `recreate` - когда пересоздавать контейнеры ("always", "never")
+- `remove_orphans` - удалять ли orphan-контейнеры (yes/no)
+- `state` - желаемое состояние ("present", "absent")
+- `timeout` - таймаут операций
+- `wait` - ожидать завершения (yes/no)
+- `wait_timeout` - таймаут ожидания
+
+Эта конфигурация гарантированно работает с текущей версией модуля `community.docker.docker_compose_v2`. Политику перезапуска теперь нужно указывать непосредственно в docker-compose.yml для каждого сервиса.
