@@ -253,3 +253,202 @@ AWX_ISOLATED_LAUNCH_TIMEOUT=600
 5. AWX будет доступен на порту 80 целевого сервера.
 
 6. Для обновления AWX достаточно изменить переменную `awx_version` и перезапустить playbook.
+
+
+Если используется Docker Compose v2 (включенный в Docker как plugin `docker compose`), нужно внести некоторые изменения в роль. Вот обновленная версия:
+
+## Изменения для поддержки Docker Compose v2
+
+### Обновленный tasks/main.yml
+
+```yaml
+---
+- name: Проверить наличие Docker Compose V2
+  command: docker compose version
+  register: compose_check
+  ignore_errors: yes
+  changed_when: false
+
+- name: Убедиться, что Docker Compose V2 доступен
+  assert:
+    that:
+      - "'Docker Compose version v2' in compose_check.stdout"
+    fail_msg: "Docker Compose V2 не обнаружен. Установите его или используйте Docker Desktop."
+
+- name: Убедиться, что Docker запущен и включен
+  service:
+    name: docker
+    state: started
+    enabled: yes
+
+- name: Создание директорий для volumes
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: 0755
+  loop:
+    - "{{ postgres_data_dir }}"
+    - "{{ awx_data_dir }}"
+    - "{{ awx_projects_dir }}"
+    - "/opt/awx"
+
+- name: Копирование файла окружения AWX
+  template:
+    src: awx.env.j2
+    dest: /opt/awx/awx.env
+    mode: 0640
+
+- name: Копирование docker-compose файла
+  template:
+    src: docker-compose.yml.j2
+    dest: "{{ awx_compose_file }}"
+    mode: 0644
+
+- name: Запуск AWX с помощью Docker Compose V2
+  community.docker.docker_compose:
+    project_src: /opt/awx
+    build: yes
+    pull: yes
+    recreate: always
+    restart_policy: always
+    state: present
+    # Явно указываем использовать docker compose v2
+    use_plugin: yes
+
+- name: Ожидание готовности AWX
+  uri:
+    url: "http://localhost:80/api/v2/ping/"
+    method: GET
+    status_code: 200
+    timeout: 30
+  register: result
+  until: result.status == 200
+  retries: 30
+  delay: 10
+```
+
+### Обновленный docker-compose.yml.j2
+
+```yaml
+version: '3.8'
+services:
+  postgres:
+    image: {{ postgres_image }}
+    container_name: {{ awx_project_name }}_postgres
+    environment:
+      POSTGRES_USER: {{ postgres_user }}
+      POSTGRES_PASSWORD: {{ postgres_password }}
+      POSTGRES_DB: {{ postgres_database }}
+    volumes:
+      - {{ postgres_data_dir }}:/var/lib/postgresql/data:Z
+    restart: unless-stopped
+    networks:
+      - awx
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U {{ postgres_user }}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: {{ redis_image }}
+    container_name: {{ awx_project_name }}_redis
+    restart: unless-stopped
+    networks:
+      - awx
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  awx:
+    image: ghcr.io/ansible/awx:{{ awx_version }}
+    container_name: {{ awx_project_name }}_task
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    hostname: awx
+    user: root
+    volumes:
+      - {{ awx_projects_dir }}:/var/lib/awx/projects:Z
+    environment:
+      AWX_ADMIN_USER: {{ awx_admin_user }}
+      AWX_ADMIN_PASSWORD: {{ awx_admin_password }}
+      SECRET_KEY: {{ awx_secret_key }}
+      DATABASE_USER: {{ postgres_user }}
+      DATABASE_PASSWORD: {{ postgres_password }}
+      DATABASE_NAME: {{ postgres_database }}
+      DATABASE_HOST: postgres
+      DATABASE_PORT: "{{ postgres_port }}"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    env_file:
+      - /opt/awx/awx.env
+    restart: unless-stopped
+    networks:
+      - awx
+
+  awx_web:
+    image: ghcr.io/ansible/awx:{{ awx_version }}
+    container_name: {{ awx_project_name }}_web
+    depends_on:
+      - awx
+    hostname: awxweb
+    user: root
+    ports:
+      - "80:8052"
+    environment:
+      SECRET_KEY: {{ awx_secret_key }}
+      DATABASE_USER: {{ postgres_user }}
+      DATABASE_PASSWORD: {{ postgres_password }}
+      DATABASE_NAME: {{ postgres_database }}
+      DATABASE_HOST: postgres
+      DATABASE_PORT: "{{ postgres_port }}"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      HTTP_PORT: "8052"
+    env_file:
+      - /opt/awx/awx.env
+    restart: unless-stopped
+    networks:
+      - awx
+
+networks:
+  awx:
+    name: awx_network
+    driver: bridge
+```
+
+## Ключевые изменения для Docker Compose V2:
+
+1. **Проверка версии Docker Compose** - добавлена задача для проверки наличия V2
+2. **Параметр `use_plugin: yes`** - в модуле docker_compose для явного указания использования плагина
+3. **Улучшенные healthchecks** - добавлены проверки здоровья для postgres и redis
+4. **Уточненные depends_on** - с указанием condition: service_healthy
+5. **Именованная сеть** - явное указание имени сети для лучшей совместимости
+6. **Обновленная версия compose** - используется version: '3.8'
+
+## Дополнительные рекомендации:
+
+1. Для работы с Docker Compose V2 в Ansible требуется:
+   - Ansible 2.10+
+   - Коллекция community.docker 1.9.0+
+
+2. Для проверки установки Docker Compose V2 можно выполнить:
+   ```bash
+   docker compose version
+   # Должен показать версию v2.x.x
+   ```
+
+3. При необходимости можно добавить задачу для установки Docker Compose V2:
+   ```yaml
+   - name: Установка Docker Compose Plugin
+     community.docker.docker_compose_plugin:
+       state: present
+     when: "'Docker Compose version v2' not in compose_check.stdout"
+   ```
+
+Эти изменения обеспечат корректную работу роли с Docker Compose V2, сохраняя все преимущества использования volumes для данных.
