@@ -735,3 +735,259 @@ ansible-galaxy collection install community.docker
 sudo apt-get install docker-compose-plugin  # Для Debian/Ubuntu
 sudo yum install docker-compose-plugin    # Для RHEL/CentOS
 ```
+
+Отлично, раз Docker Compose V2 уже установлен, я упрощу роль, убрав лишние проверки и задачи установки. Вот оптимизированная версия роли:
+
+## Упрощенная роль для AWX с предустановленным Docker Compose V2
+
+### tasks/main.yml
+
+```yaml
+---
+- name: Проверить версию Docker Compose
+  command: docker compose version
+  register: compose_version
+  changed_when: false
+  tags: check
+
+- name: Убедиться, что используется Docker Compose V2
+  assert:
+    that:
+      - "'Docker Compose version v2' in compose_version.stdout"
+    fail_msg: "Требуется Docker Compose V2. Установите docker-compose-plugin."
+  tags: check
+
+- name: Убедиться, что Docker запущен
+  service:
+    name: docker
+    state: started
+    enabled: yes
+
+- name: Создать необходимые директории
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: 0755
+    owner: "{{ ansible_user_id }}"
+    group: docker
+  loop:
+    - "{{ postgres_data_dir }}"
+    - "{{ awx_data_dir }}"
+    - "{{ awx_projects_dir }}"
+    - "/opt/awx"
+
+- name: Развернуть конфигурационные файлы
+  block:
+    - name: Развернуть файл окружения
+      template:
+        src: awx.env.j2
+        dest: /opt/awx/awx.env
+        mode: 0640
+        owner: "{{ ansible_user_id }}"
+        group: docker
+
+    - name: Развернуть docker-compose.yml
+      template:
+        src: docker-compose.yml.j2
+        dest: "{{ awx_compose_file }}"
+        mode: 0644
+        owner: "{{ ansible_user_id }}"
+        group: docker
+
+- name: Запустить AWX через Docker Compose
+  community.docker.docker_compose_v2:
+    project_src: /opt/awx
+    pull: yes
+    build: no
+    recreate: always
+    remove_orphans: yes
+    restart_policy: unless-stopped
+    state: present
+    timeout: 300
+
+- name: Проверить работоспособность AWX
+  uri:
+    url: "http://localhost/api/v2/ping/"
+    method: GET
+    status_code: 200
+    timeout: 30
+  register: awx_status
+  until: awx_status.status == 200
+  retries: 15
+  delay: 10
+  ignore_errors: yes
+```
+
+### defaults/main.yml
+
+```yaml
+---
+# Версии образов
+awx_version: "23.7.0"
+postgres_image: "postgres:13-alpine"
+redis_image: "redis:7-alpine"
+
+# Учетные данные AWX
+awx_admin_user: "admin"
+awx_admin_password: "changeme"
+awx_secret_key: "generate-secure-key-here"
+
+# Настройки PostgreSQL
+postgres_user: "awx"
+postgres_password: "awxpass"
+postgres_database: "awx"
+postgres_port: 5432
+
+# Пути для хранения данных
+postgres_data_dir: "/var/lib/awx/postgres"
+awx_data_dir: "/var/lib/awx"
+awx_projects_dir: "{{ awx_data_dir }}/projects"
+
+# Настройки проекта
+awx_project_name: "awx"
+awx_compose_file: "/opt/awx/docker-compose.yml"
+```
+
+### files/docker-compose.yml.j2
+
+```yaml
+version: '3.8'
+
+services:
+  postgres:
+    image: {{ postgres_image }}
+    container_name: {{ awx_project_name }}_postgres
+    environment:
+      POSTGRES_USER: {{ postgres_user }}
+      POSTGRES_PASSWORD: {{ postgres_password }}
+      POSTGRES_DB: {{ postgres_database }}
+    volumes:
+      - {{ postgres_data_dir }}:/var/lib/postgresql/data
+    restart: unless-stopped
+    networks:
+      - awx_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U {{ postgres_user }}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: {{ redis_image }}
+    container_name: {{ awx_project_name }}_redis
+    restart: unless-stopped
+    networks:
+      - awx_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  awx:
+    image: ghcr.io/ansible/awx:{{ awx_version }}
+    container_name: {{ awx_project_name }}_task
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    user: root
+    volumes:
+      - {{ awx_projects_dir }}:/var/lib/awx/projects
+    environment:
+      AWX_ADMIN_USER: {{ awx_admin_user }}
+      AWX_ADMIN_PASSWORD: {{ awx_admin_password }}
+      SECRET_KEY: {{ awx_secret_key }}
+      DATABASE_USER: {{ postgres_user }}
+      DATABASE_PASSWORD: {{ postgres_password }}
+      DATABASE_NAME: {{ postgres_database }}
+      DATABASE_HOST: postgres
+      DATABASE_PORT: "{{ postgres_port }}"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    env_file:
+      - /opt/awx/awx.env
+    restart: unless-stopped
+    networks:
+      - awx_network
+
+  awx_web:
+    image: ghcr.io/ansible/awx:{{ awx_version }}
+    container_name: {{ awx_project_name }}_web
+    depends_on:
+      - awx
+    ports:
+      - "80:8052"
+    environment:
+      SECRET_KEY: {{ awx_secret_key }}
+      HTTP_PORT: "8052"
+    env_file:
+      - /opt/awx/awx.env
+    restart: unless-stopped
+    networks:
+      - awx_network
+
+networks:
+  awx_network:
+    driver: bridge
+```
+
+### files/awx.env.j2
+
+```ini
+# Database settings
+DATABASE_USER={{ postgres_user }}
+DATABASE_PASSWORD={{ postgres_password }}
+DATABASE_NAME={{ postgres_database }}
+DATABASE_HOST=postgres
+DATABASE_PORT={{ postgres_port }}
+
+# Redis settings
+REDIS_HOST=redis
+REDIS_PORT=6379
+
+# AWX settings
+AWX_ADMIN_USER={{ awx_admin_user }}
+AWX_ADMIN_PASSWORD={{ awx_admin_password }}
+SECRET_KEY={{ awx_secret_key }}
+
+# Additional settings
+AWX_SKIP_MIGRATIONS=false
+AWX_ISOLATED_CHECK_INTERVAL=30
+AWX_ISOLATED_LAUNCH_TIMEOUT=600
+```
+
+## Основные улучшения:
+
+1. **Упрощенная проверка** - только проверка версии Docker Compose
+2. **Оптимизированные образы** - используются alpine-версии для postgres и redis
+3. **Улучшенные healthchecks** - увеличены интервалы проверок
+4. **Чистая структура сети** - явное именование сети
+5. **Упрощенный процесс развертывания** - убраны лишние шаги
+6. **Более безопасные права** - правильные владельцы для файлов
+
+Для использования роли:
+
+1. Установите зависимость:
+```bash
+ansible-galaxy collection install community.docker
+```
+
+2. Создайте playbook (awx_deploy.yml):
+```yaml
+---
+- hosts: awx_servers
+  become: yes
+  vars:
+    awx_admin_password: "your_secure_password"
+    awx_secret_key: "your_secure_secret_key"
+  
+  roles:
+    - awx-docker
+```
+
+3. Запустите playbook:
+```bash
+ansible-playbook -i inventory awx_deploy.yml
+```
