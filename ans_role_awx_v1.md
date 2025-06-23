@@ -990,4 +990,123 @@ ansible-galaxy collection install community.docker
 3. Запустите playbook:
 ```bash
 ansible-playbook -i inventory awx_deploy.yml
+
 ```
+
+
+
+
+Ошибка возникает из-за неверного формата параметра `pull` в модуле `docker_compose_v2`. Давайте исправим роль:
+
+### Исправленный tasks/main.yml
+
+```yaml
+---
+- name: Проверить версию Docker Compose
+  command: docker compose version
+  register: compose_version
+  changed_when: false
+  tags: check
+
+- name: Убедиться, что используется Docker Compose V2
+  assert:
+    that:
+      - "'Docker Compose version v2' in compose_version.stdout"
+    fail_msg: "Требуется Docker Compose V2. Установите docker-compose-plugin."
+  tags: check
+
+- name: Убедиться, что Docker запущен
+  service:
+    name: docker
+    state: started
+    enabled: yes
+
+- name: Создать необходимые директории
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: 0755
+    owner: "{{ ansible_user_id }}"
+    group: docker
+  loop:
+    - "{{ postgres_data_dir }}"
+    - "{{ awx_data_dir }}"
+    - "{{ awx_projects_dir }}"
+    - "/opt/awx"
+
+- name: Развернуть конфигурационные файлы
+  block:
+    - name: Развернуть файл окружения
+      template:
+        src: awx.env.j2
+        dest: /opt/awx/awx.env
+        mode: 0640
+        owner: "{{ ansible_user_id }}"
+        group: docker
+
+    - name: Развернуть docker-compose.yml
+      template:
+        src: docker-compose.yml.j2
+        dest: "{{ awx_compose_file }}"
+        mode: 0644
+        owner: "{{ ansible_user_id }}"
+        group: docker
+
+- name: Запустить AWX через Docker Compose
+  community.docker.docker_compose_v2:
+    project_src: /opt/awx
+    pull: "yes"  # Исправлено: должно быть строкой
+    build: no
+    recreate: always
+    remove_orphans: yes
+    restart_policy: unless-stopped
+    state: present
+    timeout: 300
+
+- name: Проверить работоспособность AWX
+  uri:
+    url: "http://localhost/api/v2/ping/"
+    method: GET
+    status_code: 200
+    timeout: 30
+  register: awx_status
+  until: awx_status.status == 200
+  retries: 15
+  delay: 10
+  ignore_errors: yes
+```
+
+### Ключевые исправления:
+
+1. В модуле `docker_compose_v2` параметр `pull` должен быть строкой, а не булевым значением:
+   ```yaml
+   pull: "yes"  # вместо pull: yes
+   ```
+
+2. Допустимые значения для параметра `pull`:
+   - `"always"` - всегда делать pull образов
+   - `"missing"` - делать pull только если образ отсутствует
+   - `"never"` - никогда не делать pull
+   - `"policy"` - следовать политике, указанной в docker-compose.yml
+
+3. Для полной ясности лучше использовать явное значение:
+   ```yaml
+   pull: "always"  # или "missing" в зависимости от ваших потребностей
+   ```
+
+### Полный исправленный блок запуска Docker Compose:
+
+```yaml
+- name: Запустить AWX через Docker Compose
+  community.docker.docker_compose_v2:
+    project_src: /opt/awx
+    pull: "always"    # Явное указание политики pull
+    build: no
+    recreate: always
+    remove_orphans: yes
+    restart_policy: unless-stopped
+    state: present
+    timeout: 300
+```
+
+После этих изменений ошибка `value of pull must be one of: always, missing, never, policy` должна исчезнуть. Роль будет корректно работать с Docker Compose V2.
