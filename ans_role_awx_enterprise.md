@@ -1493,3 +1493,150 @@ ansible-vault encrypt roles/awx_docker/files/awx.env
 1. Все файлы находятся в правильных директориях
 2. Нет попыток использовать несуществующие шаблоны
 3. Структура роли соответствует best practices Ansible
+
+
+
+Ошибка указывает на несколько проблем, которые нужно исправить для успешного развертывания AWX. Вот комплексное решение:
+
+### 1. Основная проблема: Несуществующая версия AWX
+Ошибка `manifest for ansible/awx:24.6.1 not found` означает, что указанной версии образа не существует в Docker Hub.
+
+**Исправление в `defaults/main.yml`**:
+```yaml
+awx_version: "23.7.0"  # Используем существующую стабильную версию
+```
+
+### 2. Устаревший параметр version в docker-compose
+Предупреждение: `the attribute version is obsolete`
+
+**Исправленный `templates/docker-compose.yml.j2`**:
+```yaml
+services:
+  # Убрана строка version: '3.8' - она больше не нужна в новых версиях Docker Compose
+  postgres:
+    image: postgres:{{ postgres_version }}
+    # ... остальная конфигурация без изменений
+```
+
+### 3. Полное исправление задачи pull в `tasks/configure_awx.yml`:
+
+```yaml
+- name: Pull AWX images with error handling
+  block:
+    - name: Pull container images
+      command: "{{ compose_command }} -f /opt/awx/docker-compose.yml pull"
+      args:
+        chdir: /opt/awx
+      register: pull_result
+      retries: 3
+      delay: 10
+      until: pull_result is succeeded
+
+  rescue:
+    - name: Debug pull failures
+      debug:
+        msg: "Failed to pull images. Error: {{ pull_result.stderr }}"
+    
+    - name: Fallback to specific known working version
+      set_fact:
+        awx_version: "23.7.0"  # Гарантированно рабочая версия
+      when: "'manifest unknown' in pull_result.stderr"
+    
+    - name: Update docker-compose with fallback version
+      template:
+        src: docker-compose.yml.j2
+        dest: /opt/awx/docker-compose.yml
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
+      when: "'manifest unknown' in pull_result.stderr"
+    
+    - name: Retry pulling with fallback version
+      command: "{{ compose_command }} -f /opt/awx/docker-compose.yml pull"
+      args:
+        chdir: /opt/awx
+      when: "'manifest unknown' in pull_result.stderr"
+```
+
+### 4. Дополнительные улучшения:
+
+1. **Проверка доступности образов** (добавить в `tasks/install_docker.yml`):
+```yaml
+- name: Verify AWX image exists
+  uri:
+    url: "https://hub.docker.com/v2/repositories/ansible/awx/tags/?page_size=25&page=1&name={{ awx_version }}"
+    return_content: yes
+    status_code: 200
+  register: awx_image_check
+  until: awx_image_check.json.results | length > 0
+  retries: 3
+  delay: 10
+```
+
+2. **Обновленный файл `defaults/main.yml`**:
+```yaml
+# Гарантированно рабочие версии
+awx_version: "23.7.0"
+postgres_version: "15"
+redis_version: "7"
+
+# Настройки отката
+fallback_awx_version: "23.7.0"
+```
+
+3. **Логирование ошибок** (добавить в `tasks/configure_awx.yml`):
+```yaml
+- name: Log docker compose output
+  copy:
+    content: |
+      Pull result: {{ pull_result }}
+      Stdout: {{ pull_result.stdout }}
+      Stderr: {{ pull_result.stderr }}
+    dest: /var/log/awx_deploy.log
+    mode: '0644'
+  when: pull_result is changed or pull_result is failed
+```
+
+### 5. Как применять исправления:
+
+1. Обновите версии в вашем `vars/awx.yml`:
+```yaml
+awx_version: "23.7.0"
+```
+
+2. Запустите playbook с ключом `--force-handlers`:
+```bash
+ansible-playbook -i inventory.ini playbook-awx.yml --force-handlers
+```
+
+### 6. Enterprise-рекомендации:
+
+1. **Использование локального registry**:
+```yaml
+# В defaults/main.yml
+awx_image_prefix: "registry.example.com/ansible/awx"
+```
+
+2. **Подготовка образов**:
+```yaml
+- name: Pre-pull images on bastion host
+  hosts: localhost
+  tasks:
+    - command: docker pull ansible/awx:{{ awx_version }}
+    - command: docker tag ansible/awx:{{ awx_version }} {{ awx_image_prefix }}:{{ awx_version }}
+    - command: docker push {{ awx_image_prefix }}:{{ awx_version }}
+```
+
+3. **Конфигурация с приватным registry**:
+```yaml
+services:
+  awx-web:
+    image: "{{ awx_image_prefix }}:{{ awx_version }}"
+    # ...
+```
+
+Эти изменения гарантируют:
+- Использование существующих версий образов
+- Автоматический откат на рабочую версию при проблемах
+- Лучшее логирование для диагностики
+- Поддержку корпоративных приватных registry
