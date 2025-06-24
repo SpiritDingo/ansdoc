@@ -369,3 +369,197 @@ networks:
 ```
 
 Этот подход обеспечивает надежное и масштабируемое развертывание AWX в enterprise-окружении с возможностью централизованного управления через Ansible.
+
+
+Вот полная Ansible роль для подготовки сервера к установке AWX в Docker Compose:
+
+```yaml
+# roles/prepare_awx_server/tasks/main.yml
+---
+- name: Install required system packages
+  apt:
+    name: "{{ item }}"
+    state: present
+    update_cache: yes
+  loop:
+    - apt-transport-https
+    - ca-certificates
+    - curl
+    - gnupg-agent
+    - software-properties-common
+    - python3-pip
+    - git
+    - make
+    - gcc
+    - python3-dev
+    - libssl-dev
+    - libffi-dev
+    - docker-compose-plugin
+  when: ansible_os_family == 'Debian'
+
+- name: Install required packages for RHEL
+  yum:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - yum-utils
+    - device-mapper-persistent-data
+    - lvm2
+    - python3-pip
+    - git
+    - gcc
+    - python3-devel
+    - openssl-devel
+    - libffi-devel
+  when: ansible_os_family == 'RedHat'
+
+- name: Add Docker GPG key
+  apt_key:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    state: present
+  when: ansible_os_family == 'Debian'
+
+- name: Add Docker repository for Debian
+  apt_repository:
+    repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+    state: present
+  when: ansible_os_family == 'Debian'
+
+- name: Add Docker repository for RHEL
+  yum_repository:
+    name: docker-ce
+    description: Docker CE Stable
+    baseurl: https://download.docker.com/linux/centos/$releasever/$basearch/stable
+    gpgcheck: yes
+    gpgkey: https://download.docker.com/linux/centos/gpg
+    enabled: yes
+  when: ansible_os_family == 'RedHat'
+
+- name: Install Docker
+  package:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+    state: present
+
+- name: Install Docker Compose
+  pip:
+    name: docker-compose
+    state: present
+    executable: pip3
+
+- name: Add current user to docker group
+  user:
+    name: "{{ ansible_user }}"
+    groups: docker
+    append: yes
+
+- name: Enable and start Docker service
+  systemd:
+    name: docker
+    state: started
+    enabled: yes
+
+- name: Validate Docker installation
+  command: docker --version
+  register: docker_version
+  changed_when: false
+
+- name: Display Docker version
+  debug:
+    msg: "Docker version: {{ docker_version.stdout }}"
+
+- name: Validate Docker Compose installation
+  command: docker-compose --version
+  register: docker_compose_version
+  changed_when: false
+
+- name: Display Docker Compose version
+  debug:
+    msg: "Docker Compose version: {{ docker_compose_version.stdout }}"
+
+- name: Create directory structure for AWX
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0755'
+  loop:
+    - /opt/awx
+    - /opt/awx/projects
+    - /opt/awx/config
+
+- name: Set kernel parameters for AWX
+  sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    state: present
+    reload: yes
+  loop:
+    - { name: "vm.max_map_count", value: "262144" }
+    - { name: "net.ipv4.ip_local_port_range", value: "1024 65000" }
+    - { name: "net.ipv4.tcp_fin_timeout", value: "30" }
+```
+
+```yaml
+# roles/prepare_awx_server/defaults/main.yml
+---
+# Docker version settings
+docker_version: "20.10.23"
+docker_compose_version: "2.17.2"
+
+# System settings
+awx_base_dir: "/opt/awx"
+awx_user: "awx"
+awx_group: "awx"
+
+# Resource limits
+file_descriptor_limit: 65536
+```
+
+```yaml
+# roles/prepare_awx_server/handlers/main.yml
+---
+- name: restart docker
+  systemd:
+    name: docker
+    state: restarted
+    enabled: yes
+```
+
+Пример использования роли в playbook:
+
+```yaml
+# playbook-prepare-awx.yml
+---
+- name: Prepare servers for AWX installation
+  hosts: awx_servers
+  become: yes
+  vars:
+    docker_version: "24.0.5"
+    docker_compose_version: "2.21.0"
+  
+  roles:
+    - prepare_awx_server
+```
+
+Эта роль выполняет:
+
+1. Установку необходимых системных пакетов (поддерживает Debian/Ubuntu и RHEL/CentOS)
+2. Установку Docker и Docker Compose
+3. Настройку системного пользователя
+4. Создание необходимой директории для AWX
+5. Настройку параметров ядра для оптимальной работы AWX
+6. Проверку корректности установки компонентов
+
+Для enterprise-окружения рекомендуется дополнительно:
+
+1. Настроить proxy для доступа к Docker Hub (если требуется)
+2. Добавить корпоративные SSL-сертификаты
+3. Настроить централизованный сбор логов
+4. Интегрировать с системой мониторинга
+5. Настроить бэкап важных директорий
+
+Вы можете переопределить любые параметры из defaults/main.yml при вызове роли, как показано в примере playbook.
