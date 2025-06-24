@@ -1352,3 +1352,144 @@ ansible-vault encrypt roles/awx_docker/vars/awx.yml
 2. Пароли соответствуют требованиям безопасности
 3. Конфигурация Redis работает корректно
 4. Развертывание проходит без ошибок
+
+
+
+Ошибка указывает, что Ansible не может найти файл шаблона `awx.env.j2`. Давайте полностью исправим эту проблему и улучшим структуру роли.
+
+### Полное исправление роли для AWX с Docker Compose v2+
+
+1. **Правильная структура файлов**:
+
+```
+roles/awx_docker/
+├── defaults
+│   └── main.yml
+├── files
+│   ├── awx.env          # Файл окружения (не шаблон)
+├── tasks
+│   ├── main.yml
+│   ├── install_docker.yml
+│   └── configure_awx.yml
+└── templates
+    └── docker-compose.yml.j2  # Только docker-compose как шаблон
+```
+
+2. **Исправленный файл `files/awx.env`**:
+
+```ini
+# Файл окружения AWX
+AWX_ADMIN_USER=admin
+AWX_ADMIN_PASSWORD=changeme
+SECRET_KEY=awxsecret
+DATABASE_USER=awx
+DATABASE_PASSWORD=awxpass
+DATABASE_HOST=postgres
+DATABASE_PORT=5432
+DATABASE_NAME=awx
+REDIS_HOST=redis
+REDIS_PORT=6379
+REDIS_PASSWORD=redispass
+```
+
+3. **Обновленные задачи в `tasks/configure_awx.yml`**:
+
+```yaml
+- name: Create AWX directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0755'
+  loop:
+    - /opt/awx
+    - /opt/awx/config
+    - /opt/awx/projects
+
+- name: Copy docker-compose template
+  template:
+    src: docker-compose.yml.j2
+    dest: /opt/awx/docker-compose.yml
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0644'
+
+- name: Copy environment file
+  copy:
+    src: awx.env
+    dest: /opt/awx/awx.env
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0600'
+
+- name: Validate Docker Compose file
+  command: "{{ compose_command }} -f /opt/awx/docker-compose.yml config"
+  register: compose_validate
+  changed_when: false
+
+- name: Pull AWX images
+  command: "{{ compose_command }} -f /opt/awx/docker-compose.yml pull"
+  args:
+    chdir: /opt/awx
+
+- name: Deploy AWX stack
+  command: "{{ compose_command }} -f /opt/awx/docker-compose.yml up -d"
+  args:
+    chdir: /opt/awx
+```
+
+4. **Ключевые изменения**:
+
+- Убрали `awx.env.j2` как шаблон, так как он не требует подстановки переменных
+- Используем модуль `copy` вместо `template` для статичного файла окружения
+- Добавили валидацию docker-compose файла перед запуском
+- Упростили структуру файлов
+
+5. **Как исправить ошибку**:
+
+1. Убедитесь, что файл существует в правильной директории:
+```bash
+mkdir -p roles/awx_docker/files
+touch roles/awx_docker/files/awx.env
+```
+
+2. Заполните файл `awx.env` необходимыми переменными (как показано выше)
+
+3. Для динамических значений используйте `defaults/main.yml`:
+
+```yaml
+# defaults/main.yml
+awx_admin_user: admin
+awx_admin_password: changeme
+awx_secret_key: awxsecret
+pg_username: awx
+pg_password: awxpass
+redis_password: redispass
+```
+
+6. **Enterprise-рекомендации**:
+
+- Для безопасности используйте Ansible Vault для шифрования паролей:
+```bash
+ansible-vault encrypt roles/awx_docker/files/awx.env
+```
+
+- Или генерируйте секреты во время выполнения:
+
+```yaml
+- name: Generate secrets if not defined
+  set_fact:
+    awx_secret_key: "{{ lookup('password', '/dev/null length=64 chars=ascii_letters,digits') }}"
+    pg_password: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+    redis_password: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+  when: 
+    - awx_secret_key is not defined
+    - pg_password is not defined
+    - redis_password is not defined
+```
+
+Теперь роль должна работать без ошибок, так как:
+1. Все файлы находятся в правильных директориях
+2. Нет попыток использовать несуществующие шаблоны
+3. Структура роли соответствует best practices Ansible
