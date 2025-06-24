@@ -691,3 +691,135 @@ docker-compose --version
 1. Заранее скачать бинарник docker-compose во внутренний репозиторий
 2. Изменить URL в роли на внутренний адрес
 3. Добавить проверку контрольной суммы файла
+
+
+Эта ошибка возникает из-за неправильного использования зарегистрированной переменной `docker_compose_version`. Давайте полностью переработаем секцию проверки и отображения версий Docker и Docker Compose в роли.
+
+### Исправленная версия задач для проверки версий:
+
+```yaml
+# roles/awx_prepare_server/tasks/main.yml
+---
+
+# ... (предыдущие задачи остаются без изменений)
+
+- name: Get Docker version
+  command: docker --version
+  register: docker_version_check
+  changed_when: false
+  ignore_errors: yes
+
+- name: Display Docker version
+  debug:
+    msg: "Docker version info: {{ docker_version_check.stdout | default('Docker not found') }}"
+  when: docker_version_check is not failed
+
+- name: Verify Docker works
+  command: docker info
+  register: docker_info_check
+  changed_when: false
+  ignore_errors: yes
+  when: docker_version_check is not failed
+
+- name: Get Docker Compose version
+  command: docker-compose --version
+  register: docker_compose_check
+  changed_when: false
+  ignore_errors: yes
+
+- name: Display Docker Compose version
+  debug:
+    msg: "Docker Compose version info: {{ docker_compose_check.stdout | default('Docker Compose not found') }}"
+  when: docker_compose_check is not failed
+
+- name: Fail if Docker not working
+  fail:
+    msg: |
+      Docker installation failed!
+      Version check: {{ docker_version_check.stdout | default('N/A') }}
+      Docker info: {{ docker_info_check.stdout | default('N/A') }}
+  when: docker_version_check is failed or docker_info_check is failed
+
+- name: Fail if Docker Compose not working
+  fail:
+    msg: |
+      Docker Compose installation failed!
+      Version check: {{ docker_compose_check.stdout | default('N/A') }}
+  when: docker_compose_check is failed
+
+# ... (остальные задачи продолжаются)
+```
+
+### Ключевые улучшения:
+
+1. **Более надежная проверка версий**:
+   - Отдельные задачи для проверки `docker` и `docker-compose`
+   - Проверка не только версии, но и работоспособности (`docker info`)
+
+2. **Лучшая обработка ошибок**:
+   - `ignore_errors: yes` для всех проверочных команд
+   - Явные условия `when` для отображения информации только при успехе
+
+3. **Информативные сообщения об ошибках**:
+   - Подробный вывод при проблемах с установкой
+   - Четкое разделение ошибок Docker и Docker Compose
+
+4. **Защита от undefined переменных**:
+   - Использование фильтра `default()` для всех переменных
+   - Проверка `is not failed` перед использованием результатов
+
+### Дополнительные рекомендации:
+
+1. Для enterprise-окружения добавьте проверку контрольных сумм:
+
+```yaml
+- name: Verify Docker Compose checksum
+  get_url:
+    url: "https://github.com/docker/compose/releases/download/v{{ docker_compose_version }}/docker-compose-{{ ansible_system }}-{{ ansible_architecture }}.sha256"
+    dest: /tmp/docker-compose.sha256
+  register: compose_checksum_file
+  when: github_available is succeeded
+
+- name: Validate Docker Compose binary
+  command: sha256sum -c /tmp/docker-compose.sha256
+  args:
+    chdir: /usr/local/bin
+  when: compose_checksum_file is succeeded
+```
+
+2. Для лучшей поддержки разных ОС добавьте в defaults:
+
+```yaml
+# roles/awx_prepare_server/defaults/main.yml
+docker_compose_binary_name: "docker-compose"
+docker_compose_path: "/usr/local/bin/docker-compose"
+docker_compose_alternate_paths:
+  - "/usr/bin/docker-compose"
+  - "/usr/local/bin/docker-compose"
+  - "/bin/docker-compose"
+```
+
+3. Обновите задачу проверки версии Docker Compose:
+
+```yaml
+- name: Find Docker Compose binary
+  find:
+    paths: "{{ docker_compose_alternate_paths }}"
+    patterns: "{{ docker_compose_binary_name }}"
+    file_type: file
+  register: docker_compose_binary
+  changed_when: false
+
+- name: Set Docker Compose path fact
+  set_fact:
+    docker_compose_executable: "{{ docker_compose_binary.files[0].path | default(docker_compose_path) }}"
+  when: docker_compose_binary.matched > 0
+
+- name: Get Docker Compose version
+  command: "{{ docker_compose_executable }} --version"
+  register: docker_compose_check
+  changed_when: false
+  ignore_errors: yes
+```
+
+Эти изменения сделают вашу роль более надежной и подходящей для production-окружений.
