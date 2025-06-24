@@ -1208,3 +1208,147 @@ networks:
 ```bash
 ansible-playbook -i inventory.ini playbook-awx.yml
 ```
+
+
+Ошибка возникает из-за отсутствия определения переменной `redis_password`. Давайте исправим роль, чтобы она корректно работала с Redis. Вот полное исправление:
+
+### 1. Обновим `defaults/main.yml`
+
+Добавим все необходимые переменные для Redis:
+
+```yaml
+# Redis configuration
+redis_enabled: true
+redis_host: "redis"
+redis_port: 6379
+redis_password: "awx_redis_password"  # Добавляем значение по умолчанию
+redis_mem_limit: "1g"
+```
+
+### 2. Модифицируем `files/docker-compose.yml.j2`
+
+Обновим конфигурацию Redis в docker-compose:
+
+```yaml
+  redis:
+    image: redis:{{ redis_version }}
+    container_name: awx-redis
+    command: redis-server --requirepass {{ redis_password }}
+    volumes:
+      - awx_redis_data:/data:Z
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "{{ redis_password }}", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: "{{ redis_mem_limit }}"
+    restart: unless-stopped
+    networks:
+      - awx_network
+```
+
+### 3. Обновим `tasks/configure_awx.yml`
+
+Добавим проверку переменных:
+
+```yaml
+- name: Validate Redis configuration
+  assert:
+    that:
+      - redis_password is defined
+      - redis_password | length >= 8
+    fail_msg: "Redis password must be defined and at least 8 characters long"
+    success_msg: "Redis configuration validated"
+```
+
+### 4. Создадим файл `vars/awx.yml` для переопределения
+
+```yaml
+# vars/awx.yml
+redis_password: "your_secure_password_here"  # Замените на реальный пароль
+```
+
+### 5. Полностью исправленная роль
+
+Структура роли теперь должна включать:
+
+```
+roles/awx_docker/
+├── defaults
+│   └── main.yml          # Все переменные по умолчанию
+├── vars
+│   └── awx.yml           # Переопределения для enterprise
+├── files
+│   ├── docker-compose.yml.j2
+│   └── awx.env.j2
+├── tasks
+│   ├── main.yml
+│   ├── install_docker.yml
+│   └── configure_awx.yml
+└── templates
+    └── nginx.conf.j2
+```
+
+### 6. Исправленный playbook
+
+```yaml
+# playbook-awx.yml
+---
+- name: Deploy AWX with Docker Compose v2
+  hosts: awx_servers
+  become: yes
+  vars_files:
+    - roles/awx_docker/vars/awx.yml  # Явное указание файла с переменными
+
+  pre_tasks:
+    - name: Ensure variables are defined
+      assert:
+        that:
+          - redis_password is defined
+          - redis_password | length >= 8
+        fail_msg: "Required variables are not properly defined"
+
+  roles:
+    - role: awx_docker
+```
+
+### 7. Как развернуть с исправлениями
+
+1. Создайте файл с переменными:
+```bash
+mkdir -p roles/awx_docker/vars
+echo 'redis_password: "your_strong_password"' > roles/awx_docker/vars/awx.yml
+```
+
+2. Запустите playbook с проверкой переменных:
+```bash
+ansible-playbook -i inventory.ini playbook-awx.yml --extra-vars "@roles/awx_docker/vars/awx.yml"
+```
+
+### 8. Дополнительные меры безопасности
+
+1. **Шифрование паролей**:
+Используйте Ansible Vault для защиты чувствительных данных:
+```bash
+ansible-vault encrypt roles/awx_docker/vars/awx.yml
+```
+
+2. **Генерация паролей**:
+Можно автоматически генерировать пароли:
+
+```yaml
+# В tasks/configure_awx.yml
+- name: Generate Redis password if not defined
+  set_fact:
+    redis_password: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+  when: redis_password is not defined
+```
+
+Эти изменения гарантируют, что:
+1. Все обязательные переменные определены
+2. Пароли соответствуют требованиям безопасности
+3. Конфигурация Redis работает корректно
+4. Развертывание проходит без ошибок
