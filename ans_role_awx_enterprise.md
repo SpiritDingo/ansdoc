@@ -563,3 +563,131 @@ file_descriptor_limit: 65536
 5. Настроить бэкап важных директорий
 
 Вы можете переопределить любые параметры из defaults/main.yml при вызове роли, как показано в примере playbook.
+
+
+Ошибка указывает, что `docker-compose` не установлен или не находится в PATH. Давайте исправим роль для корректной установки Docker Compose.
+
+### Исправленная роль для установки Docker Compose:
+
+```yaml
+# roles/awx_prepare_server/tasks/main.yml
+---
+- name: Set default remote user
+  set_fact:
+    remote_user: "{{ ansible_user | default(lookup('env', 'USER') | default('root')) }}"
+
+# ... (предыдущие задачи остаются без изменений до установки Docker Compose)
+
+- name: Install Docker Compose (official method)
+  block:
+    - name: Download Docker Compose binary
+      get_url:
+        url: "https://github.com/docker/compose/releases/download/v{{ docker_compose_version }}/docker-compose-{{ ansible_system }}-{{ ansible_architecture }}"
+        dest: /usr/local/bin/docker-compose
+        mode: '0755'
+      register: download_compose
+      until: download_compose is succeeded
+      retries: 3
+      delay: 10
+
+    - name: Create symlink for Docker Compose
+      file:
+        src: /usr/local/bin/docker-compose
+        dest: /usr/bin/docker-compose
+        state: link
+        force: yes
+
+  rescue:
+    - name: Install Docker Compose via pip (fallback)
+      pip:
+        name: docker-compose
+        state: present
+        executable: pip3
+
+- name: Verify Docker Compose installation
+  command: docker-compose --version
+  register: docker_compose_check
+  changed_when: false
+  ignore_errors: yes
+
+- name: Fail if Docker Compose not installed
+  fail:
+    msg: "Failed to install Docker Compose. Please install manually."
+  when: docker_compose_check is failed
+
+# ... (остальные задачи остаются без изменений)
+```
+
+### Обновленный файл defaults/main.yml:
+
+```yaml
+# roles/awx_prepare_server/defaults/main.yml
+---
+docker_compose_version: "2.23.0"  # Последняя стабильная версия
+docker_compose_path: "/usr/local/bin/docker-compose"
+```
+
+### Почему это работает лучше:
+
+1. **Два метода установки**:
+   - Основной метод: загрузка бинарного файла напрямую с GitHub
+   - Резервный метод: установка через pip (если первый не сработал)
+
+2. **Проверка установки**:
+   - Явная проверка что docker-compose работает
+   - Фейл с понятным сообщением если установка не удалась
+
+3. **Поддержка разных архитектур**:
+   - Использует `ansible_system` и `ansible_architecture` для правильного выбора бинарника
+
+### Дополнительные улучшения:
+
+1. Добавьте в начало playbook проверку подключения к GitHub:
+
+```yaml
+- name: Check GitHub connectivity
+  uri:
+    url: https://github.com
+    status_code: 200
+    timeout: 5
+  register: github_available
+  ignore_errors: yes
+  changed_when: false
+```
+
+2. Модифицируйте задачу установки:
+
+```yaml
+- name: Install Docker Compose
+  block:
+    - name: Download Docker Compose (if GitHub available)
+      get_url:
+        url: "https://github.com/docker/compose/releases/download/v{{ docker_compose_version }}/docker-compose-{{ ansible_system }}-{{ ansible_architecture }}"
+        dest: "{{ docker_compose_path }}"
+        mode: '0755'
+      when: github_available is succeeded
+  rescue:
+    - name: Install via pip (fallback)
+      pip:
+        name: docker-compose
+        state: present
+        executable: pip3
+```
+
+### Как проверить работу:
+
+После применения роли выполните вручную на сервере:
+```bash
+docker-compose --version
+# Должно показать: Docker Compose version v2.23.0
+```
+
+Если проблема сохраняется:
+1. Проверьте доступность GitHub из вашего сервера
+2. Убедитесь что /usr/local/bin в PATH
+3. Проверьте права на файл /usr/local/bin/docker-compose (должны быть 755)
+
+Для enterprise-окружения рекомендуется:
+1. Заранее скачать бинарник docker-compose во внутренний репозиторий
+2. Изменить URL в роли на внутренний адрес
+3. Добавить проверку контрольной суммы файла
