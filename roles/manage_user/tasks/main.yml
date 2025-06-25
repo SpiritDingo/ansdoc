@@ -1,0 +1,58 @@
+---
+- name: Ensure group exists
+  group:
+    name: "{{ user_name }}"
+    state: "{{ user_state }}"
+  when: user_state == 'present'
+
+- name: Manage user account
+  user:
+    name: "{{ user_name }}"
+    group: "{{ user_name }}"
+    groups: "{{ user_groups }}"
+    append: yes
+    shell: "{{ user_shell }}"
+    home: "{{ user_home }}"
+    password: "{{ user_password if user_password_manage else omit }}"
+    state: "{{ user_state }}"
+    system: no
+    create_home: yes
+    generate_ssh_key: no
+
+- name: Setup SSH authorized key
+  block:
+    - name: Ensure .ssh directory exists
+      file:
+        path: "{{ user_home }}/.ssh"
+        state: directory
+        owner: "{{ user_name }}"
+        group: "{{ user_name }}"
+        mode: 0700
+
+    - name: Add authorized key
+      template:
+        src: authorized_keys.j2
+        dest: "{{ user_home }}/.ssh/authorized_keys"
+        owner: "{{ user_name }}"
+        group: "{{ user_name }}"
+        mode: 0600
+  when: 
+    - user_state == 'present'
+    - user_ssh_key_manage
+    - user_ssh_key != ""
+
+- name: Configure sudo access
+  copy:
+    dest: "/etc/sudoers.d/{{ user_name }}"
+    content: |
+      {{ user_name }} ALL=(ALL) {% if user_sudo_nopasswd %}NOPASSWD:{% endif %}ALL
+    validate: "visudo -cf %s"
+  when: 
+    - user_state == 'present'
+    - user_sudo_access
+
+- name: Clean up sudo config when user is removed
+  file:
+    path: "/etc/sudoers.d/{{ user_name }}"
+    state: absent
+  when: user_state == 'absent'

@@ -1,0 +1,19 @@
+---
+# Основные параметры пользователя
+user_name: ansible
+user_groups: "sudo"
+user_home: "/home/{{ user_name }}"
+user_shell: "/bin/bash"
+user_state: present  # или 'absent' для удаления пользователя
+
+# Настройки SSH-ключа
+user_ssh_key: ""  # публичный SSH-ключ (если пустой - ключ не добавляется)
+user_ssh_key_manage: true  # управлять SSH-ключами пользователя
+
+# Настройки пароля
+user_password: ""  # хэшированный пароль (если пустой - пароль не меняется)
+user_password_manage: false  # управлять паролем пользователя
+
+# Настройки sudo
+user_sudo_access: true  # давать ли права sudo
+user_sudo_nopasswd: true  # разрешить sudo без пароля
