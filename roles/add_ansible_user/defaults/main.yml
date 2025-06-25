@@ -1,0 +1,11 @@
+---
+# Имя пользователя по умолчанию
+ansible_user: ansible
+# Группы, в которые будет добавлен пользователь
+ansible_user_groups: "sudo"
+# Домашний каталог пользователя
+ansible_user_home: "/home/{{ ansible_user }}"
+# Shell пользователя
+ansible_user_shell: "/bin/bash"
+# Публичный ключ (можно переопределить при вызове роли)
+ansible_user_ssh_key: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ..."

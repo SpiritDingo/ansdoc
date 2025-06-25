@@ -1,0 +1,2 @@
+        ansible_user: "myadmin"
+        ansible_user_ssh_key: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC..."
