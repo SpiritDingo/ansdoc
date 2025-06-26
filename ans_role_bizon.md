@@ -125,7 +125,353 @@ export BZ_AGENT_GROUPS='{{ bz_agent_groups }}'
 
 Роль можно расширить для поддержки дополнительных параметров агента или добавить обработку ошибок.
 
+# Универсальная Ansible роль для установки агента BI.ZONE EDR
 
+Вот улучшенная универсальная роль, которая поддерживает различные сценарии установки, проверки и обновления агента.
+
+## Структура роли
+
+```
+roles/bzone_edr_agent/
+├── defaults/
+│   └── main.yml
+├── tasks/
+│   ├── main.yml
+│   ├── install_deb.yml
+│   ├── install_rpm.yml
+│   ├── configure.yml
+│   ├── service.yml
+│   └── verify.yml
+├── templates/
+│   └── bz-agent.conf.j2
+├── vars/
+│   └── main.yml
+└── handlers/
+    └── main.yml
+```
+
+## Файлы роли
+
+### defaults/main.yml
+
+```yaml
+---
+# Основные параметры
+bz_agent_install: true
+bz_agent_upgrade: false
+bz_agent_force_install: false
+
+# Тип пакета (auto/rpm/deb)
+bz_agent_pkg_type: "auto"
+
+# Путь к пакету (если не указан, будет попытка установки из репозитория)
+bz_agent_pkg_path: ""
+
+# Параметры подключения (обязательные)
+bz_authority_service: ""
+bz_sensors_service: ""
+
+# Дополнительные параметры
+bz_polling_period: "300s"
+bz_dial_timeout: "15s"
+bz_agent_groups: ""
+bz_agent_tags: ""
+bz_agent_http_proxy: ""
+bz_agent_https_proxy: ""
+bz_agent_no_proxy: ""
+
+# Настройки сервиса
+bz_agent_service_state: "started"
+bz_agent_service_enabled: true
+
+# Проверка установки
+bz_agent_verify_installation: true
+bz_agent_verify_timeout: 120
+```
+
+### tasks/main.yml
+
+```yaml
+---
+- name: Проверка предварительных условий
+  ansible.builtin.assert:
+    that:
+      - bz_authority_service != ""
+      - bz_sensors_service != ""
+    msg: "Не указаны обязательные параметры bz_authority_service и bz_sensors_service"
+
+- name: Определение типа пакета (если auto)
+  ansible.builtin.set_fact:
+    bz_agent_actual_pkg_type: "{{ 'deb' if ansible_facts['pkg_mgr'] == 'apt' else 'rpm' }}"
+  when: bz_agent_pkg_type == "auto"
+
+- name: Установка фактического типа пакета
+  ansible.builtin.set_fact:
+    bz_agent_actual_pkg_type: "{{ bz_agent_pkg_type }}"
+  when: bz_agent_pkg_type != "auto"
+
+- name: Проверка установленного агента
+  ansible.builtin.command: which bzsenagent
+  register: bz_agent_installed
+  ignore_errors: yes
+  changed_when: false
+
+- name: Получение текущей версии агента
+  ansible.builtin.command: bzsenagent --version
+  register: bz_agent_version
+  changed_when: false
+  ignore_errors: yes
+
+- name: Установка факта наличия агента
+  ansible.builtin.set_fact:
+    bz_agent_is_installed: "{{ bz_agent_installed.rc == 0 }}"
+    bz_agent_current_version: "{{ bz_agent_version.stdout | default('') }}"
+
+- name: Пропуск установки (если агент уже установлен и не требуется принудительная установка)
+  ansible.builtin.meta: end_play
+  when: bz_agent_is_installed and not bz_agent_force_install and not bz_agent_upgrade
+
+- include_tasks: install_{{ bz_agent_actual_pkg_type }}.yml
+  when: bz_agent_install
+
+- include_tasks: configure.yml
+  when: bz_agent_install or bz_agent_upgrade
+
+- include_tasks: service.yml
+
+- include_tasks: verify.yml
+  when: bz_agent_verify_installation
+```
+
+### tasks/install_deb.yml
+
+```yaml
+---
+- name: Установка зависимостей для DEB
+  ansible.builtin.apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg
+    state: present
+    update_cache: yes
+
+- name: Добавление GPG ключа репозитория BI.ZONE
+  ansible.builtin.apt_key:
+    url: https://repo.bi.zone/keys/bz-apt-key.gpg
+    state: present
+  when: bz_agent_pkg_path == ""
+
+- name: Добавление репозитория BI.ZONE
+  ansible.builtin.apt_repository:
+    repo: "deb [arch=amd64] https://repo.bi.zone/apt stable main"
+    state: present
+    update_cache: yes
+  when: bz_agent_pkg_path == ""
+
+- name: Установка агента из DEB пакета
+  ansible.builtin.apt:
+    deb: "{{ bz_agent_pkg_path }}"
+    state: present
+  environment: "{{ bz_agent_env_vars }}"
+  when: bz_agent_pkg_path != ""
+
+- name: Установка агента из репозитория
+  ansible.builtin.apt:
+    name: bzsenagent
+    state: "{{ 'latest' if bz_agent_upgrade else 'present' }}"
+    update_cache: yes
+  environment: "{{ bz_agent_env_vars }}"
+  when: bz_agent_pkg_path == ""
+```
+
+### tasks/install_rpm.yml
+
+```yaml
+---
+- name: Установка зависимостей для RPM
+  ansible.builtin.yum:
+    name:
+      - yum-utils
+      - curl
+    state: present
+
+- name: Добавление репозитория BI.ZONE
+  ansible.builtin.get_url:
+    url: https://repo.bi.zone/yum/bz.repo
+    dest: /etc/yum.repos.d/bz.repo
+    mode: '0644'
+  when: bz_agent_pkg_path == ""
+
+- name: Установка агента из RPM пакета
+  ansible.builtin.yum:
+    name: "{{ bz_agent_pkg_path }}"
+    state: present
+    disable_gpg_check: yes
+  environment: "{{ bz_agent_env_vars }}"
+  when: bz_agent_pkg_path != ""
+
+- name: Установка агента из репозитория
+  ansible.builtin.yum:
+    name: bzsenagent
+    state: "{{ 'latest' if bz_agent_upgrade else 'present' }}"
+  environment: "{{ bz_agent_env_vars }}"
+  when: bz_agent_pkg_path == ""
+```
+
+### tasks/configure.yml
+
+```yaml
+---
+- name: Создание конфигурационного файла агента
+  ansible.builtin.template:
+    src: bz-agent.conf.j2
+    dest: /etc/bzsenagent/config.yaml
+    owner: root
+    group: root
+    mode: '0640'
+  notify: Restart bzsenagent service
+```
+
+### tasks/service.yml
+
+```yaml
+---
+- name: Управление сервисом bzsenagent
+  ansible.builtin.systemd:
+    name: bzsenagent
+    state: "{{ bz_agent_service_state }}"
+    enabled: "{{ bz_agent_service_enabled }}"
+    daemon_reload: yes
+```
+
+### tasks/verify.yml
+
+```yaml
+---
+- name: Ожидание запуска агента
+  ansible.builtin.wait_for:
+    path: /var/run/bzsenagent/bzsenagent.pid
+    state: present
+    timeout: "{{ bz_agent_verify_timeout }}"
+
+- name: Проверка статуса агента
+  ansible.builtin.command: bzsenagent status
+  register: agent_status
+  changed_when: false
+
+- name: Вывод статуса агента
+  ansible.builtin.debug:
+    var: agent_status.stdout_lines
+```
+
+### templates/bz-agent.conf.j2
+
+```yaml
+# BI.ZONE EDR Agent Configuration
+# Managed by Ansible - DO NOT EDIT MANUALLY
+
+authority_service: "{{ bz_authority_service }}"
+sensors_service: "{{ bz_sensors_service }}"
+polling_period: "{{ bz_polling_period }}"
+dial_timeout: "{{ bz_dial_timeout }}"
+
+{% if bz_agent_groups %}
+agent_groups: [{{ bz_agent_groups.split(',') | map('trim') | join(', ') }}]
+{% endif %}
+
+{% if bz_agent_tags %}
+tags:
+  {% for tag in bz_agent_tags.split(',') %}
+  - {{ tag | trim }}
+  {% endfor %}
+{% endif %}
+
+{% if bz_agent_http_proxy %}
+http_proxy: "{{ bz_agent_http_proxy }}"
+{% endif %}
+
+{% if bz_agent_https_proxy %}
+https_proxy: "{{ bz_agent_https_proxy }}"
+{% endif %}
+
+{% if bz_agent_no_proxy %}
+no_proxy: "{{ bz_agent_no_proxy }}"
+{% endif %}
+```
+
+### handlers/main.yml
+
+```yaml
+---
+- name: Restart bzsenagent service
+  ansible.builtin.systemd:
+    name: bzsenagent
+    state: restarted
+    enabled: yes
+    daemon_reload: yes
+```
+
+## Пример использования роли
+
+### Установка из репозитория
+
+```yaml
+- hosts: all
+  roles:
+    - role: bzone_edr_agent
+      vars:
+        bz_authority_service: "mgmt.example.com:80"
+        bz_sensors_service: "mgmt.example.com:443"
+        bz_agent_groups: "prod,linux"
+        bz_agent_tags: "env=production,role=webserver"
+```
+
+### Установка из локального пакета
+
+```yaml
+- hosts: all
+  roles:
+    - role: bzone_edr_agent
+      vars:
+        bz_agent_pkg_path: "/tmp/bzsenagent-latest.rpm"
+        bz_authority_service: "mgmt.example.com:80"
+        bz_sensors_service: "mgmt.example.com:443"
+        bz_agent_force_install: true
+```
+
+### Обновление агента
+
+```yaml
+- hosts: all
+  roles:
+    - role: bzone_edr_agent
+      vars:
+        bz_agent_upgrade: true
+        bz_authority_service: "mgmt.example.com:80"
+        bz_sensors_service: "mgmt.example.com:443"
+```
+
+## Особенности роли
+
+1. **Автоматическое определение типа ОС** (RPM/DEB) при `bz_agent_pkg_type: "auto"`
+2. **Поддержка нескольких сценариев**:
+   - Установка из репозитория BI.ZONE
+   - Установка из локального пакета
+   - Обновление существующего агента
+   - Принудительная переустановка
+3. **Гибкая конфигурация**:
+   - Поддержка групп и тегов агента
+   - Настройка прокси
+   - Контроль параметров подключения
+4. **Проверка установки**:
+   - Верификация установки
+   - Проверка версии
+   - Контроль состояния сервиса
+5. **Идемпотентность** - роль можно запускать многократно без побочных эффектов
+
+Роль может быть легко расширена для поддержки дополнительных параметров конфигурации или интеграции с другими системами.
 
 # Универсальная Ansible роль для установки агента BI.ZONE EDR с локальными пакетами
 
