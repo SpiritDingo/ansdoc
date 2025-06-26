@@ -805,3 +805,74 @@ bz_agent_verify_timeout: 120
 5. **Улучшенная обработка зависимостей** - установка только при необходимости
 
 Роль теперь полностью самодостаточна и может работать в изолированных средах без доступа к интернету, при условии размещения пакетов в директории `files`.
+
+
+
+
+Чтобы повысить права (privilege escalation) при установке DEB-пакета через модуль `apt`, нужно добавить директиву `become: yes`. Вот исправленная версия задачи:
+
+```yaml
+- name: Установка агента из локального DEB пакета
+  become: yes                # Повышение прав до root
+  become_method: sudo        # Метод повышения прав (по умолчанию sudo)
+  ansible.builtin.apt:
+    deb: "/tmp/{{ bz_agent_local_deb }}"
+    state: present
+  environment: "{{ bz_agent_env_vars }}"
+  when: bz_agent_use_local_pkg
+```
+
+Ключевые изменения:
+1. Добавлена директива `become: yes` - включает повышение привилегий
+2. Добавлена `become_method: sudo` (можно опустить, так как это значение по умолчанию)
+
+Полная улучшенная версия задачи с обработкой ошибок:
+
+```yaml
+- name: Установка агента из локального DEB пакета
+  become: yes
+  ansible.builtin.apt:
+    deb: "/tmp/{{ bz_agent_local_deb }}"
+    state: present
+    allow_unauthenticated: yes  # Если пакет не подписан
+    install_recommends: no      # Не устанавливать рекомендованные пакеты
+  environment: "{{ bz_agent_env_vars }}"
+  register: deb_install
+  ignore_errors: yes
+  when: bz_agent_use_local_pkg
+
+- name: Проверка успешности установки
+  ansible.builtin.assert:
+    that:
+      - deb_install is success or "is already the newest version" in deb_install.stderr
+    fail_msg: "Не удалось установить DEB пакет"
+    success_msg: "Пакет успешно установлен"
+```
+
+Дополнительные рекомендации:
+
+1. На уровне playbook можно задать глобальные настройки повышения прав:
+```yaml
+- hosts: all
+  become: yes               # Повышать права для всех задач
+  become_method: sudo       # Использовать sudo
+  become_user: root         # Переключаться на root (по умолчанию)
+  roles:
+    - role: bzone_edr_agent
+```
+
+2. Убедитесь, что пользователь Ansible имеет права sudo без пароля:
+```bash
+# В файле /etc/sudoers на целевых хостах
+ansible_user ALL=(ALL) NOPASSWD: ALL
+```
+
+3. Для сложных случаев можно использовать `command` вместо `apt`:
+```yaml
+- name: Альтернативная установка через dpkg
+  become: yes
+  ansible.builtin.command: >
+    dpkg -i --force-confdef --force-confold "/tmp/{{ bz_agent_local_deb }}"
+  args:
+    creates: "/usr/bin/bzsenagent"  # Проверка существования файла для идемпотентности
+```
