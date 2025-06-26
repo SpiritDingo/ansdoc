@@ -124,3 +124,338 @@ export BZ_AGENT_GROUPS='{{ bz_agent_groups }}'
    - Адреса серверов управления (authority и sensors)
 
 Роль можно расширить для поддержки дополнительных параметров агента или добавить обработку ошибок.
+
+
+
+# Универсальная Ansible роль для установки агента BI.ZONE EDR с локальными пакетами
+
+Вот модифицированная версия роли, где RPM и DEB пакеты хранятся в директории `files` самой роли.
+
+## Обновленная структура роли
+
+```
+roles/bzone_edr_agent/
+├── files/
+│   ├── bzsenagent-latest.rpm
+│   └── bzsenagent-latest.deb
+├── defaults/
+│   └── main.yml
+├── tasks/
+│   ├── main.yml
+│   ├── install_deb.yml
+│   ├── install_rpm.yml
+│   ├── configure.yml
+│   ├── service.yml
+│   └── verify.yml
+├── templates/
+│   └── bz-agent.conf.j2
+├── vars/
+│   └── main.yml
+└── handlers/
+    └── main.yml
+```
+
+## Ключевые изменения
+
+### defaults/main.yml
+
+```yaml
+---
+# Основные параметры
+bz_agent_install: true
+bz_agent_upgrade: false
+bz_agent_force_install: false
+
+# Тип пакета (auto/rpm/deb)
+bz_agent_pkg_type: "auto"
+
+# Использование локальных пакетов из роли
+bz_agent_use_local_pkg: true
+
+# Имена локальных пакетов (хранятся в files/)
+bz_agent_local_rpm: "bzsenagent-latest.rpm"
+bz_agent_local_deb: "bzsenagent-latest.deb"
+
+# Параметры подключения (обязательные)
+bz_authority_service: ""
+bz_sensors_service: ""
+```
+
+### tasks/main.yml (добавлен блок)
+
+```yaml
+- name: Определение пути к локальному пакету
+  ansible.builtin.set_fact:
+    bz_agent_pkg_path: "{{ role_path }}/files/{{ bz_agent_local_rpm if bz_agent_actual_pkg_type == 'rpm' else bz_agent_local_deb }}"
+  when: bz_agent_use_local_pkg
+```
+
+### tasks/install_deb.yml (обновлено)
+
+```yaml
+- name: Копирование DEB пакета на целевой хост
+  ansible.builtin.copy:
+    src: "{{ bz_agent_pkg_path }}"
+    dest: "/tmp/{{ bz_agent_local_deb }}"
+    remote_src: false
+  when: bz_agent_use_local_pkg
+
+- name: Установка агента из локального DEB пакета
+  ansible.builtin.apt:
+    deb: "/tmp/{{ bz_agent_local_deb }}"
+    state: present
+  environment: "{{ bz_agent_env_vars }}"
+  when: bz_agent_use_local_pkg
+```
+
+### tasks/install_rpm.yml (обновлено)
+
+```yaml
+- name: Копирование RPM пакета на целевой хост
+  ansible.builtin.copy:
+    src: "{{ bz_agent_pkg_path }}"
+    dest: "/tmp/{{ bz_agent_local_rpm }}"
+    remote_src: false
+  when: bz_agent_use_local_pkg
+
+- name: Установка агента из локального RPM пакета
+  ansible.builtin.yum:
+    name: "/tmp/{{ bz_agent_local_rpm }}"
+    state: present
+    disable_gpg_check: yes
+  environment: "{{ bz_agent_env_vars }}"
+  when: bz_agent_use_local_pkg
+```
+
+## Полный обновленный код роли
+
+### defaults/main.yml
+
+```yaml
+---
+# Основные параметры
+bz_agent_install: true
+bz_agent_upgrade: false
+bz_agent_force_install: false
+
+# Тип пакета (auto/rpm/deb)
+bz_agent_pkg_type: "auto"
+
+# Использование локальных пакетов из роли
+bz_agent_use_local_pkg: true
+
+# Имена локальных пакетов (хранятся в files/)
+bz_agent_local_rpm: "bzsenagent-latest.rpm"
+bz_agent_local_deb: "bzsenagent-latest.deb"
+
+# Параметры подключения (обязательные)
+bz_authority_service: ""
+bz_sensors_service: ""
+
+# Дополнительные параметры
+bz_polling_period: "300s"
+bz_dial_timeout: "15s"
+bz_agent_groups: ""
+bz_agent_tags: ""
+bz_agent_http_proxy: ""
+bz_agent_https_proxy: ""
+bz_agent_no_proxy: ""
+
+# Настройки сервиса
+bz_agent_service_state: "started"
+bz_agent_service_enabled: true
+
+# Проверка установки
+bz_agent_verify_installation: true
+bz_agent_verify_timeout: 120
+```
+
+### tasks/main.yml
+
+```yaml
+---
+- name: Проверка предварительных условий
+  ansible.builtin.assert:
+    that:
+      - bz_authority_service != ""
+      - bz_sensors_service != ""
+    msg: "Не указаны обязательные параметры bz_authority_service и bz_sensors_service"
+
+- name: Определение типа пакета (если auto)
+  ansible.builtin.set_fact:
+    bz_agent_actual_pkg_type: "{{ 'deb' if ansible_facts['pkg_mgr'] == 'apt' else 'rpm' }}"
+  when: bz_agent_pkg_type == "auto"
+
+- name: Установка фактического типа пакета
+  ansible.builtin.set_fact:
+    bz_agent_actual_pkg_type: "{{ bz_agent_pkg_type }}"
+  when: bz_agent_pkg_type != "auto"
+
+- name: Определение пути к локальному пакету
+  ansible.builtin.set_fact:
+    bz_agent_pkg_path: "{{ role_path }}/files/{{ bz_agent_local_rpm if bz_agent_actual_pkg_type == 'rpm' else bz_agent_local_deb }}"
+  when: bz_agent_use_local_pkg
+
+- name: Проверка установленного агента
+  ansible.builtin.command: which bzsenagent
+  register: bz_agent_installed
+  ignore_errors: yes
+  changed_when: false
+
+- name: Получение текущей версии агента
+  ansible.builtin.command: bzsenagent --version
+  register: bz_agent_version
+  changed_when: false
+  ignore_errors: yes
+
+- name: Установка факта наличия агента
+  ansible.builtin.set_fact:
+    bz_agent_is_installed: "{{ bz_agent_installed.rc == 0 }}"
+    bz_agent_current_version: "{{ bz_agent_version.stdout | default('') }}"
+
+- name: Пропуск установки (если агент уже установлен и не требуется принудительная установка)
+  ansible.builtin.meta: end_play
+  when: bz_agent_is_installed and not bz_agent_force_install and not bz_agent_upgrade
+
+- include_tasks: install_{{ bz_agent_actual_pkg_type }}.yml
+  when: bz_agent_install
+
+- include_tasks: configure.yml
+  when: bz_agent_install or bz_agent_upgrade
+
+- include_tasks: service.yml
+
+- include_tasks: verify.yml
+  when: bz_agent_verify_installation
+```
+
+### tasks/install_deb.yml
+
+```yaml
+---
+- name: Установка зависимостей для DEB
+  ansible.builtin.apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg
+    state: present
+    update_cache: yes
+  when: not bz_agent_use_local_pkg
+
+- name: Добавление GPG ключа репозитория BI.ZONE
+  ansible.builtin.apt_key:
+    url: https://repo.bi.zone/keys/bz-apt-key.gpg
+    state: present
+  when: not bz_agent_use_local_pkg
+
+- name: Добавление репозитория BI.ZONE
+  ansible.builtin.apt_repository:
+    repo: "deb [arch=amd64] https://repo.bi.zone/apt stable main"
+    state: present
+    update_cache: yes
+  when: not bz_agent_use_local_pkg
+
+- name: Копирование DEB пакета на целевой хост
+  ansible.builtin.copy:
+    src: "{{ bz_agent_pkg_path }}"
+    dest: "/tmp/{{ bz_agent_local_deb }}"
+    remote_src: false
+  when: bz_agent_use_local_pkg
+
+- name: Установка агента из локального DEB пакета
+  ansible.builtin.apt:
+    deb: "/tmp/{{ bz_agent_local_deb }}"
+    state: present
+  environment: "{{ bz_agent_env_vars }}"
+  when: bz_agent_use_local_pkg
+
+- name: Установка агента из репозитория
+  ansible.builtin.apt:
+    name: bzsenagent
+    state: "{{ 'latest' if bz_agent_upgrade else 'present' }}"
+    update_cache: yes
+  environment: "{{ bz_agent_env_vars }}"
+  when: not bz_agent_use_local_pkg
+
+- name: Удаление временного DEB пакета
+  ansible.builtin.file:
+    path: "/tmp/{{ bz_agent_local_deb }}"
+    state: absent
+  when: bz_agent_use_local_pkg
+```
+
+### tasks/install_rpm.yml
+
+```yaml
+---
+- name: Установка зависимостей для RPM
+  ansible.builtin.yum:
+    name:
+      - yum-utils
+      - curl
+    state: present
+  when: not bz_agent_use_local_pkg
+
+- name: Добавление репозитория BI.ZONE
+  ansible.builtin.get_url:
+    url: https://repo.bi.zone/yum/bz.repo
+    dest: /etc/yum.repos.d/bz.repo
+    mode: '0644'
+  when: not bz_agent_use_local_pkg
+
+- name: Копирование RPM пакета на целевой хост
+  ansible.builtin.copy:
+    src: "{{ bz_agent_pkg_path }}"
+    dest: "/tmp/{{ bz_agent_local_rpm }}"
+    remote_src: false
+  when: bz_agent_use_local_pkg
+
+- name: Установка агента из локального RPM пакета
+  ansible.builtin.yum:
+    name: "/tmp/{{ bz_agent_local_rpm }}"
+    state: present
+    disable_gpg_check: yes
+  environment: "{{ bz_agent_env_vars }}"
+  when: bz_agent_use_local_pkg
+
+- name: Установка агента из репозитория
+  ansible.builtin.yum:
+    name: bzsenagent
+    state: "{{ 'latest' if bz_agent_upgrade else 'present' }}"
+  environment: "{{ bz_agent_env_vars }}"
+  when: not bz_agent_use_local_pkg
+
+- name: Удаление временного RPM пакета
+  ansible.builtin.file:
+    path: "/tmp/{{ bz_agent_local_rpm }}"
+    state: absent
+  when: bz_agent_use_local_pkg
+```
+
+## Пример использования роли
+
+```yaml
+- hosts: all
+  roles:
+    - role: bzone_edr_agent
+      vars:
+        bz_authority_service: "mgmt.example.com:80"
+        bz_sensors_service: "mgmt.example.com:443"
+        bz_agent_groups: "prod,linux"
+        bz_agent_tags: "env=production,role=webserver"
+        bz_agent_use_local_pkg: true
+```
+
+## Особенности обновленной роли
+
+1. **Локальное хранение пакетов** - RPM и DEB пакеты хранятся в директории `files` роли
+2. **Гибкое управление источниками установки**:
+   - Установка из локальных пакетов (`bz_agent_use_local_pkg: true`)
+   - Установка из официального репозитория (`bz_agent_use_local_pkg: false`)
+3. **Автоматическая очистка** - временные пакеты удаляются после установки
+4. **Совместимость с предыдущими версиями** - все оригинальные функции сохранены
+5. **Улучшенная обработка зависимостей** - установка только при необходимости
+
+Роль теперь полностью самодостаточна и может работать в изолированных средах без доступа к интернету, при условии размещения пакетов в директории `files`.
