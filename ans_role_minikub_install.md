@@ -355,3 +355,139 @@ minikube_dependencies:
    ```
 
 После внесения этих изменений роль должна работать корректно на Oracle Linux 9.
+
+
+
+
+Ошибка указывает, что Minikube не был установлен или не находится в PATH. Давайте исправим роль, чтобы гарантировать правильную установку Minikube. Вот исправления:
+
+### 1. Обновим tasks/main.yml (исправленная часть установки Minikube):
+
+```yaml
+- name: Install latest minikube (alternative method)
+  block:
+    - name: Download minikube
+      get_url:
+        url: https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+        dest: /tmp/minikube
+        mode: '0755'
+      
+    - name: Install minikube to /usr/local/bin
+      copy:
+        src: /tmp/minikube
+        dest: /usr/local/bin/minikube
+        remote_src: yes
+        mode: '0755'
+      
+    - name: Verify minikube installation
+      command: minikube version
+      register: minikube_check
+      changed_when: false
+      
+    - name: Debug minikube version
+      debug:
+        var: minikube_check.stdout
+      
+    - name: Cleanup temp file
+      file:
+        path: /tmp/minikube
+        state: absent
+  when: minikube_version == "latest"
+```
+
+### 2. Добавим проверку PATH в начале tasks:
+
+```yaml
+- name: Ensure /usr/local/bin is in PATH
+  lineinfile:
+    path: /etc/environment
+    regexp: '^PATH='
+    line: 'PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"'
+    state: present
+  when: ansible_distribution != 'Ubuntu'  # Ubuntu обычно уже имеет правильный PATH
+
+- name: Update environment variables
+  shell: source /etc/environment
+```
+
+### 3. Добавим проверку установки после шага:
+
+```yaml
+- name: Verify minikube is executable
+  stat:
+    path: /usr/local/bin/minikube
+  register: minikube_bin
+
+- name: Fail if minikube not installed
+  fail:
+    msg: "Minikube binary not found at /usr/local/bin/minikube after installation"
+  when: not minikube_bin.stat.exists
+```
+
+### 4. Для драйвера Docker добавим проверку:
+
+```yaml
+- name: Verify Docker is running
+  command: docker ps
+  register: docker_check
+  ignore_errors: yes
+
+- name: Fail if Docker not working
+  fail:
+    msg: "Docker is not running properly. Please check Docker installation."
+  when: docker_check.rc != 0
+```
+
+### 5. Альтернативный способ запуска Minikube:
+
+```yaml
+- name: Start minikube (with retry)
+  command: "minikube start --driver={{ minikube_driver }} --cpus={{ minikube_cpus }} --memory={{ minikube_memory }} --disk-size={{ minikube_disk_size }}"
+  environment:
+    CHANGE_MINIKUBE_NONE_USER: true
+  become_user: "{{ minikube_user }}"
+  become: yes
+  register: minikube_start
+  retries: 3
+  delay: 10
+  until: minikube_start.rc == 0
+  ignore_errors: yes
+
+- name: Debug minikube start output
+  debug:
+    var: minikube_start
+```
+
+### Полное исправление для проблемы:
+
+1. Убедитесь, что /usr/local/bin в PATH:
+```bash
+echo $PATH
+```
+
+2. Проверьте наличие minikube:
+```bash
+ls -la /usr/local/bin/minikube
+```
+
+3. Если проблема сохраняется, попробуйте установить вручную:
+```bash
+curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+sudo install minikube-linux-amd64 /usr/local/bin/minikube
+```
+
+4. Проверьте права:
+```bash
+sudo chmod +x /usr/local/bin/minikube
+```
+
+После этих изменений роль должна:
+1. Корректно устанавливать Minikube
+2. Проверять его наличие
+3. Правильно запускать с указанным драйвером
+4. Иметь механизм повтора при неудачном запуске
+
+Если проблема сохраняется, проверьте:
+- Доступ к storage.googleapis.com (может быть заблокирован брандмауэром)
+- Достаточно ли прав у пользователя
+- Достаточно ли ресурсов на машине для запуска Minikube
