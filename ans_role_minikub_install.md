@@ -491,3 +491,142 @@ sudo chmod +x /usr/local/bin/minikube
 - Доступ к storage.googleapis.com (может быть заблокирован брандмауэром)
 - Достаточно ли прав у пользователя
 - Достаточно ли ресурсов на машине для запуска Minikube
+
+
+Эта ошибка возникает, когда Minikube пытается прочитать конфигурационный файл, который еще не существует. Давайте исправим это в Ansible роли.
+
+## Решение проблемы
+
+### 1. Добавим задачу для создания директории конфигурации
+
+В файл `tasks/main.yml` добавим:
+
+```yaml
+- name: Ensure minikube config directory exists
+  file:
+    path: "~{{ minikube_user }}/.minikube/config"
+    state: directory
+    owner: "{{ minikube_user }}"
+    group: "{{ minikube_group }}"
+    mode: '0755'
+```
+
+### 2. Модифицируем задачу запуска Minikube
+
+Обновим задачу запуска Minikube:
+
+```yaml
+- name: Start minikube
+  command: "minikube start --driver={{ minikube_driver }} --cpus={{ minikube_cpus }} --memory={{ minikube_memory }} --disk-size={{ minikube_disk_size }}"
+  environment:
+    CHANGE_MINIKUBE_NONE_USER: true
+    HOME: "~{{ minikube_user }}"
+  become_user: "{{ minikube_user }}"
+  become: yes
+  args:
+    creates: "~{{ minikube_user }}/.minikube/config/config.json"
+```
+
+### 3. Добавим обработку ошибок
+
+Добавим блок обработки ошибок:
+
+```yaml
+- name: Initialize minikube config if needed
+  block:
+    - name: Create empty config if missing
+      copy:
+        content: "{}"
+        dest: "~{{ minikube_user }}/.minikube/config/config.json"
+        owner: "{{ minikube_user }}"
+        group: "{{ minikube_group }}"
+        mode: '0644'
+      when: not minikube_config.stat.exists
+      
+    - name: Set correct permissions
+      file:
+        path: "~{{ minikube_user }}/.minikube"
+        state: directory
+        owner: "{{ minikube_user }}"
+        group: "{{ minikube_group }}"
+        recurse: yes
+  rescue:
+    - name: Debug minikube config error
+      debug:
+        msg: "Failed to initialize minikube config, trying alternative approach"
+      
+    - name: Run minikube version to initialize config
+      command: minikube version
+      become_user: "{{ minikube_user }}"
+      become: yes
+```
+
+### 4. Полный исправленный блок для Minikube
+
+```yaml
+- name: Ensure minikube environment is ready
+  block:
+    - name: Create minikube config directory
+      file:
+        path: "~{{ minikube_user }}/.minikube/config"
+        state: directory
+        owner: "{{ minikube_user }}"
+        group: "{{ minikube_group }}"
+        mode: '0755'
+      
+    - name: Check if config exists
+      stat:
+        path: "~{{ minikube_user }}/.minikube/config/config.json"
+      register: minikube_config
+      
+    - name: Initialize empty config if missing
+      copy:
+        content: "{}"
+        dest: "~{{ minikube_user }}/.minikube/config/config.json"
+        owner: "{{ minikube_user }}"
+        group: "{{ minikube_group }}"
+        mode: '0644'
+      when: not minikube_config.stat.exists
+      
+    - name: Run minikube version to initialize
+      command: minikube version
+      become_user: "{{ minikube_user }}"
+      become: yes
+      changed_when: false
+      
+- name: Start minikube cluster
+  command: "minikube start --driver={{ minikube_driver }} --cpus={{ minikube_cpus }} --memory={{ minikube_memory }} --disk-size={{ minikube_disk_size }}"
+  environment:
+    HOME: "~{{ minikube_user }}"
+  become_user: "{{ minikube_user }}"
+  become: yes
+  register: minikube_start
+  retries: 3
+  delay: 10
+  until: minikube_start.rc == 0
+```
+
+## Дополнительные проверки
+
+1. Убедитесь, что используется правильный пользователь:
+```bash
+echo $USER
+```
+
+2. Проверьте права на директорию minikube:
+```bash
+ls -la ~/.minikube/
+```
+
+3. Если проблема сохраняется, попробуйте выполнить вручную:
+```bash
+mkdir -p ~/.minikube/config
+echo "{}" > ~/.minikube/config/config.json
+chown -R $USER:$USER ~/.minikube
+```
+
+Эти изменения гарантируют, что:
+1. Директория конфигурации будет создана
+2. Конфигурационный файл будет инициализирован
+3. Права доступа будут установлены правильно
+4. Minikube сможет записывать свою конфигурацию
