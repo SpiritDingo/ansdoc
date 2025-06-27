@@ -520,3 +520,201 @@ python3 -c 'import crypt; print(crypt.crypt("ваш_пароль", crypt.mksalt(
    - При `user_password_update: true` пароль будет обновляться при каждом запуске
 
 Для максимальной безопасности рекомендуется хранить хэши паролей в Ansible Vault.
+
+
+# Полная реализация генерации хэша пароля в Ansible роли
+
+Добавим возможность генерации хэша пароля непосредственно в роль, чтобы не требовать его предварительного создания.
+
+## Окончательная версия роли с генерацией пароля
+
+### Обновленный `defaults/main.yml`
+
+```yaml
+---
+# Основные параметры пользователя
+user_name: ansible
+user_groups: "{{ 'sudo' if ansible_facts['os_family'] == 'Debian' else 'wheel' }}"
+user_home: "/home/{{ user_name }}"
+user_shell: "/bin/bash"
+user_state: present
+
+# Настройки SSH-ключа
+user_ssh_key: ""
+user_ssh_key_manage: true
+
+# Настройки пароля
+user_password: ""  # либо хэш, либо чистый пароль, если generate_password_hash=true
+user_password_manage: false
+user_password_update: false
+generate_password_hash: false  # если true, role будет сама генерировать хэш из user_password
+```
+
+### Обновленный `tasks/main.yml`
+
+```yaml
+---
+- name: Check if sudo group exists
+  stat:
+    path: "/etc/group"
+  register: group_info
+  changed_when: false
+
+- name: Ensure sudo group exists
+  group:
+    name: sudo
+    state: present
+  when: 
+    - "'sudo' in user_groups"
+    - not group_info.stat.exists or "'sudo:' not in lookup('file', '/etc/group')"
+
+- name: Ensure wheel group exists
+  group:
+    name: wheel
+    state: present
+  when: 
+    - "'wheel' in user_groups"
+    - not group_info.stat.exists or "'wheel:' not in lookup('file', '/etc/group')"
+
+- name: Check if user exists
+  stat:
+    path: "{{ user_home }}"
+  register: user_info
+  changed_when: false
+
+- name: Generate password hash if needed
+  set_fact:
+    password_hash: "{{ user_password | password_hash('sha512') }}"
+  when:
+    - user_password_manage
+    - generate_password_hash
+    - user_password != ""
+
+- name: Set final password value
+  set_fact:
+    final_password: "{{ password_hash if (generate_password_hash and user_password_manage) else user_password }}"
+
+- name: Ensure primary group exists
+  group:
+    name: "{{ user_name }}"
+    state: "{{ user_state }}"
+  when: user_state == 'present'
+
+- name: Manage user account
+  user:
+    name: "{{ user_name }}"
+    group: "{{ user_name }}"
+    groups: "{{ user_groups }}"
+    append: yes
+    shell: "{{ user_shell }}"
+    home: "{{ user_home }}"
+    password: "{{ final_password if (user_password_manage and (user_password_update or not user_info.stat.exists)) else omit }}"
+    state: "{{ user_state }}"
+    system: no
+    create_home: yes
+    generate_ssh_key: no
+    update_password: "{{ 'always' if (user_password_manage and user_password_update) else 'on_create' }}"
+
+# ... остальные задачи остаются без изменений ...
+```
+
+## Примеры использования
+
+### 1. Создать пользователя с автоматической генерацией хэша пароля
+
+```yaml
+- hosts: all
+  become: yes
+  roles:
+    - role: manage_user
+      vars:
+        user_name: "newuser"
+        user_password_manage: true
+        generate_password_hash: true
+        user_password: "my_secure_password_123"
+```
+
+### 2. Изменить пароль существующего пользователя
+
+```yaml
+- hosts: all
+  become: yes
+  roles:
+    - role: manage_user
+      vars:
+        user_name: "existing_user"
+        user_password_manage: true
+        user_password_update: true
+        generate_password_hash: true
+        user_password: "new_secure_password_456"
+```
+
+### 3. Использовать предварительно сгенерированный хэш
+
+```yaml
+- hosts: all
+  become: yes
+  roles:
+    - role: manage_user
+      vars:
+        user_name: "admin"
+        user_password_manage: true
+        user_password: "$6$rounds=656000$WX6bUJ5dtzQx9Ni/$6XewumE7W2nGZ1HcR9ZrO2YQYMS0vL7sFZQ7yY2X..."
+```
+
+## Дополнительные улучшения
+
+1. **Валидация пароля** (добавить в tasks/main.yml):
+
+```yaml
+- name: Validate password when generating hash
+  fail:
+    msg: "Password must be at least 8 characters long"
+  when:
+    - user_password_manage
+    - generate_password_hash
+    - user_password|length < 8
+```
+
+2. **Генерация случайного пароля**:
+
+```yaml
+- name: Generate random password if not specified
+  set_fact:
+    user_password: "{{ 20 | random_string }}"
+  when:
+    - user_password_manage
+    - generate_password_hash
+    - user_password == ""
+  no_log: true
+
+- name: Show generated password (only for debugging)
+  debug:
+    var: user_password
+  when:
+    - user_password_manage
+    - generate_password_hash
+    - debug_mode|default(false)
+  no_log: false
+```
+
+## Особенности реализации
+
+1. **Безопасность**:
+   - Пароли никогда не выводятся в лог
+   - Используется стойкий алгоритм хэширования SHA512
+   - Поддержка как предварительно сгенерированных хэшей, так и чистых паролей
+
+2. **Гибкость**:
+   - Автоматическое определение необходимости генерации хэша
+   - Возможность принудительного обновления пароля
+   - Поддержка разных сценариев использования
+
+3. **Удобство**:
+   - Не требует предварительной генерации хэша
+   - Позволяет использовать как чистые пароли, так и хэши
+
+Для максимальной безопасности рекомендуется:
+1. Использовать Ansible Vault для шифрования паролей в playbook
+2. Включать `no_log: true` для задач, работающих с паролями
+3. По возможности использовать SSH-ключи вместо паролей
