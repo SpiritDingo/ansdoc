@@ -187,3 +187,112 @@ ansible-playbook -i inventory.ini install_semaphore.yml
 3. Настройте проекты, инвентари и шаблоны задач
 
 Для обновления Semaphore просто измените переменную `semaphore_version` и перезапустите playbook.
+
+
+
+# Обновленная роль Ansible для Semaphore UI Enterprise с Docker Compose v2
+
+Вот исправленная роль, использующая модуль `community.docker.docker_compose_v2` вместо устаревшего `community.docker.docker_compose`.
+
+## Обновленный tasks/main.yml
+
+```yaml
+---
+- name: Ensure directories exist
+  file:
+    path: "{{ semaphore_data_dir }}/{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - config
+    - data
+    - postgres-data
+
+- name: Copy docker-compose template
+  template:
+    src: semaphore-docker-compose.yml.j2
+    dest: "{{ semaphore_data_dir }}/docker-compose.yml"
+    mode: '0644'
+
+- name: Copy environment file template
+  template:
+    src: semaphore.env.j2
+    dest: "{{ semaphore_data_dir }}/config/semaphore.env"
+    mode: '0600'
+
+- name: Pull Semaphore UI Enterprise images
+  community.docker.docker_compose_v2:
+    project_src: "{{ semaphore_data_dir }}"
+    pull: yes
+
+- name: Start Semaphore UI Enterprise services
+  community.docker.docker_compose_v2:
+    project_src: "{{ semaphore_data_dir }}"
+    state: present
+    recreate: always
+    restart: yes
+
+- name: Wait for Semaphore to become available
+  uri:
+    url: "http://localhost:{{ semaphore_port }}/api/auth/login"
+    method: GET
+    status_code: 200
+    timeout: 30
+  register: result
+  until: result.status == 200
+  retries: 10
+  delay: 10
+```
+
+## Требования к системе
+
+1. Убедитесь, что у вас установлены:
+   - Ansible 2.10+
+   - Docker Compose v2+ (как плагин Docker)
+   - Коллекция `community.docker` версии 3.0.0 или новее
+
+2. Установите необходимые коллекции:
+
+```bash
+ansible-galaxy collection install community.docker
+```
+
+## Важные изменения
+
+1. Замена модуля:
+   - Старый: `community.docker.docker_compose`
+   - Новый: `community.docker.docker_compose_v2`
+
+2. Параметры модуля остались практически такими же, но работают с Docker Compose v2.
+
+## Дополнительные рекомендации
+
+1. Для проверки версии Docker Compose на целевых хостах добавьте задачу:
+
+```yaml
+- name: Verify Docker Compose version
+  command: docker compose version
+  register: compose_version
+  changed_when: false
+
+- name: Fail if Docker Compose v1 is detected
+  fail:
+    msg: "Docker Compose v1 detected. Please upgrade to Docker Compose v2+."
+  when: "'Docker Compose version v2' not in compose_version.stdout"
+```
+
+2. Для автоматического обновления Docker Compose до v2 можно добавить:
+
+```yaml
+- name: Install Docker Compose v2 plugin
+  become: yes
+  ansible.builtin.get_url:
+    url: "https://github.com/docker/compose/releases/download/v2.23.0/docker-compose-linux-{{ ansible_architecture }}"
+    dest: "/usr/libexec/docker/cli-plugins/docker-compose"
+    mode: '0755'
+    owner: root
+    group: root
+  when: "'Docker Compose version v2' not in compose_version.stdout"
+```
+
+Эта обновленная роль обеспечит совместимость с современными версиями Docker и Ansible.
