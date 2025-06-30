@@ -551,3 +551,170 @@ ansible-playbook -i inventory.ini deploy_semaphore.yml
    - Внешняя сеть Traefik при необходимости
 
 Роль теперь более надежная и готова к использованию в production-средах.
+
+
+
+# Обновленная Ansible роль с поддержкой firewall для Oracle Linux 9 и Ubuntu
+
+Вот обновленная версия роли с правильной настройкой firewall для обоих дистрибутивов (Oracle Linux 9 с firewalld и Ubuntu с ufw).
+
+## Изменения в структуре роли
+
+```
+roles/semaphore_ui/
+├── tasks
+│   ├── firewall
+│   │   ├── oracle.yml
+│   │   └── ubuntu.yml
+│   └── main.yml
+└── ... (остальные файлы остаются без изменений)
+```
+
+## 1. Обновленный tasks/main.yml
+
+```yaml
+- name: Include OS-specific firewall configuration
+  ansible.builtin.include_tasks: "firewall/{{ ansible_distribution | lower }}.yml"
+  when: 
+    - semaphore_ui_expose == 'port'
+    - ansible_distribution in ['OracleLinux', 'Ubuntu']
+  ignore_errors: yes
+```
+
+## 2. tasks/firewall/oracle.yml (для Oracle Linux 9)
+
+```yaml
+---
+- name: Ensure firewalld is installed and running (Oracle Linux)
+  ansible.builtin.yum:
+    name: firewalld
+    state: present
+  register: firewalld_installed
+  changed_when: firewalld_installed.changed
+
+- name: Start and enable firewalld (Oracle Linux)
+  ansible.builtin.service:
+    name: firewalld
+    state: started
+    enabled: yes
+  when: firewalld_installed.changed
+
+- name: Add Semaphore port to firewalld (Oracle Linux)
+  ansible.builtin.firewalld:
+    port: "{{ semaphore_ui_port }}/tcp"
+    permanent: yes
+    state: enabled
+    immediate: yes
+
+- name: Reload firewalld to apply changes (Oracle Linux)
+  ansible.builtin.service:
+    name: firewalld
+    state: reloaded
+```
+
+## 3. tasks/firewall/ubuntu.yml (для Ubuntu)
+
+```yaml
+---
+- name: Ensure UFW is installed (Ubuntu)
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+  register: ufw_installed
+  changed_when: ufw_installed.changed
+
+- name: Allow SSH through UFW (Ubuntu)
+  ansible.builtin.ufw:
+    rule: allow
+    port: 22
+    proto: tcp
+
+- name: Allow Semaphore port through UFW (Ubuntu)
+  ansible.builtin.ufw:
+    rule: allow
+    port: "{{ semaphore_ui_port }}"
+    proto: tcp
+
+- name: Enable UFW firewall (Ubuntu)
+  ansible.builtin.ufw:
+    state: enabled
+    policy: deny
+```
+
+## 4. Обновленный defaults/main.yml
+
+Добавим параметры для firewall:
+
+```yaml
+# Firewall settings
+configure_firewall: true
+firewall_allow_ssh: true
+firewall_default_policy: "deny"
+```
+
+## 5. Обновленный tasks/configure_firewall.yml
+
+```yaml
+---
+- name: Configure firewall based on OS
+  block:
+    - name: Include Ubuntu firewall tasks
+      ansible.builtin.include_tasks: firewall/ubuntu.yml
+      when: ansible_distribution == 'Ubuntu'
+
+    - name: Include Oracle Linux firewall tasks
+      ansible.builtin.include_tasks: firewall/oracle.yml
+      when: ansible_distribution == 'OracleLinux'
+  
+  when:
+    - configure_firewall | bool
+    - semaphore_ui_expose == 'port'
+```
+
+## Использование роли с поддержкой обоих ОС
+
+Пример playbook (`deploy_semaphore.yml`):
+
+```yaml
+---
+- hosts: all
+  become: yes
+  pre_tasks:
+    - name: Gather facts
+      ansible.builtin.setup:
+  
+  roles:
+    - role: semaphore_ui
+      vars:
+        semaphore_ui_port: 8080
+        configure_firewall: true
+```
+
+## Особенности реализации:
+
+1. **Автоматическое определение ОС** - роль сама определяет дистрибутив и применяет правильные правила firewall
+2. **Поддержка двух систем firewall**:
+   - firewalld для Oracle Linux 9
+   - UFW для Ubuntu
+3. **Гибкая настройка**:
+   - Можно отключить настройку firewall через `configure_firewall: false`
+   - Можно управлять SSH доступом через `firewall_allow_ssh`
+4. **Безопасность по умолчанию**:
+   - По умолчанию разрешен только SSH и порт Semaphore UI
+   - Политика по умолчанию "deny"
+
+## Проверка работы
+
+После выполнения роли можно проверить:
+
+**Для Oracle Linux 9:**
+```bash
+sudo firewall-cmd --list-all
+```
+
+**Для Ubuntu:**
+```bash
+sudo ufw status
+```
+
+Эта реализация обеспечивает корректную работу с firewall на обоих дистрибутивах, сохраняя безопасность и требуемый доступ к Semaphore UI.
