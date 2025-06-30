@@ -718,3 +718,198 @@ sudo ufw status
 ```
 
 Эта реализация обеспечивает корректную работу с firewall на обоих дистрибутивах, сохраняя безопасность и требуемый доступ к Semaphore UI.
+
+
+
+# Обновленная Ansible роль с использованием Docker Compose V2
+
+Вот полностью обновленная роль, где заменен устаревший модуль `community.docker.docker_compose` на новый `community.docker.docker_compose_v2`.
+
+## Обновленные файлы роли
+
+### 1. tasks/main.yml
+
+```yaml
+---
+- name: Ensure required directories exist
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - "{{ semaphore_ui_data_dir }}"
+    - "{{ semaphore_ui_data_dir }}/postgres"
+
+- name: Verify Docker Compose V2 is available
+  command: docker compose version
+  register: docker_compose_check
+  changed_when: false
+  ignore_errors: yes
+
+- name: Fail if Docker Compose V2 is not available
+  fail:
+    msg: "Docker Compose V2 is required. Please install docker-compose-plugin package."
+  when: docker_compose_check is failed
+
+- name: Deploy Docker Compose file for Semaphore UI
+  template:
+    src: "docker-compose.yml.j2"
+    dest: "{{ semaphore_ui_data_dir }}/docker-compose.yml"
+    mode: '0644'
+
+- name: Deploy environment file
+  template:
+    src: "semaphore.env.j2"
+    dest: "{{ semaphore_ui_data_dir }}/.env"
+    mode: '0600'
+
+- name: Pull Docker images using Compose V2
+  community.docker.docker_compose_v2:
+    project_src: "{{ semaphore_ui_data_dir }}"
+    pull: yes
+
+- name: Start Semaphore UI services with Compose V2
+  community.docker.docker_compose_v2:
+    project_src: "{{ semaphore_ui_data_dir }}"
+    state: present
+    restart: yes
+    recreate: always
+    remove_orphans: yes
+
+- name: Wait for Semaphore UI to be ready
+  uri:
+    url: "http://localhost:{{ semaphore_ui_port }}/api/auth/login"
+    method: GET
+    status_code: 200
+    timeout: 30
+  register: result
+  until: result.status == 200
+  retries: 10
+  delay: 10
+
+- name: Display Semaphore UI access information
+  debug:
+    msg:
+      - "Semaphore UI Enterprise has been successfully deployed!"
+      - "Access URL: http://{{ ansible_host }}:{{ semaphore_ui_port }}"
+      - "Admin email: {{ semaphore_admin_email }}"
+      - "Admin password: {{ semaphore_admin_password }}"
+```
+
+### 2. templates/docker-compose.yml.j2
+
+```yaml
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: semaphore_postgres
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    volumes:
+      - ${DB_DATA_DIR}:/var/lib/postgresql/data
+    networks:
+      - semaphore_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  semaphore:
+    image: semaphoreui/semaphore-ee:${SEMAPHORE_VERSION}
+    container_name: semaphore_ui
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    volumes:
+      - ${SEMAPHORE_DATA_DIR}:/etc/semaphore
+    networks:
+      - semaphore_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    ports:
+      - "${SEMAPHORE_PORT}:3000"
+
+networks:
+  semaphore_network:
+    driver: bridge
+```
+
+### 3. templates/semaphore.env.j2 (новый файл)
+
+```ini
+# Semaphore Configuration
+SEMAPHORE_VERSION={{ semaphore_ui_version }}
+SEMAPHORE_DATA_DIR={{ semaphore_ui_data_dir }}/config
+SEMAPHORE_PORT={{ semaphore_ui_port }}
+
+# Database Configuration
+DB_HOST=postgres
+DB_PORT={{ semaphore_db_port }}
+DB_NAME={{ semaphore_db_name }}
+DB_USER={{ semaphore_db_user }}
+DB_PASSWORD={{ semaphore_db_password }}
+DB_DATA_DIR={{ semaphore_ui_data_dir }}/postgres
+
+# Admin Configuration
+SEMAPHORE_ADMIN={{ semaphore_admin_name }}
+SEMAPHORE_ADMIN_EMAIL={{ semaphore_admin_email }}
+SEMAPHORE_ADMIN_PASSWORD={{ semaphore_admin_password }}
+SEMAPHORE_ACCESS_KEY_ENCRYPTION={{ 64 | random | to_uuid }}
+```
+
+## Ключевые изменения:
+
+1. **Замена модуля**:
+   - `community.docker.docker_compose` → `community.docker.docker_compose_v2`
+
+2. **Новые параметры**:
+   - Добавлен `remove_orphans: yes` для очистки неиспользуемых контейнеров
+   - Добавлен `recreate: always` для гарантии обновления контейнеров
+
+3. **Проверка Docker Compose V2**:
+   - Добавлена явная проверка наличия Docker Compose V2
+   - Роль завершится с ошибкой, если V2 не установлен
+
+4. **Улучшенная структура**:
+   - Конфигурация вынесена в отдельный .env файл
+   - Добавлены healthchecks для обоих сервисов
+
+## Требования к системе:
+
+1. Ansible 2.10+
+2. community.docker 4.0.0+
+3. Docker Engine 20.10+
+4. Docker Compose V2 (должен быть установлен как plugin)
+
+## Установка Docker Compose V2 (если не установлен)
+
+Добавьте этот task в вашу роль или playbook:
+
+```yaml
+- name: Install Docker Compose V2 plugin
+  ansible.builtin.apt:
+    name: docker-compose-plugin
+    state: present
+    update_cache: yes
+  when: ansible_distribution == 'Ubuntu'
+
+- name: Install Docker Compose V2 plugin for RHEL/Oracle Linux
+  ansible.builtin.yum:
+    name: docker-compose-plugin
+    state: present
+  when: ansible_distribution in ['RedHat', 'CentOS', 'OracleLinux']
+```
+
+Эта обновленная роль полностью совместима с современными версиями Docker и Ansible, используя только поддерживаемые компоненты.
