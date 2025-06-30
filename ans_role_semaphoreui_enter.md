@@ -296,3 +296,149 @@ ansible-galaxy collection install community.docker
 ```
 
 Эта обновленная роль обеспечит совместимость с современными версиями Docker и Ansible.
+
+
+# Исправленная роль Ansible для работы с Docker Compose v2
+
+Проблема возникает из-за неверного формата параметра `pull` в модуле `docker_compose_v2`. Вот исправленная версия роли:
+
+## Исправленный tasks/main.yml
+
+```yaml
+---
+- name: Ensure directories exist
+  file:
+    path: "{{ semaphore_data_dir }}/{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - config
+    - data
+    - postgres-data
+
+- name: Copy docker-compose template
+  template:
+    src: semaphore-docker-compose.yml.j2
+    dest: "{{ semaphore_data_dir }}/docker-compose.yml"
+    mode: '0644'
+
+- name: Copy environment file template
+  template:
+    src: semaphore.env.j2
+    dest: "{{ semaphore_data_dir }}/config/semaphore.env"
+    mode: '0600'
+
+- name: Pull Semaphore UI Enterprise images
+  community.docker.docker_compose_v2:
+    project_src: "{{ semaphore_data_dir }}"
+    pull: "always"  # Исправлено: должно быть строкой, а не булевым значением
+
+- name: Start Semaphore UI Enterprise services
+  community.docker.docker_compose_v2:
+    project_src: "{{ semaphore_data_dir }}"
+    state: present
+    recreate: always
+    restart_policy: "unless-stopped"  # Добавлено для явного указания политики перезапуска
+
+- name: Wait for Semaphore to become available
+  uri:
+    url: "http://localhost:{{ semaphore_port }}/api/auth/login"
+    method: GET
+    status_code: 200
+    timeout: 30
+  register: result
+  until: result.status == 200
+  retries: 10
+  delay: 10
+```
+
+## Ключевые исправления:
+
+1. Параметр `pull` теперь принимает строковое значение:
+   - Допустимые значения: `always`, `missing`, `never`, `policy`
+   - Было: `pull: yes` → Стало: `pull: "always"`
+
+2. Добавлен явный параметр `restart_policy` для контейнеров
+
+3. Удален избыточный параметр `restart: yes` (он уже указан в docker-compose.yml)
+
+## Полная совместимая версия роли
+
+Если вам нужна полная обновленная роль, вот все файлы с исправлениями:
+
+### defaults/main.yml (без изменений)
+```yaml
+---
+semaphore_version: "latest"
+semaphore_data_dir: "/opt/semaphore"
+semaphore_port: 3000
+semaphore_db_port: 5432
+semaphore_db_name: "semaphore"
+semaphore_db_user: "semaphore"
+semaphore_db_password: "change_this_password"
+semaphore_admin_password: "admin123"
+semaphore_admin_email: "admin@example.com"
+semaphore_admin_name: "Admin"
+semaphore_encryption_key: "change_this_encryption_key"
+docker_compose_version: "v2"
+```
+
+### templates/semaphore.env.j2 (без изменений)
+```ini
+SEMAPHORE_DB_USER={{ semaphore_db_user }}
+SEMAPHORE_DB_PASS={{ semaphore_db_password }}
+SEMAPHORE_DB_HOST=postgres
+SEMAPHORE_DB_PORT={{ semaphore_db_port }}
+SEMAPHORE_DB={{ semaphore_db_name }}
+SEMAPHORE_DB_SSL=disable
+SEMAPHORE_PLAYBOOK_PATH=/tmp/semaphore
+SEMAPHORE_ADMIN={{ semaphore_admin_name }}
+SEMAPHORE_ADMIN_EMAIL={{ semaphore_admin_email }}
+SEMAPHORE_ADMIN_PASSWORD={{ semaphore_admin_password }}
+SEMAPHORE_ENCRYPTION={{ semaphore_encryption_key }}
+SEMAPHORE_ACCESS_KEY_ENCRYPTION={{ semaphore_encryption_key }}
+SEMAPHORE_LDAP_ENABLED=false
+```
+
+### files/semaphore-docker-compose.yml.j2 (без изменений)
+```yaml
+version: '3.8'
+
+services:
+  semaphore:
+    image: semaphoreui/semaphore:enterprise-{{ semaphore_version }}
+    container_name: semaphore
+    restart: unless-stopped
+    ports:
+      - "{{ semaphore_port }}:3000"
+    volumes:
+      - "{{ semaphore_data_dir }}/data:/etc/semaphore"
+      - "{{ semaphore_data_dir }}/config/semaphore.env:/etc/semaphore/semaphore.env"
+    environment:
+      - SEMAPHORE_DB_DIALECT=postgres
+    depends_on:
+      - postgres
+    networks:
+      - semaphore-net
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: semaphore-postgres
+    restart: unless-stopped
+    ports:
+      - "{{ semaphore_db_port }}:5432"
+    volumes:
+      - "{{ semaphore_data_dir }}/postgres-data:/var/lib/postgresql/data"
+    environment:
+      POSTGRES_USER: "{{ semaphore_db_user }}"
+      POSTGRES_PASSWORD: "{{ semaphore_db_password }}"
+      POSTGRES_DB: "{{ semaphore_db_name }}"
+    networks:
+      - semaphore-net
+
+networks:
+  semaphore-net:
+    driver: bridge
+```
+
+После этих изменений роль должна работать корректно с Docker Compose v2 и последними версиями Ansible.
