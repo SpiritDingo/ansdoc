@@ -876,3 +876,119 @@ ansible_user ALL=(ALL) NOPASSWD: ALL
   args:
     creates: "/usr/bin/bzsenagent"  # Проверка существования файла для идемпотентности
 ```
+
+
+
+Ошибка указывает на проблему с `systemd` и `daemon-reload` на целевой Ubuntu-машине. Давайте решим эту проблему.
+
+## Решение проблемы с systemd daemon-reload
+
+### 1. Модифицируем задачу управления сервисом (tasks/service.yml):
+
+```yaml
+---
+- name: Проверка доступности systemd
+  ansible.builtin.command: systemctl is-system-running
+  register: systemd_status
+  ignore_errors: yes
+  changed_when: false
+
+- name: Управление сервисом bzsenagent (основная попытка)
+  ansible.builtin.systemd:
+    name: bzsenagent
+    state: "{{ bz_agent_service_state }}"
+    enabled: "{{ bz_agent_service_enabled }}"
+    daemon_reload: "{{ systemd_status is success }}"
+  register: service_result
+  ignore_errors: yes
+
+- name: Управление сервисом bzsenagent (fallback без daemon_reload)
+  ansible.builtin.systemd:
+    name: bzsenagent
+    state: "{{ bz_agent_service_state }}"
+    enabled: "{{ bz_agent_service_enabled }}"
+    daemon_reload: no
+  when: service_result is failed
+```
+
+### 2. Альтернативное решение с обработкой таймаута:
+
+```yaml
+---
+- name: Управление сервисом bzsenagent (с увеличенным таймаутом)
+  ansible.builtin.systemd:
+    name: bzsenagent
+    state: "{{ bz_agent_service_state }}"
+    enabled: "{{ bz_agent_service_enabled }}"
+    daemon_reload: yes
+  vars:
+    ansible_systemd_timeout: 120  # Увеличиваем таймаут до 120 секунд
+```
+
+### 3. Полное решение с проверками:
+
+```yaml
+---
+- name: Проверка состояния systemd
+  ansible.builtin.command: systemctl is-system-running
+  register: systemd_check
+  ignore_errors: yes
+  changed_when: false
+
+- name: Временное решение для проблемного хоста
+  ansible.builtin.meta: end_play
+  when: systemd_check.rc != 0
+  tags: skip
+
+- name: Управление сервисом bzsenagent (без daemon_reload)
+  ansible.builtin.systemd:
+    name: bzsenagent
+    state: "{{ bz_agent_service_state }}"
+    enabled: "{{ bz_agent_service_enabled }}"
+    daemon_reload: no
+  when: systemd_check.rc == 0
+
+- name: Ручной запуск сервиса (fallback)
+  ansible.builtin.command: /usr/bin/bzsenagent start
+  when: systemd_check.rc != 0
+  ignore_errors: yes
+```
+
+## Дополнительные действия для устранения проблемы:
+
+1. **Проверьте состояние systemd на целевой машине**:
+```bash
+systemctl is-system-running
+journalctl -xe
+```
+
+2. **Перезапустите systemd manager** (если возможно):
+```bash
+sudo systemctl daemon-reexec
+```
+
+3. **Проверьте свободную память** - таймауты systemd часто возникают при нехватке памяти:
+```bash
+free -h
+```
+
+4. **Увеличьте таймаут systemd** (на целевой машине):
+```bash
+sudo mkdir -p /etc/systemd/system.conf.d
+echo -e "[Manager]\nDefaultTimeoutStartSec=300s" | sudo tee /etc/systemd/system.conf.d/timeout.conf
+sudo systemctl daemon-reload
+```
+
+## Примечание
+
+Если проблема сохраняется, можно временно отключить `daemon_reload` в роли, добавив в `defaults/main.yml`:
+```yaml
+bz_disable_daemon_reload: true
+```
+
+И модифицировать задачу:
+```yaml
+daemon_reload: "{{ not bz_disable_daemon_reload }}"
+```
+
+Это позволит продолжить развертывание, пока не будет решена основная проблема с systemd.
