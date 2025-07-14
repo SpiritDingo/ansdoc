@@ -290,3 +290,88 @@ ok: [server1] => {
 ```
 
 Эта версия роли дает полную информацию о каждом этапе установки пакета, что упрощает диагностику проблем и подтверждение успешного выполнения.
+
+
+
+Ошибка указывает, что Ansible не может найти файл пакета `bz_sensors_agent-nizhpharm-18f168d8.soc.bi.zone-v2.22.1-BZ_SOC_with_EDR-2025.06.02T09-39-2.deb` в директории роли. Давайте решим эту проблему.
+
+## Решение проблемы
+
+1. **Проверьте структуру директорий роли**:
+   Убедитесь, что файл пакета находится в правильной директории:
+   ```
+   roles/
+     └── universal_package_installer/
+         └── files/
+             └── ubuntu/
+                 └── bz_sensors_agent-nizhpharm-18f168d8.soc.bi.zone-v2.22.1-BZ_SOC_with_EDR-2025.06.02T09-39-2.deb
+   ```
+
+2. **Проверьте переменные роли**:
+   Убедитесь, что переменная `package_name` или `package_file_name` правильно указана в:
+   - `vars/ubuntu.yml` (для Ubuntu)
+   - `group_vars/` или `host_vars/`
+   - Параметрах роли при вызове
+
+3. **Временное решение**:
+   Если нужно быстро исправить, можно явно указать имя файла при вызове роли:
+
+```yaml
+- hosts: lebedev-test-vm
+  roles:
+    - role: universal_package_installer
+      vars:
+        package_file_name: "bz_sensors_agent-nizhpharm-18f168d8.soc.bi.zone-v2.22.1-BZ_SOC_with_EDR-2025.06.02T09-39-2.deb"
+        package_name: "bz_sensors_agent"  # Имя пакета без версии и расширения
+```
+
+## Дополнительные проверки
+
+1. **Проверьте права доступа**:
+   Убедитесь, что файл пакета доступен для чтения:
+   ```bash
+   ls -l roles/universal_package_installer/files/ubuntu/
+   ```
+
+2. **Проверьте путь к роли**:
+   Убедитесь, что Ansible может найти вашу роль. Путь к роли можно проверить так:
+   ```bash
+   ansible-config dump | grep DEFAULT_ROLES_PATH
+   ```
+
+3. **Альтернативный вариант**:
+   Если пакет очень большой или часто меняется, рассмотрите возможность хранения его на файловом сервере и скачивания перед установкой:
+
+```yaml
+- name: Download package from remote server
+  ansible.builtin.get_url:
+    url: "http://your-server/packages/{{ package_file_name }}"
+    dest: "{{ temp_path }}/{{ package_file_name }}"
+```
+
+## Полный пример исправления
+
+1. Поместите файл пакета в правильную директорию:
+   ```bash
+   mkdir -p roles/universal_package_installer/files/ubuntu/
+   cp bz_sensors_agent-*.deb roles/universal_package_installer/files/ubuntu/
+   ```
+
+2. Обновите `vars/ubuntu.yml`:
+   ```yaml
+   ---
+   package_file_name: "bz_sensors_agent-nizhpharm-18f168d8.soc.bi.zone-v2.22.1-BZ_SOC_with_EDR-2025.06.02T09-39-2.deb"
+   package_source_path: "ubuntu/{{ package_file_name }}"
+   ```
+
+3. Или укажите параметры явно при вызове роли:
+   ```yaml
+   - hosts: all
+     roles:
+       - role: universal_package_installer
+         vars:
+           package_file_name: "bz_sensors_agent-nizhpharm-18f168d8.soc.bi.zone-v2.22.1-BZ_SOC_with_EDR-2025.06.02T09-39-2.deb"
+           package_name: "bz_sensors_agent"
+   ```
+
+После этих изменений роль должна найти файл пакета и успешно установить его.
