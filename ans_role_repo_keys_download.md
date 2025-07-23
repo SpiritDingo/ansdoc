@@ -916,3 +916,259 @@ os_settings:
 ```
 
 Этот вариант также корректно обрабатывает случаи, когда конфигурация для ОС не найдена, возвращая пустой словарь.
+
+
+
+Ошибка указывает, что переменная `os_config.required_pkgs` не определена. Давайте полностью переработаем роль, чтобы сделать её более надежной и избежать подобных ошибок.
+
+## Исправленная Ansible роль
+
+### Структура роли
+
+```
+roles/repo_keys/
+├── tasks/
+│   ├── main.yml
+│   ├── ol9.yml
+│   ├── ubuntu_22.yml
+│   └── ubuntu_24.yml
+├── defaults/
+│   └── main.yml
+├── vars/
+│   ├── ol9.yml
+│   ├── ubuntu_22.yml
+│   └── ubuntu_24.yml
+└── templates/
+    └── keylist.j2
+```
+
+### defaults/main.yml
+
+```yaml
+---
+# Общие настройки
+keys_base_dir: "/etc/keys"
+download_timeout: 30
+max_retries: 3
+retry_delay: 5
+
+# Настройки по умолчанию для разных ОС
+os_defaults:
+  Ubuntu:
+    keys_dir: "{{ keys_base_dir }}/ubuntu"
+    key_ext: "gpg"
+    required_pkgs: [curl, gpg, dirmngr]
+  OracleLinux:
+    keys_dir: "{{ keys_base_dir }}/oraclelinux"
+    key_ext: "gpg"
+    required_pkgs: [curl, gnupg2]
+```
+
+### vars/ubuntu_22.yml
+
+```yaml
+---
+os_specific:
+  keys_dir: "{{ keys_base_dir }}/ubuntu_22"
+  keys:
+    - name: "docker"
+      url: "https://download.docker.com/linux/ubuntu/gpg"
+      desc: "Docker CE repository key"
+    - name: "hashicorp"
+      url: "https://apt.releases.hashicorp.com/gpg"
+      desc: "HashiCorp package repository key"
+```
+
+### vars/ubuntu_24.yml
+
+```yaml
+---
+os_specific:
+  keys_dir: "{{ keys_base_dir }}/ubuntu_24"
+  keys:
+    - name: "docker"
+      url: "https://download.docker.com/linux/ubuntu/gpg"
+      desc: "Docker CE repository key"
+    - name: "protonvpn"
+      url: "https://protonvpn.com/download/protonvpn-stable-release.gpg"
+      desc: "ProtonVPN repository key"
+```
+
+### vars/ol9.yml
+
+```yaml
+---
+os_specific:
+  keys_dir: "{{ keys_base_dir }}/ol9"
+  keys:
+    - name: "docker-ce"
+      url: "https://download.docker.com/linux/centos/gpg"
+      desc: "Docker CE repository key"
+    - name: "epel-9"
+      url: "https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-9"
+      desc: "EPEL repository key for EL9"
+```
+
+### tasks/main.yml
+
+```yaml
+---
+- name: Include OS-specific variables
+  include_vars: "{{ ansible_distribution | lower }}_{{ ansible_distribution_major_version }}.yml"
+  when: 
+    - (ansible_distribution == 'Ubuntu' and ansible_distribution_major_version in ['22', '24'])
+    - or (ansible_distribution == 'OracleLinux' and ansible_distribution_major_version == '9')
+  ignore_errors: yes
+
+- name: Set default empty keys if not loaded
+  set_fact:
+    os_specific: {'keys': []}
+  when: os_specific is not defined
+
+- name: Merge OS defaults with specific settings
+  set_fact:
+    os_config: "{{ os_defaults[ansible_distribution] | combine(os_specific, recursive=True) }}"
+
+- name: Create keys directory
+  file:
+    path: "{{ os_config.keys_dir }}"
+    state: directory
+    mode: '0755'
+
+- name: Install required packages
+  package:
+    name: "{{ os_config.required_pkgs }}"
+    state: present
+  when: ansible_distribution == 'Ubuntu'
+
+- name: Install required packages for Oracle Linux
+  yum:
+    name: "{{ os_config.required_pkgs }}"
+    state: present
+  when: ansible_distribution == 'OracleLinux'
+
+- name: Download repository keys
+  get_url:
+    url: "{{ item.url }}"
+    dest: "{{ os_config.keys_dir }}/{{ item.name }}.{{ os_config.key_ext }}"
+    mode: '0644'
+    timeout: "{{ download_timeout }}"
+    force: yes
+  loop: "{{ os_config.keys }}"
+  register: key_download
+  until: key_download is succeeded
+  retries: "{{ max_retries }}"
+  delay: "{{ retry_delay }}"
+  when: os_config.keys | length > 0
+
+- name: Process keys for Ubuntu 22.04
+  include_tasks: ubuntu_22.yml
+  when: 
+    - ansible_distribution == 'Ubuntu'
+    - ansible_distribution_major_version == '22'
+    - os_config.keys | length > 0
+
+- name: Process keys for Ubuntu 24.04
+  include_tasks: ubuntu_24.yml
+  when:
+    - ansible_distribution == 'Ubuntu'
+    - ansible_distribution_major_version == '24'
+    - os_config.keys | length > 0
+
+- name: Process keys for Oracle Linux 9
+  include_tasks: ol9.yml
+  when:
+    - ansible_distribution == 'OracleLinux'
+    - ansible_distribution_major_version == '9'
+    - os_config.keys | length > 0
+
+- name: Generate key list report
+  template:
+    src: keylist.j2
+    dest: "{{ os_config.keys_dir }}/installed_keys.txt"
+    mode: '0644'
+  when: os_config.keys | length > 0
+```
+
+### tasks/ubuntu_22.yml
+
+```yaml
+---
+- name: Validate GPG keys (Ubuntu 22.04)
+  command: >
+    gpg --no-default-keyring
+    --keyring "{{ os_config.keys_dir }}/{{ item.name }}.{{ os_config.key_ext }}"
+    --list-keys
+  loop: "{{ os_config.keys }}"
+  changed_when: false
+```
+
+### tasks/ubuntu_24.yml
+
+```yaml
+---
+- name: Convert keys to keyring format (Ubuntu 24.04)
+  command: >
+    gpg --no-default-keyring
+    --keyring "{{ os_config.keys_dir }}/{{ item.name }}.keyring"
+    --import "{{ os_config.keys_dir }}/{{ item.name }}.{{ os_config.key_ext }}"
+  loop: "{{ os_config.keys }}"
+  changed_when: true
+```
+
+### tasks/ol9.yml
+
+```yaml
+---
+- name: Import RPM GPG keys (OL9)
+  rpm_key:
+    key: "{{ os_config.keys_dir }}/{{ item.name }}.{{ os_config.key_ext }}"
+    state: present
+  loop: "{{ os_config.keys }}"
+```
+
+### templates/keylist.j2
+
+```jinja2
+# Repository Keys Report
+# OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+# Generated: {{ ansible_date_time.iso8601 }}
+# Path: {{ os_config.keys_dir }}
+
+Installed Keys:
+{% for key in os_config.keys %}
+- Name: {{ key.name }}
+  Description: {{ key.desc }}
+  Source: {{ key.url }}
+  File: {{ os_config.keys_dir }}/{{ key.name }}.{{ os_config.key_ext }}
+{% endfor %}
+
+Total keys: {{ os_config.keys | count }}
+```
+
+## Ключевые улучшения:
+
+1. **Упрощенная структура переменных**:
+   - Используем `os_defaults` для общих настроек по ОС
+   - `os_specific` для версионных особенностей
+
+2. **Надежное слияние настроек**:
+   - Используем фильтр `combine` для объединения default и specific настроек
+   - Гарантированное наличие всех необходимых полей
+
+3. **Защита от ошибок**:
+   - Установка пустого значения по умолчанию для `os_specific`
+   - Проверки длины списка ключей перед обработкой
+
+4. **Четкое разделение задач**:
+   - Отдельные файлы задач для каждой версии ОС
+   - Упрощенная логика в основном файле задач
+
+5. **Гибкость**:
+   - Легко добавлять новые версии ОС
+   - Простое переопределение переменных
+
+Роль теперь будет корректно работать даже если:
+- Нет файла с переменными для конкретной версии ОС
+- Список ключей пуст
+- Отсутствуют какие-то параметры в настройках
