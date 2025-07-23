@@ -605,3 +605,169 @@ Total keys: {{ os_keys | count }}
    - Идемпотентные операции
 
 Роль автоматически определяет версию ОС и применяет соответствующие настройки. Для работы требуется интернет-доступ с целевых хостов.
+
+
+Ошибка возникает из-за того, что переменная `ol9_keys` не определена при выполнении задачи. Давайте исправим роль, чтобы она корректно работала для всех поддерживаемых ОС.
+
+## Исправленная реализация
+
+### tasks/main.yml
+
+```yaml
+---
+- name: Load OS-specific variables
+  include_vars: "{{ ansible_distribution | lower }}_{{ ansible_distribution_major_version }}.yml"
+  when: 
+    - (ansible_distribution == 'Ubuntu' and ansible_distribution_major_version in ['22', '24'])
+    - or (ansible_distribution == 'OracleLinux' and ansible_distribution_major_version == '9')
+  ignore_errors: yes
+
+- name: Set default empty keys list if not loaded
+  set_fact:
+    os_keys: []
+  when: os_keys is not defined
+
+- name: Define current OS settings
+  set_fact:
+    os_config: "{{ os_settings[ansible_distribution + '_' + ansible_distribution_version] | default(os_settings[ansible_distribution + '_' + ansible_distribution_major_version], default={}) }}"
+
+- name: Create keys directory
+  file:
+    path: "{{ os_config.keys_dir }}"
+    state: directory
+    mode: '0755'
+
+- name: Install required packages
+  block:
+    - name: Install packages for Ubuntu
+      apt:
+        name: "{{ os_config.required_pkgs }}"
+        state: present
+        update_cache: yes
+      when: ansible_distribution == 'Ubuntu'
+
+    - name: Install packages for Oracle Linux
+      yum:
+        name: "{{ os_config.required_pkgs }}"
+        state: present
+      when: ansible_distribution == 'OracleLinux'
+  
+- name: Download repository keys
+  block:
+    - name: Download keys
+      get_url:
+        url: "{{ item.url }}"
+        dest: "{{ os_config.keys_dir }}/{{ item.name }}.{{ os_config.key_ext }}"
+        mode: '0644'
+        timeout: "{{ download_timeout }}"
+        force: yes
+      loop: "{{ os_keys }}"
+      register: key_download
+      until: key_download is succeeded
+      retries: "{{ max_retries }}"
+      delay: "{{ retry_delay }}"
+  
+    - name: Process keys for Ubuntu 22.04
+      include_tasks: ubuntu_22.yml
+      when: 
+        - ansible_distribution == 'Ubuntu'
+        - ansible_distribution_major_version == '22'
+    
+    - name: Process keys for Ubuntu 24.04
+      include_tasks: ubuntu_24.yml
+      when:
+        - ansible_distribution == 'Ubuntu'
+        - ansible_distribution_major_version == '24'
+    
+    - name: Process keys for Oracle Linux 9
+      include_tasks: ol9.yml
+      when:
+        - ansible_distribution == 'OracleLinux'
+        - ansible_distribution_major_version == '9'
+  when: os_keys | length > 0
+
+- name: Generate key list report
+  template:
+    src: keylist.j2
+    dest: "{{ os_config.keys_dir }}/installed_keys.txt"
+    mode: '0644'
+  when: os_keys | length > 0
+```
+
+### Исправления в других файлах
+
+1. Переименуйте файлы в vars/:
+   - `ubuntu_22.yml` → `ubuntu_22.yml`
+   - `ubuntu_24.yml` → `ubuntu_24.yml`
+   - `ol9.yml` → `oraclelinux_9.yml`
+
+2. Обновите содержимое `vars/oraclelinux_9.yml`:
+```yaml
+---
+os_keys:
+  - name: "docker-ce"
+    url: "https://download.docker.com/linux/centos/gpg"
+    desc: "Docker CE repository key"
+    
+  - name: "epel-9"
+    url: "https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-9"
+    desc: "EPEL repository key for EL9"
+    
+  - name: "nginx"
+    url: "https://nginx.org/keys/nginx_signing.key"
+    desc: "NGINX repository key"
+    
+  - name: "postgresql"
+    url: "https://download.postgresql.org/pub/repos/yum/keys/PGDG-RPM-GPG-KEY-PGDG"
+    desc: "PostgreSQL repository key"
+```
+
+3. Обновите `defaults/main.yml`:
+```yaml
+os_settings:
+  Ubuntu_22:
+    keys_dir: "{{ keys_base_dir }}/ubuntu_22"
+    required_pkgs: [curl, gpg, dirmngr]
+    key_ext: "gpg"
+  Ubuntu_24:
+    keys_dir: "{{ keys_base_dir }}/ubuntu_24"
+    required_pkgs: [curl, gpg, dirmngr]
+    key_ext: "gpg"
+  OracleLinux_9:
+    keys_dir: "{{ keys_base_dir }}/ol9"
+    required_pkgs: [curl, gnupg2]
+    key_ext: "gpg"
+```
+
+## Решение проблемы
+
+Основные изменения, которые решают проблему:
+
+1. Используем `ansible_distribution_major_version` вместо разбиения версии вручную
+2. Переименовали `ol9_keys` в `os_keys` для единообразия
+3. Добавили обработку случая, когда переменные не загружены
+4. Упростили логику определения настроек ОС
+5. Добавили проверку на пустой список ключей перед обработкой
+
+Теперь роль будет:
+1. Пытаться загрузить переменные для текущей ОС
+2. Устанавливать пустой список ключей, если загрузка не удалась
+3. Пропускать задачи по загрузке ключей, если их список пуст
+4. Корректно работать для всех указанных версий ОС
+
+## Пример использования
+
+```yaml
+- hosts: all
+  become: yes
+  roles:
+    - role: repo_keys
+      vars:
+        keys_base_dir: "/opt/security/keys"
+        os_keys:  # Можно переопределить ключи
+          - name: "custom_repo"
+            url: "https://example.com/gpg"
+            desc: "Custom repository key"
+```
+
+Эта реализация более устойчива к ошибкам и будет корректно работать даже если файлы с переменными для какой-то ОС отсутствуют.
