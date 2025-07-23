@@ -771,3 +771,148 @@ os_settings:
 ```
 
 Эта реализация более устойчива к ошибкам и будет корректно работать даже если файлы с переменными для какой-то ОС отсутствуют.
+
+
+
+Ошибка возникает из-за неправильного использования фильтра `default` в Jinja2. Давайте исправим задачу определения настроек ОС.
+
+### Исправленный вариант tasks/main.yml
+
+```yaml
+---
+- name: Load OS-specific variables
+  include_vars: "{{ ansible_distribution | lower }}_{{ ansible_distribution_major_version }}.yml"
+  when: 
+    - (ansible_distribution == 'Ubuntu' and ansible_distribution_major_version in ['22', '24'])
+    - or (ansible_distribution == 'OracleLinux' and ansible_distribution_major_version == '9')
+  ignore_errors: yes
+
+- name: Set default empty keys list if not loaded
+  set_fact:
+    os_keys: []
+  when: os_keys is not defined
+
+- name: Define current OS settings
+  set_fact:
+    os_config: >-
+      {{
+        os_settings.get(
+          ansible_distribution + '_' + ansible_distribution_version,
+          os_settings.get(
+            ansible_distribution + '_' + ansible_distribution_major_version,
+            {}
+          )
+        )
+      }}
+
+- name: Validate OS configuration
+  fail:
+    msg: "No configuration found for {{ ansible_distribution }} {{ ansible_distribution_version }}"
+  when: os_config | length == 0
+
+- name: Create keys directory
+  file:
+    path: "{{ os_config.keys_dir }}"
+    state: directory
+    mode: '0755'
+  when: os_config | length > 0
+
+- name: Install required packages
+  block:
+    - name: Install packages for Ubuntu
+      apt:
+        name: "{{ os_config.required_pkgs }}"
+        state: present
+        update_cache: yes
+      when: 
+        - ansible_distribution == 'Ubuntu'
+        - os_config | length > 0
+
+    - name: Install packages for Oracle Linux
+      yum:
+        name: "{{ os_config.required_pkgs }}"
+        state: present
+      when:
+        - ansible_distribution == 'OracleLinux'
+        - os_config | length > 0
+
+- name: Download and process repository keys
+  block:
+    - name: Download keys
+      get_url:
+        url: "{{ item.url }}"
+        dest: "{{ os_config.keys_dir }}/{{ item.name }}.{{ os_config.key_ext }}"
+        mode: '0644'
+        timeout: "{{ download_timeout }}"
+        force: yes
+      loop: "{{ os_keys }}"
+      register: key_download
+      until: key_download is succeeded
+      retries: "{{ max_retries }}"
+      delay: "{{ retry_delay }}"
+      when: os_keys | length > 0
+    
+    - name: Process keys for Ubuntu 22.04
+      include_tasks: ubuntu_22.yml
+      when: 
+        - ansible_distribution == 'Ubuntu'
+        - ansible_distribution_major_version == '22'
+        - os_keys | length > 0
+    
+    - name: Process keys for Ubuntu 24.04
+      include_tasks: ubuntu_24.yml
+      when:
+        - ansible_distribution == 'Ubuntu'
+        - ansible_distribution_major_version == '24'
+        - os_keys | length > 0
+    
+    - name: Process keys for Oracle Linux 9
+      include_tasks: ol9.yml
+      when:
+        - ansible_distribution == 'OracleLinux'
+        - ansible_distribution_major_version == '9'
+        - os_keys | length > 0
+  when: os_config | length > 0
+
+- name: Generate key list report
+  template:
+    src: keylist.j2
+    dest: "{{ os_config.keys_dir }}/installed_keys.txt"
+    mode: '0644'
+  when: 
+    - os_config | length > 0
+    - os_keys | length > 0
+```
+
+### Ключевые изменения:
+
+1. **Исправление фильтра default**:
+   - Заменили `| default(value, default={})` на использование метода `.get()` словаря Python
+   - Новый синтаксис: `os_settings.get(key1, os_settings.get(key2, {}))`
+
+2. **Добавлена валидация конфигурации ОС**:
+   - Проверка, что найдена конфигурация для текущей ОС
+   - Задача `fail` с сообщением, если конфигурация не найдена
+
+3. **Улучшена условная логика**:
+   - Добавлены проверки `when: os_config | length > 0` для всех задач, работающих с настройками ОС
+   - Добавлены проверки `when: os_keys | length > 0` для задач, работающих с ключами
+
+4. **Более безопасная обработка ошибок**:
+   - `ignore_errors: yes` при загрузке переменных
+   - Установка пустого списка ключей по умолчанию
+
+### Альтернативный вариант для определения os_config
+
+Если предыдущий вариант с `.get()` кажется сложным, можно использовать более простой подход:
+
+```yaml
+- name: Define current OS settings
+  set_fact:
+    os_config: >-
+      {% set os_key = ansible_distribution + '_' + ansible_distribution_version %}
+      {% set os_major_key = ansible_distribution + '_' + ansible_distribution_major_version %}
+      {{ os_settings[os_key] if os_key in os_settings else os_settings[os_major_key] if os_major_key in os_settings else {} }}
+```
+
+Этот вариант также корректно обрабатывает случаи, когда конфигурация для ОС не найдена, возвращая пустой словарь.
