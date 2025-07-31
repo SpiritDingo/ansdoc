@@ -540,3 +540,240 @@ ansible-playbook -i inventory defender_install.yml --ask-vault-pass
    - Настраиваемые параметры подключения
 
 Эта улучшенная роль обеспечивает безопасную установку Microsoft Defender с авторизацией в Nexus, сохраняя при этом гибкость и надежность развертывания.
+
+
+
+
+
+
+
+
+
+
+# Ansible роль для установки и настройки Defender с использованием локального Nexus репозитория
+
+Эта роль устанавливает и настраивает Microsoft Defender для Linux (mdatp) на Oracle Linux 9, Ubuntu 22.04 и 24.04, используя локальный репозиторий Nexus без доступа в интернет.
+
+## Структура роли
+
+```
+defender_install/
+├── defaults/
+│   └── main.yml
+├── tasks/
+│   ├── main.yml
+│   ├── oraclelinux.yml
+│   └── ubuntu.yml
+├── templates/
+│   ├── defender.repo.j2
+│   └── mdatp_nexus.j2
+└── vars/
+    └── main.yml
+```
+
+## Файлы роли
+
+### defaults/main.yml
+
+```yaml
+---
+# Настройки Nexus репозитория
+nexus_url: "http://nexus.example.com"
+nexus_repo_name: "defender-repo"
+nexus_username: "admin"
+nexus_password: "password"
+
+# Настройки Defender
+defender_organization: "YOUR_ORG"
+defender_tags: "Linux,Server"
+defender_initial_scan: true
+```
+
+### vars/main.yml
+
+```yaml
+---
+# Пакеты для разных дистрибутивов
+defender_packages:
+  oraclelinux:
+    - "mdatp"
+  ubuntu:
+    - "mdatp"
+```
+
+### tasks/main.yml
+
+```yaml
+---
+- name: Include distribution-specific tasks
+  include_tasks: "{{ ansible_distribution | lower }}.yml"
+  when: ansible_distribution in ['OracleLinux', 'Ubuntu']
+
+- name: Configure Defender
+  template:
+    src: mdatp_nexus.j2
+    dest: /etc/opt/microsoft/mdatp/mdatp_nexus.json
+    owner: root
+    group: root
+    mode: 0644
+  notify:
+    - restart defender
+
+- name: Initialize Defender
+  command: mdatp --init --path /etc/opt/microsoft/mdatp/mdatp_nexus.json
+  register: defender_init
+  changed_when: "'already initialized' not in defender_init.stderr"
+
+- name: Run initial scan (if configured)
+  command: mdatp --scan --quick
+  when: defendender_initial_scan | bool
+```
+
+### tasks/oraclelinux.yml
+
+```yaml
+---
+- name: Install prerequisites for Oracle Linux
+  yum:
+    name:
+      - yum-utils
+      - gnupg
+    state: present
+
+- name: Add Defender repository configuration for Oracle Linux
+  template:
+    src: defender.repo.j2
+    dest: /etc/yum.repos.d/defender.repo
+    owner: root
+    group: root
+    mode: 0644
+
+- name: Import GPG key from Nexus
+  rpm_key:
+    key: "{{ nexus_url }}/repository/{{ nexus_repo_name }}/keys/microsoft-gpg.key"
+    state: present
+
+- name: Install Defender package
+  yum:
+    name: "{{ defender_packages.oraclelinux }}"
+    state: present
+    enablerepo: defender
+```
+
+### tasks/ubuntu.yml
+
+```yaml
+---
+- name: Install prerequisites for Ubuntu
+  apt:
+    name:
+      - apt-transport-https
+      - gnupg
+    state: present
+
+- name: Add Defender repository configuration for Ubuntu
+  template:
+    src: defender.repo.j2
+    dest: /etc/apt/sources.list.d/defender.list
+    owner: root
+    group: root
+    mode: 0644
+
+- name: Import GPG key from Nexus
+  apt_key:
+    url: "{{ nexus_url }}/repository/{{ nexus_repo_name }}/keys/microsoft-gpg.key"
+    state: present
+
+- name: Update apt cache
+  apt:
+    update_cache: yes
+
+- name: Install Defender package
+  apt:
+    name: "{{ defender_packages.ubuntu }}"
+    state: present
+```
+
+### templates/defender.repo.j2
+
+```jinja2
+# Microsoft Defender Repository
+[defender]
+name=Microsoft Defender
+baseurl={{ nexus_url }}/repository/{{ nexus_repo_name }}/$releasever/$basearch
+enabled=1
+gpgcheck=1
+gpgkey={{ nexus_url }}/repository/{{ nexus_repo_name }}/keys/microsoft-gpg.key
+{% if ansible_distribution == 'OracleLinux' %}
+sslverify=0
+metadata_expire=300
+{% elif ansible_distribution == 'Ubuntu' %}
+deb [arch=amd64] {{ nexus_url }}/repository/{{ nexus_repo_name }} focal main
+{% endif %}
+```
+
+### templates/mdatp_nexus.j2
+
+```jinja2
+{
+  "organization": "{{ defender_organization }}",
+  "tags": [{{ defender_tags | replace(',', '","') }}],
+  "proxy": {
+    "address": "{{ nexus_url }}",
+    "port": 80,
+    "authentication": {
+      "type": "basic",
+      "username": "{{ nexus_username }}",
+      "password": "{{ nexus_password }}"
+    }
+  }
+}
+```
+
+## Предварительные требования
+
+1. В Nexus должны быть настроены:
+   - Raw репозиторий для пакетов Defender
+   - Хост-репозиторий для GPG ключей
+   - Все необходимые пакеты должны быть загружены в репозиторий
+
+2. Для Oracle Linux 9 требуется:
+   - EPEL репозиторий (должен быть доступен локально через Nexus)
+   - Пакеты `yum-utils` и `gnupg`
+
+3. Для Ubuntu требуется:
+   - Пакеты `apt-transport-https` и `gnupg`
+
+## Использование роли
+
+1. Создайте playbook:
+
+```yaml
+---
+- hosts: all
+  roles:
+    - defender_install
+  vars:
+    nexus_url: "http://your-nexus-server:8081"
+    nexus_repo_name: "defender-local"
+    nexus_username: "nexus-user"
+    nexus_password: "nexus-password"
+    defender_organization: "YourOrg"
+```
+
+2. Запустите playbook:
+
+```bash
+ansible-playbook -i inventory.ini defender_install.yml
+```
+
+## Настройка Nexus
+
+Перед использованием роли необходимо настроить в Nexus:
+
+1. Raw репозиторий для пакетов Defender
+2. Хост-репозиторий для GPG ключей
+3. Учетные записи с соответствующими правами доступа
+4. Загрузить все необходимые пакеты и ключи в репозитории
+
+Для работы без интернета все зависимости должны быть предварительно загружены в локальный Nexus репозиторий.
