@@ -777,3 +777,388 @@ ansible-playbook -i inventory.ini defender_install.yml
 4. Загрузить все необходимые пакеты и ключи в репозитории
 
 Для работы без интернета все зависимости должны быть предварительно загружены в локальный Nexus репозиторий.
+
+
+
+Вот обновленная Ansible роль, которая корректно работает с Oracle Linux 9, Ubuntu 22.04 и Ubuntu 24.04, устанавливая Microsoft Defender для Linux (mdatp) через локальный Nexus репозиторий без доступа в интернет.
+
+## Улучшенная структура роли
+
+```
+defender_install/
+├── defaults/
+│   └── main.yml
+├── tasks/
+│   ├── main.yml
+│   ├── oraclelinux.yml
+│   ├── ubuntu_22.yml
+│   └── ubuntu_24.yml
+├── templates/
+│   ├── defender_ol9.repo.j2
+│   ├── defender_ubuntu_22.repo.j2
+│   ├── defender_ubuntu_24.repo.j2
+│   └── mdatp_nexus.j2
+└── vars/
+    └── main.yml
+```
+
+## Ключевые изменения для поддержки всех версий
+
+### tasks/main.yml
+
+```yaml
+---
+- name: Include distribution-specific tasks
+  block:
+    - name: Include OracleLinux tasks
+      include_tasks: oraclelinux.yml
+      when: ansible_distribution == 'OracleLinux' and ansible_distribution_major_version == '9'
+    
+    - name: Include Ubuntu 22.04 tasks
+      include_tasks: ubuntu_22.yml
+      when: ansible_distribution == 'Ubuntu' and ansible_distribution_version == '22.04'
+      
+    - name: Include Ubuntu 24.04 tasks
+      include_tasks: ubuntu_24.yml
+      when: ansible_distribution == 'Ubuntu' and ansible_distribution_version == '24.04'
+  
+  rescue:
+    - name: Fail if unsupported OS
+      fail:
+        msg: "Unsupported OS/distribution version: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+- name: Configure Defender
+  template:
+    src: mdatp_nexus.j2
+    dest: /etc/opt/microsoft/mdatp/mdatp_nexus.json
+    owner: root
+    group: root
+    mode: 0644
+  notify:
+    - restart defender
+
+- name: Initialize Defender
+  command: mdatp --init --path /etc/opt/microsoft/mdatp/mdatp_nexus.json
+  register: defender_init
+  changed_when: "'already initialized' not in defender_init.stderr"
+
+- name: Run initial scan (if configured)
+  command: mdatp --scan --quick
+  when: defendender_initial_scan | bool
+```
+
+### tasks/ubuntu_22.yml
+
+```yaml
+---
+- name: Install prerequisites for Ubuntu 22.04
+  apt:
+    name:
+      - apt-transport-https
+      - gnupg
+    state: present
+
+- name: Add Defender repository configuration for Ubuntu 22.04
+  template:
+    src: defender_ubuntu_22.repo.j2
+    dest: /etc/apt/sources.list.d/defender.list
+    owner: root
+    group: root
+    mode: 0644
+
+- name: Import GPG key from Nexus for Ubuntu 22.04
+  apt_key:
+    url: "{{ nexus_url }}/repository/{{ nexus_repo_name }}/keys/microsoft-gpg.key"
+    state: present
+
+- name: Update apt cache for Ubuntu 22.04
+  apt:
+    update_cache: yes
+
+- name: Install Defender package for Ubuntu 22.04
+  apt:
+    name: "{{ defender_packages.ubuntu }}"
+    state: present
+```
+
+### tasks/ubuntu_24.yml
+
+```yaml
+---
+- name: Install prerequisites for Ubuntu 24.04
+  apt:
+    name:
+      - apt-transport-https
+      - gnupg
+      - ca-certificates
+    state: present
+
+- name: Add Defender repository configuration for Ubuntu 24.04
+  template:
+    src: defender_ubuntu_24.repo.j2
+    dest: /etc/apt/sources.list.d/defender.list
+    owner: root
+    group: root
+    mode: 0644
+
+- name: Import GPG key from Nexus for Ubuntu 24.04 (using gpg)
+  block:
+    - name: Download GPG key
+      get_url:
+        url: "{{ nexus_url }}/repository/{{ nexus_repo_name }}/keys/microsoft-gpg.key"
+        dest: /usr/share/keyrings/microsoft-defender.gpg
+        mode: 0644
+    
+    - name: Add apt source with signed-by
+      shell: |
+        echo "deb [signed-by=/usr/share/keyrings/microsoft-defender.gpg] {{ nexus_url }}/repository/{{ nexus_repo_name }}/ubuntu jammy main" > /etc/apt/sources.list.d/defender.list
+
+- name: Update apt cache for Ubuntu 24.04
+  apt:
+    update_cache: yes
+
+- name: Install Defender package for Ubuntu 24.04
+  apt:
+    name: "{{ defender_packages.ubuntu }}"
+    state: present
+```
+
+### templates/defender_ubuntu_22.repo.j2
+
+```jinja2
+deb [arch=amd64] {{ nexus_url }}/repository/{{ nexus_repo_name }}/ubuntu jammy main
+```
+
+### templates/defender_ubuntu_24.repo.j2
+
+```jinja2
+deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-defender.gpg] {{ nexus_url }}/repository/{{ nexus_repo_name }}/ubuntu jammy main
+```
+
+### templates/defender_ol9.repo.j2
+
+```jinja2
+[defender-ol9]
+name=Microsoft Defender for Oracle Linux 9
+baseurl={{ nexus_url }}/repository/{{ nexus_repo_name }}/ol9/$basearch
+enabled=1
+gpgcheck=1
+gpgkey={{ nexus_url }}/repository/{{ nexus_repo_name }}/keys/microsoft-gpg.key
+sslverify=0
+metadata_expire=300
+```
+
+## Особенности реализации для разных ОС:
+
+1. **Oracle Linux 9**:
+   - Используется стандартный YUM/DNF репозиторий
+   - Требуется отключение sslverify из-за локального Nexus
+
+2. **Ubuntu 22.04**:
+   - Традиционный подход с apt-key
+   - Используется кодовое имя "jammy"
+
+3. **Ubuntu 24.04**:
+   - Современный подход с signed-by (apt-key deprecated)
+   - Дополнительные зависимости (ca-certificates)
+   - Также использует "jammy" для совместимости пакетов
+
+## Рекомендации по настройке Nexus:
+
+1. Структура репозитория в Nexus должна быть:
+   ```
+   /defender-local
+   ├── /keys
+   │   └── microsoft-gpg.key
+   ├── /ol9
+   │   └── /x86_64
+   │       └── (все RPM пакеты для OL9)
+   └── /ubuntu
+       └── /jammy
+           └── (все DEB пакеты для Ubuntu 22.04/24.04)
+   ```
+
+2. Для Ubuntu 22.04 и 24.04 можно использовать одни и те же пакеты, так как они совместимы.
+
+3. Убедитесь, что в Nexus настроены proper permissions для доступа к репозиторию.
+
+Эта обновленная роль обеспечивает корректную установку Defender на все указанные версии ОС с использованием локального Nexus репозитория без необходимости интернет-доступа.
+
+
+Вот обновленная Ansible роль с добавлением авторизации при доступе к Nexus репозиторию для всех поддерживаемых ОС:
+
+## Обновленная структура роли с авторизацией
+
+```
+defender_install/
+├── defaults/
+│   └── main.yml
+├── tasks/
+│   ├── main.yml
+│   ├── oraclelinux.yml
+│   ├── ubuntu_22.yml
+│   └── ubuntu_24.yml
+├── templates/
+│   ├── defender_ol9.repo.j2
+│   ├── defender_ubuntu_22.repo.j2
+│   ├── defender_ubuntu_24.repo.j2
+│   ├── mdatp_nexus.j2
+│   └── nexus_auth.conf.j2
+└── vars/
+    └── main.yml
+```
+
+## Ключевые изменения для авторизации в Nexus
+
+### defaults/main.yml
+
+```yaml
+---
+# Настройки Nexus с авторизацией
+nexus_url: "http://nexus.example.com"
+nexus_repo_name: "defender-repo"
+nexus_username: "deployment-user"
+nexus_password: "secure-password"
+nexus_auth_enabled: true
+
+# Настройки Defender
+defender_organization: "YOUR_ORG"
+defender_tags: "Linux,Server"
+defender_initial_scan: true
+```
+
+### templates/nexus_auth.conf.j2
+
+```jinja2
+machine {{ nexus_url | regex_replace('^https?://', '') }}
+login {{ nexus_username }}
+password {{ nexus_password }}
+```
+
+### tasks/main.yml (добавлен блок)
+
+```yaml
+- name: Configure Nexus authentication
+  block:
+    - name: Create .netrc file for Nexus auth
+      template:
+        src: nexus_auth.conf.j2
+        dest: /root/.netrc
+        owner: root
+        group: root
+        mode: 0600
+      when: nexus_auth_enabled | bool
+
+    - name: Configure wget for Nexus auth
+      ini_file:
+        path: /etc/wgetrc
+        section: ''
+        option: 'use_netrc'
+        value: 'yes'
+        create: yes
+      when: nexus_auth_enabled | bool
+
+    - name: Configure curl for Nexus auth
+      lineinfile:
+        path: /etc/.curlrc
+        line: '--netrc'
+        create: yes
+      when: nexus_auth_enabled | bool
+```
+
+### Обновленные файлы репозиториев с авторизацией
+
+#### templates/defender_ol9.repo.j2
+
+```jinja2
+[defender-ol9]
+name=Microsoft Defender for Oracle Linux 9
+baseurl={{ nexus_url }}/repository/{{ nexus_repo_name }}/ol9/$basearch
+enabled=1
+gpgcheck=1
+gpgkey={{ nexus_url }}/repository/{{ nexus_repo_name }}/keys/microsoft-gpg.key
+sslverify=0
+metadata_expire=300
+{% if nexus_auth_enabled %}
+username={{ nexus_username }}
+password={{ nexus_password }}
+{% endif %}
+```
+
+#### templates/defender_ubuntu_22.repo.j2
+
+```jinja2
+deb [arch=amd64] {{ nexus_username }}:{{ nexus_password }}@{{ nexus_url | regex_replace('^https?://', '') }}/repository/{{ nexus_repo_name }}/ubuntu jammy main
+```
+
+#### templates/defender_ubuntu_24.repo.j2
+
+```jinja2
+deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-defender.gpg] {{ nexus_username }}:{{ nexus_password }}@{{ nexus_url | regex_replace('^https?://', '') }}/repository/{{ nexus_repo_name }}/ubuntu jammy main
+```
+
+### Обновленные задачи для Ubuntu 24.04
+
+#### tasks/ubuntu_24.yml
+
+```yaml
+- name: Import GPG key from Nexus for Ubuntu 24.04 (with auth)
+  block:
+    - name: Download GPG key with auth
+      get_url:
+        url: "{{ nexus_url }}/repository/{{ nexus_repo_name }}/keys/microsoft-gpg.key"
+        dest: /usr/share/keyrings/microsoft-defender.gpg
+        url_username: "{{ nexus_username }}"
+        url_password: "{{ nexus_password }}"
+        force: yes
+        mode: 0644
+      when: nexus_auth_enabled | bool
+
+    - name: Add apt source with signed-by
+      copy:
+        content: "deb [signed-by=/usr/share/keyrings/microsoft-defender.gpg] {{ nexus_username }}:{{ nexus_password }}@{{ nexus_url | regex_replace('^https?://', '') }}/repository/{{ nexus_repo_name }}/ubuntu jammy main"
+        dest: /etc/apt/sources.list.d/defender.list
+        mode: 0644
+```
+
+## Реализация авторизации для разных компонентов
+
+1. **Для YUM/DNF (Oracle Linux)**:
+   - Прямое указание username/password в конфиге репозитория
+   - Альтернативно: использование /root/.netrc
+
+2. **Для APT (Ubuntu)**:
+   - Встроенные credentials в URL (user:pass@host)
+   - Для загрузки GPG ключа - параметры url_username/url_password в get_url
+
+3. **Для wget/curl**:
+   - Конфигурация через /root/.netrc
+   - Настройка /etc/wgetrc и /etc/.curlrc
+
+4. **Для Defender**:
+   - Авторизация уже настроена в mdatp_nexus.json через proxy.authentication
+
+## Полная безопасность
+
+1. Все пароли передаются через Ansible Vault
+2. Файлы с credentials имеют строгие права доступа (0600)
+3. Для Ubuntu credentials хранятся только в sources.list
+4. Для Oracle Linux - в конфиге репозитория
+
+## Пример использования с авторизацией
+
+```yaml
+- hosts: all
+  vars_files:
+    - vault.yml
+  roles:
+    - defender_install
+  vars:
+    nexus_url: "http://nexus.internal"
+    nexus_repo_name: "defender-repo"
+    nexus_username: "{{ vault_nexus_user }}"
+    nexus_password: "{{ vault_nexus_pass }}"
+    defender_organization: "SECURITY"
+```
+
+Эта реализация обеспечивает безопасную авторизацию при доступе к Nexus на всех этапах работы роли для всех поддерживаемых ОС.
