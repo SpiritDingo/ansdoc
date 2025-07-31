@@ -1,3 +1,222 @@
+# Роль Ansible для установки и настройки Microsoft Defender для Linux
+
+Эта роль устанавливает и настраивает Microsoft Defender для Linux (mdatp) с использованием локального репозитория Nexus и локального хранилища ключей для Oracle Linux 9, Ubuntu 22.04 и Ubuntu 24.04.
+
+## Структура роли
+
+```
+roles/defender_install/
+├── defaults/
+│   └── main.yml       - Основные переменные
+├── tasks/
+│   ├── main.yml       - Основной файл задач
+│   ├── oracle.yml     - Задачи для Oracle Linux
+│   ├── ubuntu.yml     - Задачи для Ubuntu
+│   └── common.yml    - Общие задачи для всех ОС
+├── templates/
+│   ├── defender.repo.j2  - Шаблон репозитория для RHEL-based
+│   └── defender.list.j2  - Шаблон репозитория для Debian-based
+└── vars/
+    ├── main.yml       - Основные переменные
+    ├── oracle.yml     - Переменные для Oracle Linux
+    └── ubuntu.yml     - Переменные для Ubuntu
+```
+
+## Файлы роли
+
+### defaults/main.yml
+
+```yaml
+---
+# Настройки репозитория Nexus
+nexus_url: "http://nexus.example.com"
+nexus_repo_path: "/repository/defender"
+
+# Настройки Defender
+defender_config:
+  organization: "YourOrganization"
+  tags:
+    - "env:production"
+  proxy: ""
+  log_level: "info"
+```
+
+### tasks/main.yml
+
+```yaml
+---
+- name: Include OS-specific variables
+  include_vars: "{{ ansible_distribution | lower }}.yml"
+
+- name: Include OS-specific tasks
+  include_tasks: "{{ ansible_distribution | lower }}.yml"
+  when: ansible_distribution in ['OracleLinux', 'Ubuntu']
+
+- name: Configure Microsoft Defender
+  include_tasks: common.yml
+```
+
+### tasks/oracle.yml
+
+```yaml
+---
+- name: Install prerequisites for Oracle Linux
+  yum:
+    name:
+      - gnupg
+      - gpg
+    state: present
+
+- name: Add Microsoft Defender GPG key from local Nexus
+  rpm_key:
+    key: "{{ nexus_url }}{{ nexus_repo_path }}/keys/microsoft-gpg.asc"
+    state: present
+
+- name: Configure Microsoft Defender repository from Nexus
+  template:
+    src: defender.repo.j2
+    dest: /etc/yum.repos.d/microsoft-defender.repo
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Install Microsoft Defender
+  yum:
+    name: mdatp
+    state: present
+    enablerepo: "microsoft-defender"
+```
+
+### tasks/ubuntu.yml
+
+```yaml
+---
+- name: Install prerequisites for Ubuntu
+  apt:
+    name:
+      - gnupg
+      - gpg
+    state: present
+    update_cache: yes
+
+- name: Add Microsoft Defender GPG key from local Nexus
+  apt_key:
+    url: "{{ nexus_url }}{{ nexus_repo_path }}/keys/microsoft-gpg.asc"
+    state: present
+
+- name: Configure Microsoft Defender repository from Nexus
+  template:
+    src: defender.list.j2
+    dest: /etc/apt/sources.list.d/microsoft-defender.list
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Install Microsoft Defender
+  apt:
+    name: mdatp
+    state: present
+    update_cache: yes
+```
+
+### tasks/common.yml
+
+```yaml
+---
+- name: Ensure Defender service is running and enabled
+  service:
+    name: mdatp
+    state: started
+    enabled: yes
+
+- name: Configure Defender settings
+  command: mdatp config {{ item.key }} --value {{ item.value }}
+  loop: "{{ defender_config | dict2items }}"
+  when: item.value is defined and item.value != ""
+  ignore_errors: yes
+
+- name: Verify Defender status
+  command: mdatp health
+  register: defender_health
+  changed_when: false
+
+- name: Display Defender health status
+  debug:
+    var: defender_health.stdout_lines
+```
+
+### templates/defender.repo.j2
+
+```jinja2
+[microsoft-defender]
+name=Microsoft Defender for Linux
+baseurl={{ nexus_url }}{{ nexus_repo_path }}/rhel/{{ ansible_distribution_major_version }}/
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/Microsoft-RPM-GPG-KEY
+```
+
+### templates/defender.list.j2
+
+```jinja2
+deb [arch=amd64] {{ nexus_url }}{{ nexus_repo_path }}/ubuntu/{{ ansible_distribution_release }}/ stable main
+```
+
+### vars/oracle.yml
+
+```yaml
+---
+defender_package: mdatp
+defender_service: mdatp
+```
+
+### vars/ubuntu.yml
+
+```yaml
+---
+defender_package: mdatp
+defender_service: mdatp
+```
+
+## Пример playbook
+
+```yaml
+---
+- name: Install and configure Microsoft Defender
+  hosts: all
+  become: yes
+  roles:
+    - defender_install
+```
+
+## Подготовка локального репозитория Nexus
+
+1. Загрузите пакеты Defender для всех поддерживаемых ОС в Nexus
+2. Загрузите GPG ключи Microsoft в Nexus
+3. Настройте репозитории в Nexus для каждого дистрибутива:
+   - Oracle Linux 9
+   - Ubuntu 22.04
+   - Ubuntu 24.04
+
+## Использование
+
+1. Разместите роль в директории `roles/` вашего Ansible проекта
+2. Создайте playbook (как показано выше)
+3. Запустите playbook:
+
+```bash
+ansible-playbook -i inventory defender_install.yml
+```
+
+## Примечания
+
+- Убедитесь, что ваши хосты имеют доступ к серверу Nexus
+- Настройте переменные `nexus_url` и `nexus_repo_path` в соответствии с вашей инфраструктурой
+- Для работы роли требуется root-доступ (become: yes)
+- Роль поддерживает только указанные версии ОС
+
+
+
 # Улучшенная роль Ansible для установки Defender с авторизацией в Nexus
 
 Добавим поддержку авторизации в Nexus и улучшим безопасность и надежность роли.
