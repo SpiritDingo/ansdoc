@@ -1,105 +1,130 @@
-Вот Ansible плейбук для сбора информации о каталоге /var/www/html и поиска содержимого web_sync:
+Вот Ansible плейбук для проверки каталога и поиска значения web_sync в файлах:
 
 ```yaml
 ---
-- name: Проверка каталога /var/www/html и поиск web_sync
+- name: Проверка каталога /var/www/html и поиск значения web_sync в файлах
   hosts: all
   gather_facts: false
   
   tasks:
-    - name: Проверить существование каталога /var/www/html
-      stat:
-        path: /var/www/html
-      register: www_dir_info
-
-    - name: Вывести информацию о каталоге
-      debug:
-        msg: |
-          Каталог /var/www/html:
-          - Существует: {{ www_dir_info.stat.exists }}
-          {% if www_dir_info.stat.exists %}
-          - Тип: {{ www_dir_info.stat.type }}
-          - Владелец: {{ www_dir_info.stat.pw_name }}
-          - Группа: {{ www_dir_info.stat.gr_name }}
-          - Права: {{ www_dir_info.stat.mode }}
-          - Размер: {{ www_dir_info.stat.size }} байт
-          - Дата изменения: {{ www_dir_info.stat.mtime }}
-          {% endif %}
-
-    - name: Поиск файлов/каталогов с именем web_sync в /var/www/html
-      find:
-        paths: /var/www/html
-        name: "*web_sync*"
-        recurse: yes
-      register: web_sync_files
-      when: www_dir_info.stat.exists
-
-    - name: Вывести найденные файлы/каталоги web_sync
-      debug:
-        msg: |
-          Найдено {{ web_sync_files.files | length }} объектов с именем web_sync:
-          {% for file in web_sync_files.files %}
-          - Путь: {{ file.path }}
-            Тип: {{ file.file_type }}
-            Размер: {{ file.size }} байт
-          {% endfor %}
-      when: www_dir_info.stat.exists and web_sync_files.files | length > 0
-
-    - name: Сообщение если web_sync не найден
-      debug:
-        msg: "Файлы/каталоги с именем web_sync не найдены в /var/www/html"
-      when: www_dir_info.stat.exists and web_sync_files.files | length == 0
-
-    - name: Сообщение если каталог /var/www/html не существует
-      debug:
-        msg: "Каталог /var/www/html не существует"
-      when: not www_dir_info.stat.exists
-```
-
-Также вот упрощенная версия плейбука:
-
-```yaml
----
-- name: Проверка /var/www/html и поиск web_sync
-  hosts: all
-  gather_facts: false
-  
-  tasks:
-    - name: Проверить каталог /var/www/html
+    - name: Проверка существования каталога /var/www/html
       stat:
         path: /var/www/html
       register: www_dir
-
-    - name: Поиск web_sync содержимого
+      
+    - name: Поиск всех файлов в каталоге (если он существует)
       find:
         paths: /var/www/html
-        patterns: "*web_sync*"
         recurse: yes
-      register: web_sync_results
-      when: www_dir.stat.exists
-
-    - name: Вывести результаты
+        file_type: file
+      register: all_files
+      when: www_dir.stat.exists and www_dir.stat.isdir
+      
+    - name: Поиск значения web_sync во всех файлах
+      shell: |
+        grep -r -l "web_sync" /var/www/html 2>/dev/null || true
+      register: files_with_web_sync
+      changed_when: false
+      when: www_dir.stat.exists and www_dir.stat.isdir
+      
+    - name: Получение детальной информации о файлах с web_sync
+      stat:
+        path: "{{ item }}"
+      register: web_sync_files_info
+      loop: "{{ files_with_web_sync.stdout_lines }}"
+      when: 
+        - www_dir.stat.exists 
+        - www_dir.stat.isdir
+        - files_with_web_sync.stdout_lines | length > 0
+        
+    - name: Поиск точного значения web_sync с контекстом
+      shell: |
+        grep -n -H "web_sync" "{{ item }}" 2>/dev/null || true
+      register: web_sync_matches
+      loop: "{{ files_with_web_sync.stdout_lines }}"
+      when: 
+        - www_dir.stat.exists 
+        - www_dir.stat.isdir
+        - files_with_web_sync.stdout_lines | length > 0
+      changed_when: false
+      
+    - name: Вывод результатов поиска
       debug:
-        var: web_sync_results.files
-      when: www_dir.stat.exists and web_sync_results.files | length > 0
-
-    - name: Сообщение если ничего не найдено
+        msg: |
+          Каталог /var/www/html существует: {{ www_dir.stat.exists }}
+          {% if www_dir.stat.exists %}
+          Найдено файлов с упоминанием 'web_sync': {{ files_with_web_sync.stdout_lines | length }}
+          {% if files_with_web_sync.stdout_lines | length > 0 %}
+          Файлы и совпадения:
+          {% for file in files_with_web_sync.stdout_lines %}
+          - Файл: {{ file }}
+            Совпадения:
+            {% for match in web_sync_matches.results %}
+            {% if match.item == file and match.stdout %}
+            {{ match.stdout }}
+            {% endif %}
+            {% endfor %}
+          {% endfor %}
+          {% else %}
+          Значение 'web_sync' не найдено в файлах
+          {% endif %}
+          {% else %}
+          Каталог /var/www/html не существует - поиск пропущен
+          {% endif %}
+      var: msg
+      
+    - name: Альтернативный вывод (более структурированный)
       debug:
-        msg: "Каталог /var/www/html не существует или web_sync не найден"
-      when: not www_dir.stat.exists or web_sync_results.files | length == 0
+        msg: "Файл: {{ item.item }}, Совпадения: {{ item.stdout_lines | join(', ') }}"
+      loop: "{{ web_sync_matches.results }}"
+      when: 
+        - www_dir.stat.exists 
+        - www_dir.stat.isdir
+        - item.stdout != ''
+        - files_with_web_sync.stdout_lines | length > 0
 ```
 
-Для запуска плейбука сохраните его в файл (например, check_web_sync.yml) и выполните:
+Более простая версия плейбука:
 
-```bash
-ansible-playbook -i inventory check_web_sync.yml
+```yaml
+---
+- name: Поиск значения web_sync в каталоге /var/www/html
+  hosts: all
+  gather_facts: false
+  
+  tasks:
+    - name: Проверка существования каталога /var/www/html
+      stat:
+        path: /var/www/html
+      register: www_dir
+      
+    - name: Поиск значения web_sync в файлах (если каталог существует)
+      shell: |
+        if [ -d "/var/www/html" ]; then
+          grep -r -n -H "web_sync" /var/www/html 2>/dev/null || echo "Значение 'web_sync' не найдено"
+        else
+          echo "Каталог /var/www/html не существует"
+        fi
+      register: web_sync_search
+      changed_when: false
+      
+    - name: Вывод результатов поиска
+      debug:
+        msg: "{{ web_sync_search.stdout_lines }}"
 ```
 
-Где inventory - ваш файл с перечнем хостов.
+Ключевые особенности плейбука:
 
-Плейбук выполнит:
+1. Проверка существования каталога с помощью модуля stat
+2. Поиск рекурсивно во всех файлах каталога
+3. Поиск именно значения web_sync, а не файлов с таким именем
+4. Вывод пути к файлу и строки с совпадением
+5. Пропуск задачи если каталог не существует
+6. Обработка ошибок - игнорирование ошибок доступа и т.д.
 
-1. Проверку существования каталога /var/www/html
-2. Выведет подробную информацию о каталоге (если существует)
-3. Поиск всех файлов и каталогов, содержащих web_sync в имени
-4. Выведет результаты поиска
+Плейбук покажет:
+
+· Существует ли каталог /var/www/html
+· В каких файлах найдено значение web_sync
+· Полные пути к этим файлам
+· Конкретные строки с совпадениями (с номерами строк)
