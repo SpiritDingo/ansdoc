@@ -187,6 +187,162 @@ ansible-playbook -i inventory gather_repos.yml
 Этот подход позволяет эффективно собирать информацию о репозиториях across multiple Ubuntu systems и может быть расширен для анализа или валидации конфигураций.
 
 
+Чтобы создать Ansible роль для сбора информации о настройках репозиториев в Ubuntu 22.04 и 24.04 (включая файлы /etc/apt/sources.list и /etc/apt/sources.list.d/), вы можете использовать следующие шаги, основываясь на результатах поиска.
+
+📁 Структура роли
+
+Создайте структуру каталогов для роли следующим образом:
+
+```bash
+roles/
+    gather_apt_repos/
+        tasks/
+            main.yml
+        defaults/
+            main.yml
+        meta/
+            main.yml
+```
+
+📝 Содержание файлов роли
+
+1. tasks/main.yml
+
+Этот файл содержит задачи для сбора информации о репозиториях.
+
+```yaml
+---
+- name: Gather information about APT repositories
+  block:
+    - name: Check existence of /etc/apt/sources.list
+      ansible.builtin.stat:
+        path: /etc/apt/sources.list
+      register: sources_list_stat
+
+    - name: Read contents of /etc/apt/sources.list if it exists
+      ansible.builtin.slurp:
+        src: /etc/apt/sources.list
+      register: sources_list_content
+      when: sources_list_stat.stat.exists
+
+    - name: Find all .list files in /etc/apt/sources.list.d/
+      ansible.builtin.find:
+        paths: /etc/apt/sources.list.d
+        patterns: '*.list'
+      register: sources_list_d_files
+
+    - name: Read contents of all .list files in /etc/apt/sources.list.d/
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      register: sources_list_d_content
+      loop: "{{ sources_list_d_files.files }}"
+
+    - name: Find all .sources files in /etc/apt/sources.list.d/
+      ansible.builtin.find:
+        paths: /etc/apt/sources.list.d
+        patterns: '*.sources'
+      register: sources_list_d_sources_files
+
+    - name: Read contents of all .sources files in /etc/apt/sources.list.d/
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      register: sources_list_d_sources_content
+      loop: "{{ sources_list_d_sources_files.files }}"
+
+  rescue:
+    - name: Handle errors during repository information gathering
+      ansible.builtin.debug:
+        msg: "Error gathering repository information: {{ ansible_failed_result.msg }}"
+
+- name: Set facts for gathered repository information
+  ansible.builtin.set_fact:
+    apt_repositories_info: {
+      "sources_list": "{{ sources_list_content.content | b64decode if sources_list_stat.stat.exists else '' }}",
+      "sources_list_d_list_files": [
+        {% for item in sources_list_d_content.results %}
+        {
+          "path": "{{ item.item }}",
+          "content": "{{ item.content | b64decode }}"
+        }{% if not loop.last %},{% endif %}
+        {% endfor %}
+      ],
+      "sources_list_d_sources_files": [
+        {% for item in sources_list_d_sources_content.results %}
+        {
+          "path": "{{ item.item }}",
+          "content": "{{ item.content | b64decode }}"
+        }{% if not loop.last %},{% endif %}
+        {% endfor %}
+      ]
+    }
+
+- name: Display gathered repository information
+  ansible.builtin.debug:
+    var: apt_repositories_info
+```
+
+2. defaults/main.yml
+
+Здесь вы можете определить переменные по умолчанию для роли, хотя в данном случае они могут не понадобиться. Файл можно оставить пустым или определить:
+
+```yaml
+---
+# defaults file for gather_apt_repos
+```
+
+3. meta/main.yml
+
+Этот файл содержит метаданные роли:
+
+```yaml
+---
+galaxy_info:
+  author: Your Name
+  description: Role to gather APT repository information from Ubuntu systems
+  company: Your Company
+  license: MIT
+  min_ansible_version: 2.9
+  platforms:
+    - name: Ubuntu
+      versions:
+        - jammy
+        - noble
+  galaxy_tags:
+    - system
+    - repositories
+    - apt
+```
+
+🛠 Использование роли
+
+1. Создайте плейбук для использования роли, например gather_repos.yml:
+
+```yaml
+---
+- hosts: all
+  roles:
+    - gather_apt_repos
+```
+
+1. Запустите плейбук:
+
+```bash
+ansible-playbook -i inventory gather_repos.yml
+```
+
+💡 Примечания
+
+· Чтение файлов: Для чтения файлов используется модуль slurp, который возвращает содержимое в кодировке base64. Поэтому используется фильтр b64decode для декодирования .
+· Обработка ошибок: Блок rescue обрабатывает возможные ошибки при сборе информации.
+· Сбор информации: Роля собирает информацию из:
+  · /etc/apt/sources.list
+  · Всех файлов с расширением .list в /etc/apt/sources.list.d/
+  · Всех файлов с расширением .sources в /etc/apt/sources.list.d/ (актуально для Ubuntu 24.04 Noble) .
+· Вывод информации: Собранная информация выводится с помощью debug и сохраняется в факте apt_repositories_info для дальнейшего использования.
+
+Эта роль обеспечивает сбор информации о репозиториях в формате, пригодном для последующего анализа или документирования конфигурации системы.
+
+
 Дополню роль для сохранения собранной информации в отчеты различных форматов.
 
 📁 Обновленная структура роли
