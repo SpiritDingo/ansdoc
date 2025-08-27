@@ -185,3 +185,322 @@ ansible-playbook -i inventory gather_repos.yml
 · Роль не изменяет конфигурацию репозиториев, а только собирает информацию.
 
 Этот подход позволяет эффективно собирать информацию о репозиториях across multiple Ubuntu systems и может быть расширен для анализа или валидации конфигураций.
+
+
+Дополню роль для сохранения собранной информации в отчеты различных форматов.
+
+📁 Обновленная структура роли
+
+```
+roles/
+    gather_apt_repos/
+        tasks/
+            main.yml
+        defaults/
+            main.yml
+        meta/
+            main.yml
+        templates/
+            report.j2
+```
+
+📝 Обновленные файлы роли
+
+1. defaults/main.yml - добавление переменных для отчетов
+
+```yaml
+---
+# defaults file for gather_apt_repos
+gather_apt_repos_report_dir: "/tmp/apt_repos_reports"
+gather_apt_repos_report_format: "txt"  # txt, json, yaml, html
+gather_apt_repos_create_timestamp: true
+gather_apt_repos_include_hostname: true
+```
+
+2. tasks/main.yml - добавление задач для создания отчетов
+
+```yaml
+---
+- name: Create report directory
+  ansible.builtin.file:
+    path: "{{ gather_apt_repos_report_dir }}"
+    state: directory
+    mode: '0755'
+  when: gather_apt_repos_report_dir != ""
+
+- name: Gather information about APT repositories
+  block:
+    - name: Check existence of /etc/apt/sources.list
+      ansible.builtin.stat:
+        path: /etc/apt/sources.list
+      register: sources_list_stat
+
+    - name: Read contents of /etc/apt/sources.list if it exists
+      ansible.builtin.slurp:
+        src: /etc/apt/sources.list
+      register: sources_list_content
+      when: sources_list_stat.stat.exists
+
+    - name: Find all .list files in /etc/apt/sources.list.d/
+      ansible.builtin.find:
+        paths: /etc/apt/sources.list.d
+        patterns: '*.list'
+      register: sources_list_d_files
+
+    - name: Read contents of all .list files in /etc/apt/sources.list.d/
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      register: sources_list_d_content
+      loop: "{{ sources_list_d_files.files }}"
+
+    - name: Find all .sources files in /etc/apt/sources.list.d/
+      ansible.builtin.find:
+        paths: /etc/apt/sources.list.d
+        patterns: '*.sources'
+      register: sources_list_d_sources_files
+
+    - name: Read contents of all .sources files in /etc/apt/sources.list.d/
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      register: sources_list_d_sources_content
+      loop: "{{ sources_list_d_sources_files.files }}"
+
+  rescue:
+    - name: Handle errors during repository information gathering
+      ansible.builtin.debug:
+        msg: "Error gathering repository information: {{ ansible_failed_result.msg }}"
+
+- name: Set facts for gathered repository information
+  ansible.builtin.set_fact:
+    apt_repositories_info: {
+      "hostname": "{{ ansible_hostname }}",
+      "timestamp": "{{ ansible_date_time.iso8601 }}",
+      "sources_list_exists": "{{ sources_list_stat.stat.exists }}",
+      "sources_list_content": "{{ sources_list_content.content | b64decode if sources_list_stat.stat.exists else 'FILE_NOT_EXISTS' }}",
+      "sources_list_d_list_files": [
+        {% for item in sources_list_d_content.results %}
+        {
+          "path": "{{ item.item.path }}",
+          "content": "{{ item.content | b64decode }}"
+        }{% if not loop.last %},{% endif %}
+        {% endfor %}
+      ],
+      "sources_list_d_sources_files": [
+        {% for item in sources_list_d_sources_content.results %}
+        {
+          "path": "{{ item.item.path }}",
+          "content": "{{ item.content | b64decode }}"
+        }{% if not loop.last %},{% endif %}
+        {% endfor %}
+      ]
+    }
+
+- name: Create timestamp for filename
+  ansible.builtin.set_fact:
+    report_timestamp: "{{ ansible_date_time.iso8601 | regex_replace('[-:]', '') | regex_replace('\\.\\d+', '') }}"
+  when: gather_apt_repos_create_timestamp
+
+- name: Set report filename
+  ansible.builtin.set_fact:
+    report_filename: "apt_repos_report{% if gather_apt_repos_include_hostname %}_{{ ansible_hostname }}{% endif %}{% if gather_apt_repos_create_timestamp %}_{{ report_timestamp }}{% endif %}.{{ gather_apt_repos_report_format }}"
+  when: gather_apt_repos_report_dir != ""
+
+- name: Generate TXT report
+  ansible.builtin.template:
+    src: report.j2
+    dest: "{{ gather_apt_repos_report_dir }}/{{ report_filename }}"
+    mode: '0644'
+  when: gather_apt_repos_report_format == "txt" and gather_apt_repos_report_dir != ""
+
+- name: Generate JSON report
+  ansible.builtin.copy:
+    content: "{{ apt_repositories_info | to_nice_json }}"
+    dest: "{{ gather_apt_repos_report_dir }}/{{ report_filename }}"
+    mode: '0644'
+  when: gather_apt_repos_report_format == "json" and gather_apt_repos_report_dir != ""
+
+- name: Generate YAML report
+  ansible.builtin.copy:
+    content: "{{ apt_repositories_info | to_nice_yaml }}"
+    dest: "{{ gather_apt_repos_report_dir }}/{{ report_filename }}"
+    mode: '0644'
+  when: gather_apt_repos_report_format == "yaml" and gather_apt_repos_report_dir != ""
+
+- name: Display gathered repository information
+  ansible.builtin.debug:
+    var: apt_repositories_info
+
+- name: Show report location
+  ansible.builtin.debug:
+    msg: "Report saved to {{ gather_apt_repos_report_dir }}/{{ report_filename }}"
+  when: gather_apt_repos_report_dir != ""
+```
+
+3. templates/report.j2 - шаблон для текстового отчета
+
+```jinja2
+# APT Repository Report
+# Generated: {{ apt_repositories_info.timestamp }}
+# Hostname: {{ apt_repositories_info.hostname }}
+
+{% if apt_repositories_info.sources_list_exists %}
+=== /etc/apt/sources.list ===
+{{ apt_repositories_info.sources_list_content }}
+
+{% else %}
+=== /etc/apt/sources.list ===
+File does not exist
+
+{% endif %}
+=== Files in /etc/apt/sources.list.d/ ===
+
+{% if apt_repositories_info.sources_list_d_list_files %}
+*.list files:
+{% for file in apt_repositories_info.sources_list_d_list_files %}
+--- {{ file.path }} ---
+{{ file.content }}
+
+{% endfor %}
+{% else %}
+No .list files found in /etc/apt/sources.list.d/
+{% endif %}
+
+{% if apt_repositories_info.sources_list_d_sources_files %}
+*.sources files:
+{% for file in apt_repositories_info.sources_list_d_sources_files %}
+--- {{ file.path }} ---
+{{ file.content }}
+
+{% endfor %}
+{% else %}
+No .sources files found in /etc/apt/sources.list.d/
+{% endif %}
+
+# Summary:
+- /etc/apt/sources.list: {{ "EXISTS" if apt_repositories_info.sources_list_exists else "MISSING" }}
+- .list files: {{ apt_repositories_info.sources_list_d_list_files | length }}
+- .sources files: {{ apt_repositories_info.sources_list_d_sources_files | length }}
+```
+
+🎯 Пример плейбука с настройками отчетов
+
+```yaml
+---
+- hosts: all
+  vars:
+    gather_apt_repos_report_dir: "/tmp/apt_reports"
+    gather_apt_repos_report_format: "txt"  # или "json", "yaml"
+    gather_apt_repos_create_timestamp: true
+    gather_apt_repos_include_hostname: true
+  
+  roles:
+    - gather_apt_repos
+  
+  tasks:
+    - name: Display report contents
+      ansible.builtin.shell: |
+        ls -la "{{ gather_apt_repos_report_dir }}" && \
+        echo "=== Last report ===" && \
+        ls -t "{{ gather_apt_repos_report_dir }}" | head -1 | xargs -I {} cat "{{ gather_apt_repos_report_dir }}/{}"
+      register: report_contents
+      changed_when: false
+    
+    - name: Show report summary
+      ansible.builtin.debug:
+        msg: "{{ report_contents.stdout }}"
+```
+
+📊 Дополнительные возможности
+
+Для HTML отчета добавьте шаблон templates/report_html.j2:
+
+```jinja2
+<!DOCTYPE html>
+<html>
+<head>
+    <title>APT Repository Report - {{ apt_repositories_info.hostname }}</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .header { background: #f0f0f0; padding: 10px; border-radius: 5px; }
+        .file-section { margin: 15px 0; }
+        .file-content { background: #f8f8f8; padding: 10px; border: 1px solid #ddd; }
+        .summary { background: #e8f4f8; padding: 10px; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>APT Repository Report</h1>
+        <p><strong>Generated:</strong> {{ apt_repositories_info.timestamp }}</p>
+        <p><strong>Hostname:</strong> {{ apt_repositories_info.hostname }}</p>
+    </div>
+
+    <div class="file-section">
+        <h2>/etc/apt/sources.list</h2>
+        {% if apt_repositories_info.sources_list_exists %}
+        <pre class="file-content">{{ apt_repositories_info.sources_list_content }}</pre>
+        {% else %}
+        <p>File does not exist</p>
+        {% endif %}
+    </div>
+
+    <div class="file-section">
+        <h2>Files in /etc/apt/sources.list.d/</h2>
+        
+        <h3>*.list files</h3>
+        {% if apt_repositories_info.sources_list_d_list_files %}
+        {% for file in apt_repositories_info.sources_list_d_list_files %}
+        <h4>{{ file.path }}</h4>
+        <pre class="file-content">{{ file.content }}</pre>
+        {% endfor %}
+        {% else %}
+        <p>No .list files found</p>
+        {% endif %}
+
+        <h3>*.sources files</h3>
+        {% if apt_repositories_info.sources_list_d_sources_files %}
+        {% for file in apt_repositories_info.sources_list_d_sources_files %}
+        <h4>{{ file.path }}</h4>
+        <pre class="file-content">{{ file.content }}</pre>
+        {% endfor %}
+        {% else %}
+        <p>No .sources files found</p>
+        {% endif %}
+    </div>
+
+    <div class="summary">
+        <h2>Summary</h2>
+        <ul>
+            <li>/etc/apt/sources.list: {{ "EXISTS" if apt_repositories_info.sources_list_exists else "MISSING" }}</li>
+            <li>.list files: {{ apt_repositories_info.sources_list_d_list_files | length }}</li>
+            <li>.sources files: {{ apt_repositories_info.sources_list_d_sources_files | length }}</li>
+        </ul>
+    </div>
+</body>
+</html>
+```
+
+И добавьте задачу для HTML формата в tasks/main.yml:
+
+```yaml
+- name: Generate HTML report
+  ansible.builtin.template:
+    src: report_html.j2
+    dest: "{{ gather_apt_repos_report_dir }}/{{ report_filename }}"
+    mode: '0644'
+  when: gather_apt_repos_report_format == "html" and gather_apt_repos_report_dir != ""
+```
+
+🚀 Использование
+
+```bash
+# Запуск с текстовым отчетом
+ansible-playbook -i inventory gather_repos.yml
+
+# Запуск с JSON отчетом
+ansible-playbook -i inventory gather_repos.yml -e "gather_apt_repos_report_format=json"
+
+# Запуск с HTML отчетом
+ansible-playbook -i inventory gather_repos.yml -e "gather_apt_repos_report_format=html"
+```
+
+Теперь роль будет сохранять подробные отчеты в указанной директории с возможностью выбора формата (TXT, JSON, YAML, HTML) и дополнительными метаданными.
