@@ -1,0 +1,251 @@
+Вот пример Ansible роли для сбора информации о серверах и генерации CSV отчета с хеш-файлом.
+
+Структура роли
+
+```
+server-info-collector/
+├── tasks/
+│   └── main.yml
+├── templates/
+│   └── report.j2
+├── defaults/
+│   └── main.yml
+└── meta/
+    └── main.yml
+```
+
+defaults/main.yml
+
+```yaml
+---
+# Пакеты для проверки (регулярные выражения)
+software_filter:
+  - "python3"
+  - "docker"
+  - "nginx"
+  - "apache2"
+  - "httpd"
+  - "mysql"
+  - "postgresql"
+  - "node"
+  - "java"
+  - "ruby"
+
+# Путь для сохранения отчета
+report_path: "/tmp/server_report"
+output_filename: "server_inventory"
+
+# Формат времени для отчета
+timestamp_format: "%Y-%m-%d_%H-%M-%S"
+```
+
+tasks/main.yml
+
+```yaml
+---
+- name: Gather system facts
+  setup:
+    gather_subset:
+      - hardware
+      - network
+      - virtual
+      - os
+    filter:
+      - "ansible_hostname"
+      - "ansible_distribution"
+      - "ansible_distribution_version"
+      - "ansible_architecture"
+      - "ansible_processor*"
+      - "ansible_memtotal_mb"
+      - "ansible_swaptotal_mb"
+      - "ansible_devices"
+      - "ansible_mounts"
+
+- name: Collect disk information
+  set_fact:
+    disk_info: |
+      {% set disks = [] %}
+      {% for mount in ansible_mounts %}
+      {% if disks.append({"mount": mount.mount, "size_gb": (mount.size_total // (1024**3)) | round(2)}) %}{% endif %}
+      {% endfor %}
+      {{ disks }}
+
+- name: Collect installed software
+  block:
+    - name: Get installed packages (Debian/Ubuntu)
+      package_facts:
+        manager: auto
+      when: ansible_pkg_mgr == "apt"
+
+    - name: Get installed packages (RHEL/CentOS)
+      package_facts:
+        manager: auto
+      when: ansible_pkg_mgr == "yum"
+
+    - name: Filter software based on patterns
+      set_fact:
+        filtered_software: |
+          {% set software_list = [] %}
+          {% for pattern in software_filter %}
+            {% for pkg_name, pkg_info in ansible_facts.packages.items() %}
+              {% if pattern | lower in pkg_name | lower or pkg_name | lower in pattern | lower %}
+                {% if software_list.append({"name": pkg_name, "version": pkg_info[0].version}) %}{% endif %}
+              {% endif %}
+            {% endfor %}
+          {% endfor %}
+          {{ software_list | unique }}
+
+  rescue:
+    - name: Fallback software collection using shell
+      shell: |
+        {% if ansible_pkg_mgr == "apt" %}
+        dpkg-query -W -f='${Package} ${Version}\n' | grep -iE "{{ software_filter | join('|') }}" || true
+        {% elif ansible_pkg_mgr == "yum" %}
+        rpm -qa --queryformat '%{NAME} %{VERSION}\n' | grep -iE "{{ software_filter | join('|') }}" || true
+        {% else %}
+        echo "Unknown package manager"
+        {% endif %}
+      register: software_output
+      changed_when: false
+
+    - name: Process fallback software data
+      set_fact:
+        filtered_software: |
+          {% set software_list = [] %}
+          {% for line in software_output.stdout_lines %}
+            {% if line.strip() %}
+              {% set parts = line.split() %}
+              {% if parts | length >= 2 %}
+                {% set pkg_name = parts[0] %}
+                {% set pkg_version = parts[1] %}
+                {% if software_list.append({"name": pkg_name, "version": pkg_version}) %}{% endif %}
+              {% endif %}
+            {% endfor %}
+          {{ software_list }}
+
+- name: Create report directory
+  file:
+    path: "{{ report_path }}"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+
+- name: Generate CSV report
+  template:
+    src: report.j2
+    dest: "{{ report_path }}/{{ output_filename }}_{{ ansible_date_time.epoch }}.csv"
+  delegate_to: localhost
+
+- name: Generate checksum file
+  shell: |
+    cd {{ report_path }} && 
+    sha256sum {{ output_filename }}_{{ ansible_date_time.epoch }}.csv > {{ output_filename }}_{{ ansible_date_time.epoch }}.csv.sha256
+  delegate_to: localhost
+
+- name: Display report location
+  debug:
+    msg: |
+      Report generated: {{ report_path }}/{{ output_filename }}_{{ ansible_date_time.epoch }}.csv
+      Checksum file: {{ report_path }}/{{ output_filename }}_{{ ansible_date_time.epoch }}.csv.sha256
+```
+
+templates/report.j2
+
+```csv
+Hostname,Distribution,Version,Architecture,CPU Model,CPU Cores,Total Memory (MB),Total Swap (MB),Disks,Software
+"{{ ansible_hostname }}","{{ ansible_distribution }}","{{ ansible_distribution_version }}","{{ ansible_architecture }}","{{ ansible_processor[1] if ansible_processor[0] == '0' else ansible_processor[0] }}","{{ ansible_processor_cores }}","{{ ansible_memtotal_mb }}","{{ ansible_swaptotal_mb }}","{% for disk in disk_info %}{{ disk.mount }}:{{ disk.size_gb }}GB{% if not loop.last %}; {% endif %}{% endfor %}","{% for software in filtered_software %}{{ software.name }}-{{ software.version }}{% if not loop.last %}; {% endif %}{% endfor %}"
+```
+
+meta/main.yml
+
+```yaml
+---
+galaxy_info:
+  author: Your Name
+  description: Server information collection role
+  company: Your Company
+  license: MIT
+  min_ansible_version: 2.9
+  platforms:
+    - name: EL
+      versions:
+        - 7
+        - 8
+        - 9
+    - name: Ubuntu
+      versions:
+        - bionic
+        - focal
+        - jammy
+    - name: Debian
+      versions:
+        - buster
+        - bullseye
+        - bookworm
+  galaxy_tags:
+    - system
+    - inventory
+    - reporting
+
+dependencies: []
+```
+
+Playbook для использования роли
+
+Создайте playbook.yml:
+
+```yaml
+---
+- name: Collect server information
+  hosts: all
+  become: yes
+  roles:
+    - server-info-collector
+  vars:
+    software_filter:
+      - "python"
+      - "docker"
+      - "nginx"
+      - "mysql"
+      - "postgres"
+      - "java"
+      - "node"
+      - "ruby"
+```
+
+Использование
+
+1. Создайте инвентарь hosts.ini:
+
+```ini
+[servers]
+server1.example.com
+server2.example.com
+server3.example.com
+
+[servers:vars]
+ansible_user=your_username
+ansible_ssh_private_key_file=~/.ssh/your_key
+```
+
+1. Запустите плейбук:
+
+```bash
+ansible-playbook -i hosts.ini playbook.yml
+```
+
+Результат
+
+После выполнения будут созданы файлы:
+
+· /tmp/server_report/server_inventory_[timestamp].csv - CSV отчет
+· /tmp/server_report/server_inventory_[timestamp].csv.sha256 - хеш-файл
+
+Пример содержимого CSV
+
+```csv
+Hostname,Distribution,Version,Architecture,CPU Model,CPU Cores,Total Memory (MB),Total Swap (MB),Disks,Software
+"webserver01","Ubuntu","22.04","x86_64","Intel(R) Xeon(R) CPU E5-2680 v4",8,16384,2048,"/:50.0GB; /data:100.0GB","python3-3.10.6; docker-20.10.12; nginx-1.18.0"
+```
+
+Эта роль предоставляет гибкую систему для сбора информации о серверах с возможностью настройки фильтров для ПО и генерации проверяемых отчетов.
