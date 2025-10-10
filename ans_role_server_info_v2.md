@@ -1979,3 +1979,252 @@ ansible-vault decrypt /tmp/server_reports/all_servers_inventory.csv
 5. Поддержка стандартных команд ansible-vault для просмотра и управления
 
 Теперь ваши отчеты будут защищены с помощью Ansible Vault!
+
+
+
+
+Ошибка возникает потому, что модуль community.general.vault не установлен или недоступен. Давайте исправим это, используя стандартные модули Ansible и команду ansible-vault.
+
+Исправленный tasks/main.yml
+
+Замените задачи, связанные с шифрованием, на следующие:
+
+```yaml
+# ... предыдущие задачи остаются без изменений ...
+
+- name: Generate checksum for unencrypted report
+  shell: |
+    cd "{{ report_path }}" && 
+    sha256sum "{{ output_filename }}.csv" > "{{ output_filename }}.csv.sha256"
+  delegate_to: localhost
+  run_once: true
+  when: not encrypt_report
+
+- name: Check if report exists before encryption
+  stat:
+    path: "{{ report_path }}/{{ output_filename }}.csv"
+  register: report_stat
+  delegate_to: localhost
+  run_once: true
+  when: encrypt_report
+
+- name: Encrypt report with Ansible Vault using command
+  command: >
+    ansible-vault encrypt
+    {% if vault_password_file %}--vault-password-file {{ vault_password_file }}{% endif %}
+    --output "{{ report_path }}/{{ output_filename }}_encrypted.csv"
+    "{{ report_path }}/{{ output_filename }}.csv"
+  delegate_to: localhost
+  run_once: true
+  when:
+    - encrypt_report
+    - report_stat.stat.exists
+
+- name: Generate checksum for encrypted report
+  shell: |
+    cd "{{ report_path }}" && 
+    sha256sum "{{ output_filename }}_encrypted.csv" > "{{ output_filename }}_encrypted.csv.sha256"
+  delegate_to: localhost
+  run_once: true
+  when: 
+    - encrypt_report
+    - report_stat.stat.exists
+
+- name: Remove unencrypted report after encryption
+  file:
+    path: "{{ report_path }}/{{ output_filename }}.csv"
+    state: absent
+  delegate_to: localhost
+  run_once: true
+  when:
+    - encrypt_report
+    - remove_unencrypted
+    - report_stat.stat.exists
+
+- name: Display report location
+  debug:
+    msg: |
+      {% if encrypt_report and report_stat.stat.exists %}
+      Encrypted report generated: {{ report_path }}/{{ output_filename }}_encrypted.csv
+      Use 'ansible-vault view {{ report_path }}/{{ output_filename }}_encrypted.csv' to view the report
+      {% if vault_password_file != "" %}
+      Vault password file: {{ vault_password_file }}
+      {% endif %}
+      Checksum file: {{ report_path }}/{{ output_filename }}_encrypted.csv.sha256
+      {% if remove_unencrypted %}
+      Note: Unencrypted version was removed
+      {% endif %}
+      {% elif encrypt_report and not report_stat.stat.exists %}
+      ERROR: Report file not found for encryption
+      {% else %}
+      Consolidated report generated: {{ report_path }}/{{ output_filename }}.csv
+      Checksum file: {{ report_path }}/{{ output_filename }}.csv.sha256
+      {% endif %}
+  delegate_to: localhost
+  run_once: true
+
+- name: Warn about missing vault password file
+  debug:
+    msg: |
+      WARNING: encrypt_report is true but vault_password_file is not specified.
+      You will be prompted for the vault password interactively.
+  delegate_to: localhost
+  run_once: true
+  when:
+    - encrypt_report
+    - vault_password_file == ""
+```
+
+Альтернативная версия с использованием shell модуля
+
+Если команда command не работает, используйте эту версию:
+
+```yaml
+- name: Encrypt report with Ansible Vault using shell
+  shell: |
+    ansible-vault encrypt \
+    {% if vault_password_file %}--vault-password-file {{ vault_password_file }}{% endif %} \
+    --output "{{ report_path }}/{{ output_filename }}_encrypted.csv" \
+    "{{ report_path }}/{{ output_filename }}.csv"
+  args:
+    executable: /bin/bash
+  delegate_to: localhost
+  run_once: true
+  when:
+    - encrypt_report
+    - report_stat.stat.exists
+```
+
+Упрощенная версия без дополнительных зависимостей
+
+Если у вас продолжаются проблемы, вот максимально простая версия:
+
+```yaml
+- name: Encrypt report with Ansible Vault (simplified)
+  shell: |
+    cd "{{ report_path }}" && \
+    {% if vault_password_file %}
+    ansible-vault encrypt --vault-password-file "{{ vault_password_file }}" --output "{{ output_filename }}_encrypted.csv" "{{ output_filename }}.csv"
+    {% else %}
+    ansible-vault encrypt --output "{{ output_filename }}_encrypted.csv" "{{ output_filename }}.csv"
+    {% endif %}
+  delegate_to: localhost
+  run_once: true
+  when:
+    - encrypt_report
+    - report_stat.stat.exists
+
+- name: Generate checksum for encrypted report
+  shell: |
+    cd "{{ report_path }}" && 
+    sha256sum "{{ output_filename }}_encrypted.csv" > "{{ output_filename }}_encrypted.csv.sha256"
+  delegate_to: localhost
+  run_once: true
+  when: encrypt_report
+
+- name: Remove unencrypted report if requested
+  file:
+    path: "{{ report_path }}/{{ output_filename }}.csv"
+    state: absent
+  delegate_to: localhost
+  run_once: true
+  when:
+    - encrypt_report
+    - remove_unencrypted
+```
+
+Обновленный defaults/main.yml
+
+```yaml
+---
+# Пакеты для проверки (регулярные выражения)
+software_filter:
+  - "python3"
+  - "docker"
+  - "nginx"
+  - "apache2"
+  - "httpd"
+  - "mysql"
+  - "postgresql"
+  - "node"
+  - "java"
+  - "ruby"
+
+# Путь для сохранения отчета
+report_path: "/tmp/server_report"
+output_filename: "servers_consolidated_report"
+
+# Шифрование отчета
+encrypt_report: false
+vault_password_file: ""
+remove_unencrypted: false
+
+# Формат времени для отчета
+timestamp_format: "%Y-%m-%d_%H-%M-%S"
+```
+
+Playbook для использования с шифрованием
+
+```yaml
+---
+- name: Collect consolidated server information with encryption
+  hosts: all
+  become: yes
+  gather_facts: no
+  roles:
+    - server-info-collector
+  vars:
+    software_filter:
+      - "python"
+      - "docker"
+      - "nginx"
+      - "mysql"
+      - "postgres"
+      - "java"
+      - "node"
+      - "ruby"
+    report_path: "/tmp/server_reports"
+    output_filename: "all_servers_inventory"
+    encrypt_report: true
+    vault_password_file: "/path/to/vault_password.txt"  # Опционально
+    remove_unencrypted: true
+```
+
+Использование
+
+1. С шифрованием и файлом пароля:
+
+```bash
+ansible-playbook -i hosts.ini playbook.yml \
+  -e "encrypt_report=true" \
+  -e "vault_password_file=~/vault_password.txt" \
+  -e "remove_unencrypted=true"
+```
+
+1. С шифрованием и интерактивным вводом пароля:
+
+```bash
+ansible-playbook -i hosts.ini playbook.yml \
+  -e "encrypt_report=true" \
+  -e "remove_unencrypted=true"
+```
+
+1. Просмотр зашифрованного отчета:
+
+```bash
+# С файлом пароля
+ansible-vault view /tmp/server_reports/all_servers_inventory_encrypted.csv --vault-password-file ~/vault_password.txt
+
+# С интерактивным вводом пароля
+ansible-vault view /tmp/server_reports/all_servers_inventory_encrypted.csv
+```
+
+Основные изменения:
+
+1. Замена модуля - используем стандартные command или shell модули вместо community.general.vault
+2. Проверка существования файла - добавляем проверку перед шифрованием
+3. Создание отдельного зашифрованного файла - используем --output для создания нового файла вместо замены исходного
+4. Улучшенная обработка ошибок - добавляем проверки на каждом этапе
+5. Гибкость с паролем - поддерживается как файл с паролем, так и интерактивный ввод
+
+Теперь шифрование должно работать без ошибок с использованием стандартных возможностей Ansible!
