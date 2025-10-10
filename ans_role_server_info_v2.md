@@ -1265,3 +1265,305 @@ Hostname,Distribution,Version,Architecture,CPU Model,CPU Cores,Memory (MB),Swap 
 ```
 
 Теперь роль должна работать без синтаксических ошибок и надежно собирать информацию даже при частичных сбоях.
+
+
+
+
+Модифицируем роль для сбора отчета в один общий файл. Вот исправленная версия:
+
+Исправленная tasks/main.yml
+
+```yaml
+---
+- name: Gather system facts
+  setup:
+    gather_subset:
+      - "!all"
+      - "!min"
+      - hardware
+      - network
+      - virtual
+      - distribution
+      - distribution_version
+      - architecture
+      - processor
+      - devices
+      - mounts
+  register: facts_result
+  ignore_errors: yes
+
+- name: Set safe facts with defaults
+  set_fact:
+    safe_hostname: "{{ ansible_hostname | default('Unknown') }}"
+    safe_distribution: "{{ ansible_distribution | default('Unknown') }}"
+    safe_distribution_version: "{{ ansible_distribution_version | default('Unknown') }}"
+    safe_architecture: "{{ ansible_architecture | default('Unknown') }}"
+    safe_memory: "{{ ansible_memtotal_mb | default(0) }}"
+    safe_swap: "{{ ansible_swaptotal_mb | default(0) }}"
+    safe_virtualization_type: "{{ ansible_virtualization_type | default('physical') }}"
+    safe_virtualization_role: "{{ ansible_virtualization_role | default('host') }}"
+    safe_processor_cores: "{{ ansible_processor_cores | default(ansible_processor_count | default('N/A')) }}"
+
+- name: Get CPU model safely
+  set_fact:
+    safe_cpu_model: |
+      {%- if ansible_processor is defined -%}
+        {%- if ansible_processor[1] is defined and ansible_processor[0] == '0' -%}
+          {{ ansible_processor[1] }}
+        {%- elif ansible_processor[0] is defined -%}
+          {{ ansible_processor[0] }}
+        {%- else -%}
+          "N/A"
+        {%- endif -%}
+      {%- else -%}
+        "N/A"
+      {%- endif -%}
+
+- name: Collect disk information with multiple fallbacks
+  block:
+    - name: Try to get disk info from mounts facts
+      set_fact:
+        disk_info: |
+          {%- set disks = [] -%}
+          {%- if ansible_mounts is defined and ansible_mounts -%}
+            {%- for mount in ansible_mounts -%}
+              {%- if mount is mapping and mount.mount is defined and mount.size_total is defined -%}
+                {%- set size_gb = (mount.size_total | int // (1024**3)) | round(2) -%}
+                {%- if disks.append({"mount": mount.mount, "size_gb": size_gb}) -%}{%- endif -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {{ disks }}
+      when: ansible_mounts is defined
+
+  rescue:
+    - name: Set empty disk info on error
+      set_fact:
+        disk_info: []
+
+- name: Fallback disk info using shell command
+  block:
+    - name: Get disk info via df command
+      shell: |
+        df -h --output=target,size | tail -n +2 | awk '{gsub(/M|G|T/,"",$2); print $1 ":" $2}'
+      register: disk_df
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Process disk output from df
+      set_fact:
+        disk_info_fallback: |
+          {%- set disks = [] -%}
+          {%- if disk_df is defined and disk_df.stdout_lines is defined -%}
+            {%- for line in disk_df.stdout_lines -%}
+              {%- if ':' in line -%}
+                {%- set parts = line.split(':') -%}
+                {%- if parts|length >= 2 and parts[0] != '' -%}
+                  {%- if disks.append({"mount": parts[0], "size_gb": parts[1] | trim}) -%}{%- endif -%}
+                {%- endif -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {{ disks }}
+      when: disk_df is defined and disk_df.stdout is defined
+
+  when: disk_info is not defined or disk_info | length == 0
+
+- name: Ensure disk_info is always defined
+  set_fact:
+    disk_info: "{{ disk_info_fallback | default([]) }}"
+  when: disk_info is not defined
+
+- name: Final disk_info fallback
+  set_fact:
+    disk_info: []
+  when: disk_info is not defined
+
+- name: Collect installed software
+  block:
+    - name: Get installed packages
+      package_facts:
+        manager: auto
+
+    - name: Filter software based on patterns
+      set_fact:
+        filtered_software: |
+          {%- set software_list = [] -%}
+          {%- if ansible_facts.packages is defined -%}
+            {%- for pattern in software_filter -%}
+              {%- for pkg_name, pkg_info in ansible_facts.packages.items() -%}
+                {%- if pattern | lower in pkg_name | lower or pkg_name | lower in pattern | lower -%}
+                  {%- if software_list.append({"name": pkg_name, "version": pkg_info[0].version}) -%}{%- endif -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {{ software_list | unique }}
+
+  rescue:
+    - name: Fallback software collection using shell
+      block:
+        - name: Get software via apt
+          shell: |
+            dpkg-query -W -f='${Package} ${Version}\n' 2>/dev/null | grep -iE "{{ software_filter | join('|') }}" || true
+          register: software_apt
+          changed_when: false
+          ignore_errors: yes
+          when: ansible_pkg_mgr == "apt"
+
+        - name: Get software via yum
+          shell: |
+            rpm -qa --queryformat '%{NAME} %{VERSION}-%{RELEASE}\n' 2>/dev/null | grep -iE "{{ software_filter | join('|') }}" || true
+          register: software_yum
+          changed_when: false
+          ignore_errors: yes
+          when: ansible_pkg_mgr == "yum"
+
+        - name: Set software output based on package manager
+          set_fact:
+            software_output: "{{ software_apt if ansible_pkg_mgr == 'apt' else software_yum }}"
+          when: ansible_pkg_mgr in ['apt', 'yum']
+
+        - name: Process fallback software data
+          set_fact:
+            filtered_software: |
+              {%- set software_list = [] -%}
+              {%- if software_output is defined and software_output.stdout_lines is defined -%}
+                {%- for line in software_output.stdout_lines -%}
+                  {%- if line.strip() -%}
+                    {%- set parts = line.strip().split() -%}
+                    {%- if parts|length >= 2 -%}
+                      {%- set pkg_name = parts[0] -%}
+                      {%- set pkg_version = parts[1] -%}
+                      {%- if software_list.append({"name": pkg_name, "version": pkg_version}) -%}{%- endif -%}
+                    {%- endif -%}
+                  {%- endif -%}
+                {%- endfor -%}
+              {%- endif -%}
+              {{ software_list }}
+
+      rescue:
+        - name: Set empty software list on complete failure
+          set_fact:
+            filtered_software: []
+
+- name: Ensure filtered_software is defined
+  set_fact:
+    filtered_software: []
+  when: filtered_software is not defined
+
+- name: Create report directory on control node
+  file:
+    path: "{{ report_path }}"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  run_once: true
+
+- name: Add host data to consolidated report
+  lineinfile:
+    path: "{{ report_path }}/{{ output_filename }}.csv"
+    line: |
+      "{{ safe_hostname }}","{{ safe_distribution }}","{{ safe_distribution_version }}","{{ safe_architecture }}","{{ safe_cpu_model }}","{{ safe_processor_cores }}","{{ safe_memory }}","{{ safe_swap }}","{{ safe_virtualization_type }}/{{ safe_virtualization_role }}","{% for disk in disk_info %}{{ disk.mount }}:{{ disk.size_gb }}GB{% if not loop.last %}; {% endif %}{% endfor %}","{% for software in filtered_software %}{{ software.name }}-{{ software.version }}{% if not loop.last %}; {% endif %}{% endfor %}"
+    create: yes
+    insertbefore: BOF
+  delegate_to: localhost
+  run_once: false
+
+- name: Add CSV header (only once)
+  lineinfile:
+    path: "{{ report_path }}/{{ output_filename }}.csv"
+    line: "Hostname,Distribution,Version,Architecture,CPU Model,CPU Cores,Memory (MB),Swap (MB),Virtualization,Disks,Software"
+    create: yes
+    insertbefore: BOF
+  delegate_to: localhost
+  run_once: true
+  when: inventory_hostname == play_hosts[0]
+
+- name: Generate checksum file for consolidated report
+  shell: |
+    cd "{{ report_path }}" && 
+    sha256sum "{{ output_filename }}.csv" > "{{ output_filename }}.csv.sha256"
+  delegate_to: localhost
+  run_once: true
+
+- name: Display consolidated report location
+  debug:
+    msg: |
+      Consolidated report generated: {{ report_path }}/{{ output_filename }}.csv
+      Checksum file: {{ report_path }}/{{ output_filename }}.csv.sha256
+  delegate_to: localhost
+  run_once: true
+```
+
+Обновленный defaults/main.yml
+
+```yaml
+---
+# Пакеты для проверки (регулярные выражения)
+software_filter:
+  - "python3"
+  - "docker"
+  - "nginx"
+  - "apache2"
+  - "httpd"
+  - "mysql"
+  - "postgresql"
+  - "node"
+  - "java"
+  - "ruby"
+
+# Путь для сохранения отчета
+report_path: "/tmp/server_report"
+output_filename: "servers_consolidated_report"
+
+# Формат времени для отчета
+timestamp_format: "%Y-%m-%d_%H-%M-%S"
+```
+
+Playbook для использования роли
+
+```yaml
+---
+- name: Collect consolidated server information
+  hosts: all
+  become: yes
+  gather_facts: no
+  roles:
+    - server-info-collector
+  vars:
+    software_filter:
+      - "python"
+      - "docker"
+      - "nginx"
+      - "mysql"
+      - "postgres"
+      - "java"
+      - "node"
+      - "ruby"
+    report_path: "/tmp/server_reports"
+    output_filename: "all_servers_inventory"
+```
+
+Основные изменения:
+
+1. Замена шаблона на lineinfile - вместо генерации отдельных файлов через шаблон, используем lineinfile для добавления данных каждого сервера в один файл
+2. Добавление заголовка только один раз - задача добавляет CSV заголовок только при первом выполнении на первом хосте
+3. Консолидированный файл - все данные собираются в один файл servers_consolidated_report.csv
+4. Удалены отладочные задачи - убраны задачи debug чтобы избежать синтаксических ошибок
+5. Один checksum файл - генерируется один хеш-файл для консолидированного отчета
+
+Как это работает:
+
+1. При первом запуске на первом хосте создается CSV файл с заголовком
+2. Каждый хост добавляет свою строку с данными в начало файла (используется insertbefore: BOF)
+3. В результате получается один файл со всеми серверами
+4. Генерируется один checksum файл для всего отчета
+
+Использование:
+
+```bash
+ansible-playbook -i hosts.ini playbook.yml
+```
+
+После выполнения все данные будут в одном файле: /tmp/server_reports/all_servers_inventory.csv
