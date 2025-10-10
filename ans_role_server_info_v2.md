@@ -1567,3 +1567,415 @@ ansible-playbook -i hosts.ini playbook.yml
 ```
 
 После выполнения все данные будут в одном файле: /tmp/server_reports/all_servers_inventory.csv
+
+
+Добавим возможность шифрования отчета с помощью Ansible Vault. Вот модифицированная роль:
+
+Обновленный defaults/main.yml
+
+```yaml
+---
+# Пакеты для проверки (регулярные выражения)
+software_filter:
+  - "python3"
+  - "docker"
+  - "nginx"
+  - "apache2"
+  - "httpd"
+  - "mysql"
+  - "postgresql"
+  - "node"
+  - "java"
+  - "ruby"
+
+# Путь для сохранения отчета
+report_path: "/tmp/server_report"
+output_filename: "servers_consolidated_report"
+
+# Шифрование отчета
+encrypt_report: false
+vault_password_file: ""
+remove_unencrypted: false
+
+# Формат времени для отчета
+timestamp_format: "%Y-%m-%d_%H-%M-%S"
+```
+
+Обновленный tasks/main.yml
+
+```yaml
+---
+- name: Gather system facts
+  setup:
+    gather_subset:
+      - "!all"
+      - "!min"
+      - hardware
+      - network
+      - virtual
+      - distribution
+      - distribution_version
+      - architecture
+      - processor
+      - devices
+      - mounts
+  register: facts_result
+  ignore_errors: yes
+
+- name: Set safe facts with defaults
+  set_fact:
+    safe_hostname: "{{ ansible_hostname | default('Unknown') }}"
+    safe_distribution: "{{ ansible_distribution | default('Unknown') }}"
+    safe_distribution_version: "{{ ansible_distribution_version | default('Unknown') }}"
+    safe_architecture: "{{ ansible_architecture | default('Unknown') }}"
+    safe_memory: "{{ ansible_memtotal_mb | default(0) }}"
+    safe_swap: "{{ ansible_swaptotal_mb | default(0) }}"
+    safe_virtualization_type: "{{ ansible_virtualization_type | default('physical') }}"
+    safe_virtualization_role: "{{ ansible_virtualization_role | default('host') }}"
+    safe_processor_cores: "{{ ansible_processor_cores | default(ansible_processor_count | default('N/A')) }}"
+
+- name: Get CPU model safely
+  set_fact:
+    safe_cpu_model: |
+      {%- if ansible_processor is defined -%}
+        {%- if ansible_processor[1] is defined and ansible_processor[0] == '0' -%}
+          {{ ansible_processor[1] }}
+        {%- elif ansible_processor[0] is defined -%}
+          {{ ansible_processor[0] }}
+        {%- else -%}
+          "N/A"
+        {%- endif -%}
+      {%- else -%}
+        "N/A"
+      {%- endif -%}
+
+- name: Collect disk information with multiple fallbacks
+  block:
+    - name: Try to get disk info from mounts facts
+      set_fact:
+        disk_info: |
+          {%- set disks = [] -%}
+          {%- if ansible_mounts is defined and ansible_mounts -%}
+            {%- for mount in ansible_mounts -%}
+              {%- if mount is mapping and mount.mount is defined and mount.size_total is defined -%}
+                {%- set size_gb = (mount.size_total | int // (1024**3)) | round(2) -%}
+                {%- if disks.append({"mount": mount.mount, "size_gb": size_gb}) -%}{%- endif -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {{ disks }}
+      when: ansible_mounts is defined
+
+  rescue:
+    - name: Set empty disk info on error
+      set_fact:
+        disk_info: []
+
+- name: Fallback disk info using shell command
+  block:
+    - name: Get disk info via df command
+      shell: |
+        df -h --output=target,size | tail -n +2 | awk '{gsub(/M|G|T/,"",$2); print $1 ":" $2}'
+      register: disk_df
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Process disk output from df
+      set_fact:
+        disk_info_fallback: |
+          {%- set disks = [] -%}
+          {%- if disk_df is defined and disk_df.stdout_lines is defined -%}
+            {%- for line in disk_df.stdout_lines -%}
+              {%- if ':' in line -%}
+                {%- set parts = line.split(':') -%}
+                {%- if parts|length >= 2 and parts[0] != '' -%}
+                  {%- if disks.append({"mount": parts[0], "size_gb": parts[1] | trim}) -%}{%- endif -%}
+                {%- endif -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {{ disks }}
+      when: disk_df is defined and disk_df.stdout is defined
+
+  when: disk_info is not defined or disk_info | length == 0
+
+- name: Ensure disk_info is always defined
+  set_fact:
+    disk_info: "{{ disk_info_fallback | default([]) }}"
+  when: disk_info is not defined
+
+- name: Final disk_info fallback
+  set_fact:
+    disk_info: []
+  when: disk_info is not defined
+
+- name: Collect installed software
+  block:
+    - name: Get installed packages
+      package_facts:
+        manager: auto
+
+    - name: Filter software based on patterns
+      set_fact:
+        filtered_software: |
+          {%- set software_list = [] -%}
+          {%- if ansible_facts.packages is defined -%}
+            {%- for pattern in software_filter -%}
+              {%- for pkg_name, pkg_info in ansible_facts.packages.items() -%}
+                {%- if pattern | lower in pkg_name | lower or pkg_name | lower in pattern | lower -%}
+                  {%- if software_list.append({"name": pkg_name, "version": pkg_info[0].version}) -%}{%- endif -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {{ software_list | unique }}
+
+  rescue:
+    - name: Fallback software collection using shell
+      block:
+        - name: Get software via apt
+          shell: |
+            dpkg-query -W -f='${Package} ${Version}\n' 2>/dev/null | grep -iE "{{ software_filter | join('|') }}" || true
+          register: software_apt
+          changed_when: false
+          ignore_errors: yes
+          when: ansible_pkg_mgr == "apt"
+
+        - name: Get software via yum
+          shell: |
+            rpm -qa --queryformat '%{NAME} %{VERSION}-%{RELEASE}\n' 2>/dev/null | grep -iE "{{ software_filter | join('|') }}" || true
+          register: software_yum
+          changed_when: false
+          ignore_errors: yes
+          when: ansible_pkg_mgr == "yum"
+
+        - name: Set software output based on package manager
+          set_fact:
+            software_output: "{{ software_apt if ansible_pkg_mgr == 'apt' else software_yum }}"
+          when: ansible_pkg_mgr in ['apt', 'yum']
+
+        - name: Process fallback software data
+          set_fact:
+            filtered_software: |
+              {%- set software_list = [] -%}
+              {%- if software_output is defined and software_output.stdout_lines is defined -%}
+                {%- for line in software_output.stdout_lines -%}
+                  {%- if line.strip() -%}
+                    {%- set parts = line.strip().split() -%}
+                    {%- if parts|length >= 2 -%}
+                      {%- set pkg_name = parts[0] -%}
+                      {%- set pkg_version = parts[1] -%}
+                      {%- if software_list.append({"name": pkg_name, "version": pkg_version}) -%}{%- endif -%}
+                    {%- endif -%}
+                  {%- endif -%}
+                {%- endfor -%}
+              {%- endif -%}
+              {{ software_list }}
+
+      rescue:
+        - name: Set empty software list on complete failure
+          set_fact:
+            filtered_software: []
+
+- name: Ensure filtered_software is defined
+  set_fact:
+    filtered_software: []
+  when: filtered_software is not defined
+
+- name: Create report directory on control node
+  file:
+    path: "{{ report_path }}"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  run_once: true
+
+- name: Add CSV header (only once)
+  lineinfile:
+    path: "{{ report_path }}/{{ output_filename }}.csv"
+    line: "Hostname,Distribution,Version,Architecture,CPU Model,CPU Cores,Memory (MB),Swap (MB),Virtualization,Disks,Software"
+    create: yes
+    insertbefore: BOF
+  delegate_to: localhost
+  run_once: true
+  when: inventory_hostname == play_hosts[0]
+
+- name: Add host data to consolidated report
+  lineinfile:
+    path: "{{ report_path }}/{{ output_filename }}.csv"
+    line: |
+      "{{ safe_hostname }}","{{ safe_distribution }}","{{ safe_distribution_version }}","{{ safe_architecture }}","{{ safe_cpu_model }}","{{ safe_processor_cores }}","{{ safe_memory }}","{{ safe_swap }}","{{ safe_virtualization_type }}/{{ safe_virtualization_role }}","{% for disk in disk_info %}{{ disk.mount }}:{{ disk.size_gb }}GB{% if not loop.last %}; {% endif %}{% endfor %}","{% for software in filtered_software %}{{ software.name }}-{{ software.version }}{% if not loop.last %}; {% endif %}{% endfor %}"
+    create: yes
+  delegate_to: localhost
+  run_once: false
+
+- name: Generate checksum for unencrypted report
+  shell: |
+    cd "{{ report_path }}" && 
+    sha256sum "{{ output_filename }}.csv" > "{{ output_filename }}.csv.sha256"
+  delegate_to: localhost
+  run_once: true
+  when: not encrypt_report
+
+- name: Encrypt report with Ansible Vault
+  community.general.vault:
+    path: "{{ report_path }}/{{ output_filename }}.csv"
+    vault_password_file: "{{ vault_password_file }}"
+  delegate_to: localhost
+  run_once: true
+  when: 
+    - encrypt_report
+    - vault_password_file != ""
+
+- name: Generate checksum for encrypted report
+  shell: |
+    cd "{{ report_path }}" && 
+    sha256sum "{{ output_filename }}.csv" > "{{ output_filename }}.csv.sha256"
+  delegate_to: localhost
+  run_once: true
+  when: encrypt_report
+
+- name: Remove unencrypted report after encryption
+  file:
+    path: "{{ report_path }}/{{ output_filename }}.csv"
+    state: absent
+  delegate_to: localhost
+  run_once: true
+  when:
+    - encrypt_report
+    - remove_unencrypted
+
+- name: Display report location
+  debug:
+    msg: |
+      {% if encrypt_report %}
+      Encrypted report generated: {{ report_path }}/{{ output_filename }}.csv
+      Use 'ansible-vault view {{ report_path }}/{{ output_filename }}.csv' to view the report
+      {% if vault_password_file != "" %}
+      Vault password file: {{ vault_password_file }}
+      {% endif %}
+      {% else %}
+      Consolidated report generated: {{ report_path }}/{{ output_filename }}.csv
+      {% endif %}
+      Checksum file: {{ report_path }}/{{ output_filename }}.csv.sha256
+      {% if encrypt_report and remove_unencrypted %}
+      Note: Unencrypted version was removed
+      {% endif %}
+  delegate_to: localhost
+  run_once: true
+
+- name: Warn about missing vault password file
+  debug:
+    msg: |
+      WARNING: encrypt_report is true but vault_password_file is not specified.
+      Report will not be encrypted.
+  delegate_to: localhost
+  run_once: true
+  when:
+    - encrypt_report
+    - vault_password_file == ""
+```
+
+Установка зависимости для модуля vault
+
+Создайте файл requirements.yml в роли:
+
+```yaml
+---
+collections:
+  - community.general
+```
+
+И установите его:
+
+```bash
+ansible-galaxy collection install -r requirements.yml
+```
+
+Playbook для использования роли с шифрованием
+
+```yaml
+---
+- name: Collect consolidated server information with encryption
+  hosts: all
+  become: yes
+  gather_facts: no
+  roles:
+    - server-info-collector
+  vars:
+    software_filter:
+      - "python"
+      - "docker"
+      - "nginx"
+      - "mysql"
+      - "postgres"
+      - "java"
+      - "node"
+      - "ruby"
+    report_path: "/tmp/server_reports"
+    output_filename: "all_servers_inventory"
+    encrypt_report: true
+    vault_password_file: "/path/to/vault_password.txt"
+    remove_unencrypted: true
+```
+
+Альтернативный вариант - создание vault пароля на лету
+
+Если вы хотите генерировать пароль автоматически, добавьте эти задачи:
+
+```yaml
+- name: Generate random vault password
+  shell: |
+    openssl rand -base64 32 > "{{ report_path }}/vault_password.txt"
+  delegate_to: localhost
+  run_once: true
+  when: 
+    - encrypt_report
+    - vault_password_file == ""
+
+- name: Set generated vault password file
+  set_fact:
+    vault_password_file: "{{ report_path }}/vault_password.txt"
+  when: 
+    - encrypt_report
+    - vault_password_file == ""
+```
+
+Использование
+
+1. Без шифрования (по умолчанию):
+
+```bash
+ansible-playbook -i hosts.ini playbook.yml
+```
+
+1. С шифрованием (с указанием файла с паролем):
+
+```bash
+ansible-playbook -i hosts.ini playbook.yml \
+  -e "encrypt_report=true" \
+  -e "vault_password_file=~/vault_password.txt" \
+  -e "remove_unencrypted=true"
+```
+
+1. Просмотр зашифрованного отчета:
+
+```bash
+ansible-vault view /tmp/server_reports/all_servers_inventory.csv
+```
+
+1. Расшифровка отчета:
+
+```bash
+ansible-vault decrypt /tmp/server_reports/all_servers_inventory.csv
+```
+
+Основные возможности шифрования:
+
+1. encrypt_report - включение/выключение шифрования
+2. vault_password_file - путь к файлу с паролем для vault
+3. remove_unencrypted - удалять ли незашифрованную версию после шифрования
+4. Автоматическая генерация checksum для зашифрованного файла
+5. Поддержка стандартных команд ansible-vault для просмотра и управления
+
+Теперь ваши отчеты будут защищены с помощью Ansible Vault!
