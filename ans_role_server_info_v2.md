@@ -753,3 +753,260 @@ Hostname,Distribution,Version,Architecture,CPU Model,CPU Cores,Total Memory (MB)
 5. Добавлены альтернативные методы сбора информации о дисках
 
 Теперь роль должна корректно обрабатывать случаи, когда факты о монтированиях недоступны или имеют неожиданный формат.
+
+
+
+
+Ошибка возникает потому что переменная disk_info не определена. Давайте полностью перепишем роль с более надежной обработкой всех возможных ошибок:
+
+Исправленная tasks/main.yml
+
+```yaml
+---
+- name: Gather system facts
+  setup:
+    gather_subset:
+      - "!all"
+      - "!min"
+      - hardware
+      - network
+      - virtual
+      - distribution
+      - distribution_version
+      - architecture
+      - processor
+      - devices
+      - mounts
+  register: facts_result
+  ignore_errors: yes
+
+- name: Set safe facts with defaults
+  set_fact:
+    safe_hostname: "{{ ansible_hostname | default('Unknown') }}"
+    safe_distribution: "{{ ansible_distribution | default('Unknown') }}"
+    safe_distribution_version: "{{ ansible_distribution_version | default('Unknown') }}"
+    safe_architecture: "{{ ansible_architecture | default('Unknown') }}"
+    safe_memory: "{{ ansible_memtotal_mb | default(0) }}"
+    safe_swap: "{{ ansible_swaptotal_mb | default(0) }}"
+    safe_virtualization_type: "{{ ansible_virtualization_type | default('physical') }}"
+    safe_virtualization_role: "{{ ansible_virtualization_role | default('host') }}"
+    safe_processor_cores: "{{ ansible_processor_cores | default(ansible_processor_count | default('N/A')) }}"
+
+- name: Get CPU model safely
+  set_fact:
+    safe_cpu_model: |
+      {%- if ansible_processor is defined -%}
+        {%- if ansible_processor[1] is defined and ansible_processor[0] == '0' -%}
+          {{ ansible_processor[1] }}
+        {%- elif ansible_processor[0] is defined -%}
+          {{ ansible_processor[0] }}
+        {%- else -%}
+          "N/A"
+        {%- endif -%}
+      {%- else -%}
+        "N/A"
+      {%- endif -%}
+
+- name: Collect disk information with multiple fallbacks
+  block:
+    - name: Try to get disk info from mounts facts
+      set_fact:
+        disk_info: |
+          {%- set disks = [] -%}
+          {%- if ansible_mounts is defined and ansible_mounts -%}
+            {%- for mount in ansible_mounts -%}
+              {%- if mount is mapping and mount.mount is defined and mount.size_total is defined -%}
+                {%- set size_gb = (mount.size_total | int // (1024**3)) | round(2) -%}
+                {%- if disks.append({"mount": mount.mount, "size_gb": size_gb}) -%}{%- endif -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {{ disks }}
+      when: ansible_mounts is defined
+
+    - name: Debug disk info from mounts
+      debug:
+        var: disk_info
+      when: disk_info is defined
+      verbosity: 1
+
+  rescue:
+    - name: Set empty disk info on error
+      set_fact:
+        disk_info: []
+
+- name: Fallback disk info using shell command
+  block:
+    - name: Get disk info via df command
+      shell: |
+        df -h --output=target,size | tail -n +2 | awk '{gsub(/M|G|T/,"",$2); print $1 ":" $2}'
+      register: disk_df
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Process disk output from df
+      set_fact:
+        disk_info_fallback: |
+          {%- set disks = [] -%}
+          {%- if disk_df is defined and disk_df.stdout_lines is defined -%}
+            {%- for line in disk_df.stdout_lines -%}
+              {%- if ':' in line -%}
+                {%- set parts = line.split(':') -%}
+                {%- if parts|length >= 2 and parts[0] != '' -%}
+                  {%- if disks.append({"mount": parts[0], "size_gb": parts[1] | trim}) -%}{%- endif -%}
+                {%- endif -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {{ disks }}
+      when: disk_df is defined and disk_df.stdout is defined
+
+  when: disk_info is not defined or disk_info | length == 0
+
+- name: Ensure disk_info is always defined
+  set_fact:
+    disk_info: "{{ disk_info_fallback | default([]) }}"
+  when: disk_info is not defined
+
+- name: Final disk_info fallback
+  set_fact:
+    disk_info: []
+  when: disk_info is not defined
+
+- name: Debug final disk_info
+  debug:
+    msg: "Final disk_info: {{ disk_info }}"
+  verbosity: 1
+
+- name: Collect installed software
+  block:
+    - name: Get installed packages
+      package_facts:
+        manager: auto
+
+    - name: Filter software based on patterns
+      set_fact:
+        filtered_software: |
+          {%- set software_list = [] -%}
+          {%- if ansible_facts.packages is defined -%}
+            {%- for pattern in software_filter -%}
+              {%- for pkg_name, pkg_info in ansible_facts.packages.items() -%}
+                {%- if pattern | lower in pkg_name | lower or pkg_name | lower in pattern | lower -%}
+                  {%- if software_list.append({"name": pkg_name, "version": pkg_info[0].version}) -%}{%- endif -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {{ software_list | unique }}
+
+  rescue:
+    - name: Fallback software collection using shell
+      block:
+        - name: Get software via apt
+          shell: |
+            dpkg-query -W -f='${Package} ${Version}\n' 2>/dev/null | grep -iE "{{ software_filter | join('|') }}" || true
+          register: software_apt
+          when: ansible_pkg_mgr == "apt"
+
+        - name: Get software via yum
+          shell: |
+            rpm -qa --queryformat '%{NAME} %{VERSION}-%{RELEASE}\n' 2>/dev/null | grep -iE "{{ software_filter | join('|') }}" || true
+          register: software_yum
+          when: ansible_pkg_mgr == "yum"
+
+        - name: Set software output based on package manager
+          set_fact:
+            software_output: "{{ software_apt if ansible_pkg_mgr == 'apt' else software_yum }}"
+
+        - name: Process fallback software data
+          set_fact:
+            filtered_software: |
+              {%- set software_list = [] -%}
+              {%- if software_output is defined and software_output.stdout_lines is defined -%}
+                {%- for line in software_output.stdout_lines -%}
+                  {%- if line.strip() -%}
+                    {%- set parts = line.strip().split() -%}
+                    {%- if parts|length >= 2 -%}
+                      {%- set pkg_name = parts[0] -%}
+                      {%- set pkg_version = parts[1] -%}
+                      {%- if software_list.append({"name": pkg_name, "version": pkg_version}) -%}{%- endif -%}
+                    {%- endif -%}
+                  {%- endif -%}
+                {%- endfor -%}
+              {%- endif -%}
+              {{ software_list }}
+
+      rescue:
+        - name: Set empty software list on complete failure
+          set_fact:
+            filtered_software: []
+
+- name: Ensure filtered_software is defined
+  set_fact:
+    filtered_software: []
+  when: filtered_software is not defined
+
+- name: Create report directory on control node
+  file:
+    path: "{{ report_path }}"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  run_once: true
+
+- name: Generate CSV report
+  template:
+    src: report.j2
+    dest: "{{ report_path }}/{{ output_filename }}_{{ ansible_date_time.epoch }}.csv"
+  delegate_to: localhost
+
+- name: Generate checksum file
+  shell: |
+    cd "{{ report_path }}" && 
+    sha256sum "{{ output_filename }}_{{ ansible_date_time.epoch }}.csv" > "{{ output_filename }}_{{ ansible_date_time.epoch }}.csv.sha256"
+  delegate_to: localhost
+  run_once: true
+
+- name: Display report location
+  debug:
+    msg: |
+      Report generated: {{ report_path }}/{{ output_filename }}_{{ ansible_date_time.epoch }}.csv
+      Checksum file: {{ report_path }}/{{ output_filename }}_{{ ansible_date_time.epoch }}.csv.sha256
+  run_once: true
+```
+
+Исправленный templates/report.j2
+
+```csv
+Hostname,Distribution,Version,Architecture,CPU Model,CPU Cores,Total Memory (MB),Total Swap (MB),Virtualization,Disks,Software
+"{{ safe_hostname }}","{{ safe_distribution }}","{{ safe_distribution_version }}","{{ safe_architecture }}","{{ safe_cpu_model }}","{{ safe_processor_cores }}","{{ safe_memory }}","{{ safe_swap }}","{{ safe_virtualization_type }}/{{ safe_virtualization_role }}","{% if disk_info is defined %}{% for disk in disk_info %}{{ disk.mount }}:{{ disk.size_gb }}{% if not disk.size_gb is regex_search('[MGTP]B$') %}GB{% endif %}{% if not loop.last %}; {% endif %}{% endfor %}{% else %}N/A{% endif %}","{% for software in filtered_software %}{{ software.name }}-{{ software.version }}{% if not loop.last %}; {% endif %}{% endfor %}"
+```
+
+Альтернативный упрощенный шаблон (если вышеописанный не работает)
+
+Создайте templates/report_simple.j2:
+
+```csv
+Hostname,Distribution,Version,Architecture,CPU Model,CPU Cores,Memory (MB),Swap (MB),Virtualization,Disks,Software
+"{{ safe_hostname }}","{{ safe_distribution }}","{{ safe_distribution_version }}","{{ safe_architecture }}","{{ safe_cpu_model }}","{{ safe_processor_cores }}","{{ safe_memory }}","{{ safe_swap }}","{{ safe_virtualization_type }}/{{ safe_virtualization_role }}","{% for disk in disk_info %}{{ disk.mount }}:{{ disk.size_gb }}GB{% if not loop.last %}; {% endif %}{% endfor %}","{% for software in filtered_software %}{{ software.name }}-{{ software.version }}{% if not loop.last %}; {% endif %}{% endfor %}"
+```
+
+И в задаче генерации отчета используйте:
+
+```yaml
+- name: Generate CSV report
+  template:
+    src: report_simple.j2
+    dest: "{{ report_path }}/{{ output_filename }}_{{ ansible_date_time.epoch }}.csv"
+  delegate_to: localhost
+```
+
+Основные исправления:
+
+1. Добавлена регистрация результатов сбора фактов с ignore_errors: yes
+2. Множественные fallback'и для disk_info с разными методами сбора
+3. Гарантированное определение всех переменных перед использованием в шаблоне
+4. Улучшенная обработка ошибок для сбора информации о ПО
+5. Безопасный шаблон с проверками на существование переменных
+
+Эта версия роли должна надежно работать даже при проблемах со сбором отдельных фактов и гарантированно генерировать CSV отчет.
