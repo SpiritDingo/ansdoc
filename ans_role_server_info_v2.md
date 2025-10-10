@@ -533,3 +533,223 @@ ansible-playbook -i hosts.ini playbook.yml
 5. Добавил отладочную задачу для просмотра собранных фактов
 
 Роль теперь должна работать без ошибок и собирать всю необходимую информацию о серверах.
+
+
+
+
+
+Ошибка возникает из-за проблемы с переменной ansible_mounts. Давайте исправим роль, улучшив обработку данных о дисках и добавив проверки:
+
+Исправленная tasks/main.yml
+
+```yaml
+---
+- name: Gather system facts
+  setup:
+    gather_subset:
+      - "!all"
+      - "!min"
+      - hardware
+      - network
+      - virtual
+      - distribution
+      - distribution_version
+      - architecture
+      - processor
+      - devices
+      - mounts
+    filter:
+      - "ansible_hostname"
+      - "ansible_distribution"
+      - "ansible_distribution_version"
+      - "ansible_architecture"
+      - "ansible_processor*"
+      - "ansible_memtotal_mb"
+      - "ansible_swaptotal_mb"
+      - "ansible_devices"
+      - "ansible_mounts"
+      - "ansible_virtualization_type"
+      - "ansible_virtualization_role"
+
+- name: Check if mounts facts are available
+  debug:
+    msg: "Mounts data type: {{ ansible_mounts | type_debug }}, value: {{ ansible_mounts }}"
+  verbosity: 1
+
+- name: Collect disk information safely
+  set_fact:
+    disk_info: |
+      {%- set disks = [] -%}
+      {%- if ansible_mounts is defined and ansible_mounts -%}
+        {%- for mount in ansible_mounts -%}
+          {%- if mount is mapping and mount.mount is defined and mount.size_total is defined -%}
+            {%- set size_gb = (mount.size_total | int // (1024**3)) | round(2) -%}
+            {%- if disks.append({"mount": mount.mount, "size_gb": size_gb}) -%}{%- endif -%}
+          {%- endif -%}
+        {%- endfor -%}
+      {%- endif -%}
+      {{ disks }}
+
+- name: Get CPU model information safely
+  set_fact:
+    cpu_model: |
+      {%- if ansible_processor is defined -%}
+        {%- if ansible_processor[1] is defined and ansible_processor[0] == '0' -%}
+          {{ ansible_processor[1] }}
+        {%- else -%}
+          {{ ansible_processor[0] }}
+        {%- endif -%}
+      {%- else -%}
+        "N/A"
+      {%- endif -%}
+
+- name: Get CPU cores count safely
+  set_fact:
+    cpu_cores: "{{ ansible_processor_cores | default(ansible_processor_count | default('N/A')) }}"
+
+- name: Collect installed software
+  block:
+    - name: Get installed packages
+      package_facts:
+        manager: auto
+
+    - name: Filter software based on patterns
+      set_fact:
+        filtered_software: |
+          {%- set software_list = [] -%}
+          {%- if ansible_facts.packages is defined -%}
+            {%- for pattern in software_filter -%}
+              {%- for pkg_name, pkg_info in ansible_facts.packages.items() -%}
+                {%- if pattern | lower in pkg_name | lower or pkg_name | lower in pattern | lower -%}
+                  {%- if software_list.append({"name": pkg_name, "version": pkg_info[0].version}) -%}{%- endif -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {{ software_list | unique }}
+
+  rescue:
+    - name: Fallback software collection using shell
+      shell: |
+        {%- if ansible_pkg_mgr == "apt" -%}
+        dpkg-query -W -f='${Package} ${Version}\n' 2>/dev/null | grep -iE "{{ software_filter | join('|') }}" || true
+        {%- elif ansible_pkg_mgr == "yum" -%}
+        rpm -qa --queryformat '%{NAME} %{VERSION}\n' 2>/dev/null | grep -iE "{{ software_filter | join('|') }}" || true
+        {%- else -%}
+        echo "Unknown package manager"
+        {%- endif -%}
+      register: software_output
+      changed_when: false
+
+    - name: Process fallback software data
+      set_fact:
+        filtered_software: |
+          {%- set software_list = [] -%}
+          {%- for line in software_output.stdout_lines -%}
+            {%- if line.strip() -%}
+              {%- set parts = line.strip().split() -%}
+              {%- if parts | length >= 2 -%}
+                {%- set pkg_name = parts[0] -%}
+                {%- set pkg_version = parts[1] -%}
+                {%- if software_list.append({"name": pkg_name, "version": pkg_version}) -%}{%- endif -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ software_list }}
+
+- name: Ensure filtered_software is defined
+  set_fact:
+    filtered_software: []
+  when: filtered_software is not defined
+
+- name: Set default values for missing facts
+  set_fact:
+    safe_hostname: "{{ ansible_hostname | default('Unknown') }}"
+    safe_distribution: "{{ ansible_distribution | default('Unknown') }}"
+    safe_distribution_version: "{{ ansible_distribution_version | default('Unknown') }}"
+    safe_architecture: "{{ ansible_architecture | default('Unknown') }}"
+    safe_memory: "{{ ansible_memtotal_mb | default(0) }}"
+    safe_swap: "{{ ansible_swaptotal_mb | default(0) }}"
+    safe_virtualization_type: "{{ ansible_virtualization_type | default('physical') }}"
+    safe_virtualization_role: "{{ ansible_virtualization_role | default('host') }}"
+
+- name: Create report directory on control node
+  file:
+    path: "{{ report_path }}"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  run_once: true
+
+- name: Generate CSV report
+  template:
+    src: report.j2
+    dest: "{{ report_path }}/{{ output_filename }}_{{ ansible_date_time.epoch }}.csv"
+  delegate_to: localhost
+  run_once: false
+
+- name: Generate checksum file
+  shell: |
+    cd "{{ report_path }}" && 
+    sha256sum "{{ output_filename }}_{{ ansible_date_time.epoch }}.csv" > "{{ output_filename }}_{{ ansible_date_time.epoch }}.csv.sha256"
+  delegate_to: localhost
+  run_once: true
+
+- name: Display report location
+  debug:
+    msg: |
+      Report generated: {{ report_path }}/{{ output_filename }}_{{ ansible_date_time.epoch }}.csv
+      Checksum file: {{ report_path }}/{{ output_filename }}_{{ ansible_date_time.epoch }}.csv.sha256
+  run_once: true
+```
+
+Исправленный templates/report.j2
+
+```csv
+Hostname,Distribution,Version,Architecture,CPU Model,CPU Cores,Total Memory (MB),Total Swap (MB),Virtualization,Disks,Software
+"{{ safe_hostname }}","{{ safe_distribution }}","{{ safe_distribution_version }}","{{ safe_architecture }}","{{ cpu_model }}","{{ cpu_cores }}","{{ safe_memory }}","{{ safe_swap }}","{{ safe_virtualization_type }}/{{ safe_virtualization_role }}","{% for disk in disk_info %}{{ disk.mount }}:{{ disk.size_gb }}GB{% if not loop.last %}; {% endif %}{% endfor %}","{% for software in filtered_software %}{{ software.name }}-{{ software.version }}{% if not loop.last %}; {% endif %}{% endfor %}"
+```
+
+Альтернативная версия для проблемных систем
+
+Если проблема с ansible_mounts persists, добавьте эту задачу как альтернативу:
+
+```yaml
+- name: Collect disk information using shell command (fallback)
+  block:
+    - name: Get disk info via df command
+      shell: df -h --output=target,size | grep -v 'Mounted on' | awk '{print $1 ":" $2}'
+      register: disk_output
+      changed_when: false
+    
+    - name: Process disk output
+      set_fact:
+        disk_info_fallback: |
+          {%- set disks = [] -%}
+          {%- for line in disk_output.stdout_lines -%}
+            {%- if ':' in line -%}
+              {%- set parts = line.split(':') -%}
+              {%- if parts | length >= 2 -%}
+                {%- if disks.append({"mount": parts[0], "size_gb": parts[1]}) -%}{%- endif -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ disks }}
+  
+  rescue:
+    - name: Set empty disk info on error
+      set_fact:
+        disk_info_fallback: []
+```
+
+И используйте disk_info_fallback в шаблоне, если основной метод не работает.
+
+Основные исправления:
+
+1. Добавлены проверки типа данных для ansible_mounts
+2. Улучшена обработка ошибок с помощью is mapping и проверок атрибутов
+3. Добавлены безопасные переменные с значениями по умолчанию
+4. Улучшена отладка с проверкой типа данных mounts
+5. Добавлены альтернативные методы сбора информации о дисках
+
+Теперь роль должна корректно обрабатывать случаи, когда факты о монтированиях недоступны или имеют неожиданный формат.
