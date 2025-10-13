@@ -2733,3 +2733,518 @@ ansible-playbook -i hosts.ini playbook.yml \
 ```
 
 Теперь отчет будет содержать полную информацию о сетевых интерфейсах и запущенных службах на каждом сервере!
+
+
+
+
+
+Ошибка возникает из-за неправильного форматирования в блоке rescue для сбора служб. Давайте исправим эту проблему:
+
+Исправленный tasks/main.yml
+
+Замените блок сбора служб на следующий корректный код:
+
+```yaml
+# ... предыдущие задачи до сбора служб ...
+
+- name: Collect service information
+  block:
+    - name: Gather service facts
+      service_facts:
+
+    - name: Filter services based on patterns
+      set_fact:
+        filtered_services: |
+          {%- set services_list = [] -%}
+          {%- if ansible_facts.services is defined -%}
+            {%- for pattern in service_filter -%}
+              {%- for service_name, service_info in ansible_facts.services.items() -%}
+                {%- if pattern | lower in service_name | lower or service_name | lower in pattern | lower -%}
+                  {%- set service_status = service_info.state | default('unknown') -%}
+                  {%- if service_status == 'running' -%}
+                    {%- if services_list.append(service_name) -%}{%- endif -%}
+                  {%- endif -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {{ services_list | unique | sort }}
+
+  rescue:
+    - name: Fallback service collection using shell (Systemd)
+      block:
+        - name: Check systemd services
+          shell: |
+            systemctl list-units --type=service --state=running --no-legend | awk '{print $1}' | grep -iE "{{ service_filter | join('|') }}" || true
+          register: systemd_services
+          changed_when: false
+          ignore_errors: yes
+
+        - name: Process systemd services
+          set_fact:
+            filtered_services: "{{ systemd_services.stdout_lines }}"
+          when: systemd_services is defined and systemd_services.stdout_lines is defined
+
+      when: ansible_service_mgr == "systemd"
+
+    - name: Fallback service collection using shell (SysV)
+      block:
+        - name: Check SysV services
+          shell: |
+            service --status-all 2>/dev/null | grep -iE "{{ service_filter | join('|') }}" | awk '{print $4}' || true
+          register: sysv_services
+          changed_when: false
+          ignore_errors: yes
+
+        - name: Process SysV services
+          set_fact:
+            filtered_services: "{{ sysv_services.stdout_lines }}"
+          when: sysv_services is defined and sysv_services.stdout_lines is defined
+
+      when: ansible_service_mgr == "sysvinit"
+
+    - name: Final fallback for services
+      set_fact:
+        filtered_services: []
+      when: filtered_services is not defined
+
+- name: Ensure filtered_services is defined
+  set_fact:
+    filtered_services: []
+  when: filtered_services is not defined
+
+# ... остальные задачи продолжаются ...
+```
+
+Альтернативная упрощенная версия сбора служб
+
+Если у вас продолжаются проблемы, вот более простая версия:
+
+```yaml
+- name: Collect service information
+  block:
+    - name: Gather service facts
+      service_facts:
+
+    - name: Filter running services
+      set_fact:
+        filtered_services: |
+          {%- set services_list = [] -%}
+          {%- if ansible_facts.services is defined -%}
+            {%- for service_name, service_info in ansible_facts.services.items() -%}
+              {%- set service_status = service_info.state | default('unknown') -%}
+              {%- if service_status == 'running' -%}
+                {%- for pattern in service_filter -%}
+                  {%- if pattern | lower in service_name | lower -%}
+                    {%- if services_list.append(service_name) -%}{%- endif -%}
+                  {%- endif -%}
+                {%- endfor -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {{ services_list | unique | sort }}
+
+  rescue:
+    - name: Use systemctl to get running services
+      shell: |
+        systemctl list-units --type=service --state=running --no-legend 2>/dev/null | awk '{print $1}' | while read service; do
+          for pattern in {{ service_filter | join(' ') }}; do
+            if echo "$service" | grep -qi "$pattern"; then
+              echo "$service"
+              break
+            fi
+          done
+        done | sort | uniq
+      register: systemd_services
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Set services from systemctl
+      set_fact:
+        filtered_services: "{{ systemd_services.stdout_lines }}"
+      when: systemd_services is defined and systemd_services.stdout_lines is defined
+
+    - name: Set empty services list as final fallback
+      set_fact:
+        filtered_services: []
+      when: filtered_services is not defined
+```
+
+Полная исправленная версия tasks/main.yml
+
+Вот полный исправленный файл tasks/main.yml без ошибок форматирования:
+
+```yaml
+---
+- name: Gather system facts
+  setup:
+    gather_subset:
+      - "!all"
+      - "!min"
+      - hardware
+      - network
+      - virtual
+      - distribution
+      - distribution_version
+      - architecture
+      - processor
+      - devices
+      - mounts
+  register: facts_result
+  ignore_errors: yes
+
+- name: Set safe facts with defaults
+  set_fact:
+    safe_hostname: "{{ ansible_hostname | default('Unknown') }}"
+    safe_distribution: "{{ ansible_distribution | default('Unknown') }}"
+    safe_distribution_version: "{{ ansible_distribution_version | default('Unknown') }}"
+    safe_architecture: "{{ ansible_architecture | default('Unknown') }}"
+    safe_memory: "{{ ansible_memtotal_mb | default(0) }}"
+    safe_swap: "{{ ansible_swaptotal_mb | default(0) }}"
+    safe_virtualization_type: "{{ ansible_virtualization_type | default('physical') }}"
+    safe_virtualization_role: "{{ ansible_virtualization_role | default('host') }}"
+    safe_processor_cores: "{{ ansible_processor_cores | default(ansible_processor_count | default('N/A')) }}"
+
+- name: Get CPU model safely
+  set_fact:
+    safe_cpu_model: |
+      {%- if ansible_processor is defined -%}
+        {%- if ansible_processor[1] is defined and ansible_processor[0] == '0' -%}
+          {{ ansible_processor[1] }}
+        {%- elif ansible_processor[0] is defined -%}
+          {{ ansible_processor[0] }}
+        {%- else -%}
+          "N/A"
+        {%- endif -%}
+      {%- else -%}
+        "N/A"
+      {%- endif -%}
+
+- name: Collect IP addresses information
+  set_fact:
+    ip_addresses: |
+      {%- set ips = [] -%}
+      {%- if ansible_default_ipv4 is defined and ansible_default_ipv4.address is defined -%}
+        {%- if ips.append(ansible_default_ipv4.address) -%}{%- endif -%}
+      {%- endif -%}
+      {%- if include_all_ips and ansible_all_ipv4_addresses is defined -%}
+        {%- for ip in ansible_all_ipv4_addresses -%}
+          {%- if ip != ansible_default_ipv4.address and ip not in ips -%}
+            {%- if ips.append(ip) -%}{%- endif -%}
+          {%- endif -%}
+        {%- endfor -%}
+      {%- endif -%}
+      {{ ips }}
+
+- name: Get primary IP address
+  set_fact:
+    primary_ip: "{{ ansible_default_ipv4.address | default('N/A') }}"
+
+- name: Collect disk information with multiple fallbacks
+  block:
+    - name: Try to get disk info from mounts facts
+      set_fact:
+        disk_info: |
+          {%- set disks = [] -%}
+          {%- if ansible_mounts is defined and ansible_mounts -%}
+            {%- for mount in ansible_mounts -%}
+              {%- if mount is mapping and mount.mount is defined and mount.size_total is defined -%}
+                {%- set size_gb = (mount.size_total | int // (1024**3)) | round(2) -%}
+                {%- if disks.append({"mount": mount.mount, "size_gb": size_gb}) -%}{%- endif -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {{ disks }}
+      when: ansible_mounts is defined
+
+  rescue:
+    - name: Set empty disk info on error
+      set_fact:
+        disk_info: []
+
+- name: Fallback disk info using shell command
+  block:
+    - name: Get disk info via df command
+      shell: |
+        df -h --output=target,size | tail -n +2 | awk '{gsub(/M|G|T/,"",$2); print $1 ":" $2}'
+      register: disk_df
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Process disk output from df
+      set_fact:
+        disk_info_fallback: |
+          {%- set disks = [] -%}
+          {%- if disk_df is defined and disk_df.stdout_lines is defined -%}
+            {%- for line in disk_df.stdout_lines -%}
+              {%- if ':' in line -%}
+                {%- set parts = line.split(':') -%}
+                {%- if parts|length >= 2 and parts[0] != '' -%}
+                  {%- if disks.append({"mount": parts[0], "size_gb": parts[1] | trim}) -%}{%- endif -%}
+                {%- endif -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {{ disks }}
+      when: disk_df is defined and disk_df.stdout is defined
+
+  when: disk_info is not defined or disk_info | length == 0
+
+- name: Ensure disk_info is always defined
+  set_fact:
+    disk_info: "{{ disk_info_fallback | default([]) }}"
+  when: disk_info is not defined
+
+- name: Final disk_info fallback
+  set_fact:
+    disk_info: []
+  when: disk_info is not defined
+
+- name: Collect service information
+  block:
+    - name: Gather service facts
+      service_facts:
+
+    - name: Filter running services
+      set_fact:
+        filtered_services: |
+          {%- set services_list = [] -%}
+          {%- if ansible_facts.services is defined -%}
+            {%- for service_name, service_info in ansible_facts.services.items() -%}
+              {%- set service_status = service_info.state | default('unknown') -%}
+              {%- if service_status == 'running' -%}
+                {%- for pattern in service_filter -%}
+                  {%- if pattern | lower in service_name | lower -%}
+                    {%- if services_list.append(service_name) -%}{%- endif -%}
+                  {%- endif -%}
+                {%- endfor -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {{ services_list | unique | sort }}
+
+  rescue:
+    - name: Use systemctl to get running services
+      shell: |
+        systemctl list-units --type=service --state=running --no-legend 2>/dev/null | awk '{print $1}' | while read service; do
+          for pattern in {{ service_filter | join(' ') }}; do
+            if echo "$service" | grep -qi "$pattern"; then
+              echo "$service"
+              break
+            fi
+          done
+        done | sort | uniq
+      register: systemd_services
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Set services from systemctl
+      set_fact:
+        filtered_services: "{{ systemd_services.stdout_lines }}"
+      when: systemd_services is defined and systemd_services.stdout_lines is defined
+
+    - name: Set empty services list as final fallback
+      set_fact:
+        filtered_services: []
+      when: filtered_services is not defined
+
+- name: Ensure filtered_services is defined
+  set_fact:
+    filtered_services: []
+  when: filtered_services is not defined
+
+- name: Collect installed software
+  block:
+    - name: Get installed packages
+      package_facts:
+        manager: auto
+
+    - name: Filter software based on patterns
+      set_fact:
+        filtered_software: |
+          {%- set software_list = [] -%}
+          {%- if ansible_facts.packages is defined -%}
+            {%- for pattern in software_filter -%}
+              {%- for pkg_name, pkg_info in ansible_facts.packages.items() -%}
+                {%- if pattern | lower in pkg_name | lower or pkg_name | lower in pattern | lower -%}
+                  {%- if software_list.append({"name": pkg_name, "version": pkg_info[0].version}) -%}{%- endif -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {{ software_list | unique }}
+
+  rescue:
+    - name: Fallback software collection using shell
+      block:
+        - name: Get software via apt
+          shell: |
+            dpkg-query -W -f='${Package} ${Version}\n' 2>/dev/null | grep -iE "{{ software_filter | join('|') }}" || true
+          register: software_apt
+          changed_when: false
+          ignore_errors: yes
+          when: ansible_pkg_mgr == "apt"
+
+        - name: Get software via yum
+          shell: |
+            rpm -qa --queryformat '%{NAME} %{VERSION}-%{RELEASE}\n' 2>/dev/null | grep -iE "{{ software_filter | join('|') }}" || true
+          register: software_yum
+          changed_when: false
+          ignore_errors: yes
+          when: ansible_pkg_mgr == "yum"
+
+        - name: Set software output based on package manager
+          set_fact:
+            software_output: "{{ software_apt if ansible_pkg_mgr == 'apt' else software_yum }}"
+          when: ansible_pkg_mgr in ['apt', 'yum']
+
+        - name: Process fallback software data
+          set_fact:
+            filtered_software: |
+              {%- set software_list = [] -%}
+              {%- if software_output is defined and software_output.stdout_lines is defined -%}
+                {%- for line in software_output.stdout_lines -%}
+                  {%- if line.strip() -%}
+                    {%- set parts = line.strip().split() -%}
+                    {%- if parts|length >= 2 -%}
+                      {%- set pkg_name = parts[0] -%}
+                      {%- set pkg_version = parts[1] -%}
+                      {%- if software_list.append({"name": pkg_name, "version": pkg_version}) -%}{%- endif -%}
+                    {%- endif -%}
+                  {%- endif -%}
+                {%- endfor -%}
+              {%- endif -%}
+              {{ software_list }}
+
+      rescue:
+        - name: Set empty software list on complete failure
+          set_fact:
+            filtered_software: []
+
+- name: Ensure filtered_software is defined
+  set_fact:
+    filtered_software: []
+  when: filtered_software is not defined
+
+- name: Create report directory on control node
+  file:
+    path: "{{ report_path }}"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  run_once: true
+
+- name: Add CSV header (only once)
+  lineinfile:
+    path: "{{ report_path }}/{{ output_filename }}.csv"
+    line: "Hostname,Primary IP,All IPs,Distribution,Version,Architecture,CPU Model,CPU Cores,Memory (MB),Swap (MB),Virtualization,Disks,Running Services,Installed Software"
+    create: yes
+    insertbefore: BOF
+  delegate_to: localhost
+  run_once: true
+  when: inventory_hostname == play_hosts[0]
+
+- name: Add host data to consolidated report
+  lineinfile:
+    path: "{{ report_path }}/{{ output_filename }}.csv"
+    line: |
+      "{{ safe_hostname }}","{{ primary_ip }}","{{ ip_addresses | join('; ') }}","{{ safe_distribution }}","{{ safe_distribution_version }}","{{ safe_architecture }}","{{ safe_cpu_model }}","{{ safe_processor_cores }}","{{ safe_memory }}","{{ safe_swap }}","{{ safe_virtualization_type }}/{{ safe_virtualization_role }}","{% for disk in disk_info %}{{ disk.mount }}:{{ disk.size_gb }}GB{% if not loop.last %}; {% endif %}{% endfor %}","{% for service in filtered_services %}{{ service }}{% if not loop.last %}; {% endif %}{% endfor %}","{% for software in filtered_software %}{{ software.name }}-{{ software.version }}{% if not loop.last %}; {% endif %}{% endfor %}"
+    create: yes
+  delegate_to: localhost
+  run_once: false
+
+- name: Generate checksum for unencrypted report
+  shell: |
+    cd "{{ report_path }}" && 
+    sha256sum "{{ output_filename }}.csv" > "{{ output_filename }}.csv.sha256"
+  delegate_to: localhost
+  run_once: true
+  when: not encrypt_report
+
+- name: Check if report exists before encryption
+  stat:
+    path: "{{ report_path }}/{{ output_filename }}.csv"
+  register: report_stat
+  delegate_to: localhost
+  run_once: true
+  when: encrypt_report
+
+- name: Encrypt report with Ansible Vault using command
+  command: >
+    ansible-vault encrypt
+    {% if vault_password_file %}--vault-password-file {{ vault_password_file }}{% endif %}
+    --output "{{ report_path }}/{{ output_filename }}_encrypted.csv"
+    "{{ report_path }}/{{ output_filename }}.csv"
+  delegate_to: localhost
+  run_once: true
+  when:
+    - encrypt_report
+    - report_stat.stat.exists
+
+- name: Generate checksum for encrypted report
+  shell: |
+    cd "{{ report_path }}" && 
+    sha256sum "{{ output_filename }}_encrypted.csv" > "{{ output_filename }}_encrypted.csv.sha256"
+  delegate_to: localhost
+  run_once: true
+  when: 
+    - encrypt_report
+    - report_stat.stat.exists
+
+- name: Remove unencrypted report after encryption
+  file:
+    path: "{{ report_path }}/{{ output_filename }}.csv"
+    state: absent
+  delegate_to: localhost
+  run_once: true
+  when:
+    - encrypt_report
+    - remove_unencrypted
+    - report_stat.stat.exists
+
+- name: Display report location
+  debug:
+    msg: |
+      {% if encrypt_report and report_stat.stat.exists %}
+      Encrypted report generated: {{ report_path }}/{{ output_filename }}_encrypted.csv
+      Use 'ansible-vault view {{ report_path }}/{{ output_filename }}_encrypted.csv' to view the report
+      {% if vault_password_file != "" %}
+      Vault password file: {{ vault_password_file }}
+      {% endif %}
+      Checksum file: {{ report_path }}/{{ output_filename }}_encrypted.csv.sha256
+      {% if remove_unencrypted %}
+      Note: Unencrypted version was removed
+      {% endif %}
+      {% elif encrypt_report and not report_stat.stat.exists %}
+      ERROR: Report file not found for encryption
+      {% else %}
+      Consolidated report generated: {{ report_path }}/{{ output_filename }}.csv
+      Checksum file: {{ report_path }}/{{ output_filename }}.csv.sha256
+      {% endif %}
+  delegate_to: localhost
+  run_once: true
+
+- name: Warn about missing vault password file
+  debug:
+    msg: |
+      WARNING: encrypt_report is true but vault_password_file is not specified.
+      You will be prompted for the vault password interactively.
+  delegate_to: localhost
+  run_once: true
+  when:
+    - encrypt_report
+    - vault_password_file == ""
+```
+
+Основные исправления:
+
+1. Убрал дублирующееся имя задачи в блоке rescue
+2. Добавил правильное форматирование для всех задач
+3. Упростил логику сбора служб
+4. Добавил правильные условия when для всех fallback-задач
+
+Теперь роль должна работать без ошибок синтаксиса!
+
+
+
+
