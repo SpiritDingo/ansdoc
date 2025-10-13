@@ -3284,3 +3284,485 @@ Hostname,...,Current Memory (GB),Max Physical Memory,Memory Details,...
 · Фильтруются пустые слоты и неизвестные модули
 
 Теперь отчет будет содержать полную информацию не только о текущей установленной оперативной памяти, но и о максимальной физически поддерживаемой памяти системой, а также детали об установленных модулях памяти.
+
+
+
+
+Отличная идея! Добавим сбор информации о физических дисках, их размере, типе и других характеристиках. Вот улучшенная версия роли:
+
+## Обновленный defaults/main.yml
+
+```yaml
+---
+# Настройки сбора информации о памяти
+memory_info:
+  collect_max_memory: true
+  collect_memory_slots: true
+  use_dmidecode: true
+  use_lshw: true
+
+# Настройки сбора информации о дисках
+disk_info:
+  collect_physical_disks: true
+  collect_partition_info: true
+  collect_disk_health: false  # Будет использовать smartctl если доступно
+  exclude_loop_devices: true
+  exclude_removable: true
+  min_disk_size_gb: 1  # Минимальный размер диска для отображения
+
+# Пакеты для проверки (регулярные выражения)
+software_filter:
+  - "python3"
+  - "docker"
+  - "nginx"
+  - "apache2"
+  - "httpd"
+  - "mysql"
+  - "postgresql"
+  - "node"
+  - "java"
+  - "ruby"
+
+# Службы для проверки
+service_filter:
+  - "nginx"
+  - "apache2"
+  - "httpd"
+  - "mysql"
+  - "postgresql"
+  - "docker"
+  - "ssh"
+  - "redis"
+  - "mongod"
+  - "elasticsearch"
+
+# Путь для сохранения отчета
+report_path: "/tmp/server_report"
+output_filename: "servers_consolidated_report"
+
+# Шифрование отчета
+encrypt_report: false
+vault_password_file: ""
+remove_unencrypted: false
+
+# Настройки сбора IP-адресов
+preferred_interface: "eth0"  # Предпочтительный интерфейс для основного IP
+include_all_ips: true         # Включать все IP-адреса
+
+# Сбор описаний служб
+collect_service_descriptions: true
+collect_detailed_service_info: true  # Сбор расширенной информации о службах
+
+# Фильтрация дисков (точки монтирования)
+exclude_mount_types:
+  - "tmpfs"
+  - "devtmpfs"
+  - "squashfs"
+  - "overlay"
+  - "cgroup"
+  - "mqueue"
+  - "devpts"
+  - "proc"
+  - "sysfs"
+  - "fusectl"
+  - "debugfs"
+  - "securityfs"
+  - "configfs"
+  - "pstore"
+  - "autofs"
+  - "hugetlbfs"
+  - "fuse.gvfsd-fuse"
+
+exclude_mount_points:
+  - "/proc"
+  - "/sys"
+  - "/dev"
+  - "/run"
+  - "/snap"
+  - "/var/lib/docker"
+  - "/sys/fs/cgroup"
+  - "/sys/fs/fuse/connections"
+  - "/sys/kernel/security"
+  - "/dev/shm"
+  - "/run/lock"
+  - "/run/user"
+
+# Формат времени для отчета
+timestamp_format: "%Y-%m-%d_%H-%M-%S"
+```
+
+## Новые задачи для сбора информации о физических дисках
+
+Добавьте эти задачи после сбора информации о памяти и перед сбором информации о CPU:
+
+```yaml
+- name: Collect physical disk information
+  block:
+    - name: Install necessary disk utilities
+      package:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - util-linux
+        - lshw
+        - hdparm
+      ignore_errors: yes
+      when: disk_info.collect_physical_disks | default(true)
+
+    - name: Get physical disks information using lsblk
+      shell: |
+        lsblk -b -o NAME,TYPE,SIZE,MODEL,VENDOR,ROTA,MOUNTPOINT,FSTYPE,TRAN,SERIAL --json 2>/dev/null || echo '{"blockdevices": []}'
+      register: lsblk_output
+      changed_when: false
+      ignore_errors: yes
+      when: disk_info.collect_physical_disks | default(true)
+
+    - name: Parse physical disks information
+      set_fact:
+        physical_disks_parsed: |
+          {%- set disks = [] -%}
+          {%- if lsblk_output.stdout and lsblk_output.stdout != '{"blockdevices": []}' -%}
+            {%- set lsblk_data = lsblk_output.stdout | from_json -%}
+            {%- for device in lsblk_data.blockdevices -%}
+              {%- if device.type == "disk" -%}
+                {%- set skip_disk = false -%}
+                
+                {# Пропускаем loop устройства если включено #}
+                {%- if disk_info.exclude_loop_devices | default(true) and device.name.startswith('loop') -%}
+                  {%- set skip_disk = true -%}
+                {%- endif -%}
+                
+                {# Пропускаем маленькие диски #}
+                {%- set size_gb = (device.size | default(0) | int / (1024**3)) | round(2) -%}
+                {%- if size_gb < (disk_info.min_disk_size_gb | default(1)) -%}
+                  {%- set skip_disk = true -%}
+                {%- endif -%}
+                
+                {%- if not skip_disk -%}
+                  {%- set disk_info_dict = {
+                    'name': device.name,
+                    'type': device.type,
+                    'size_gb': size_gb,
+                    'size_bytes': device.size | default(0),
+                    'model': device.model | default('Unknown'),
+                    'vendor': device.vendor | default('Unknown'),
+                    'rotational': (device.rota | default(1) == 1),
+                    'transport': device.tran | default('Unknown'),
+                    'serial': device.serial | default('Unknown')
+                  } -%}
+                  
+                  {# Собираем информацию о разделах для этого диска #}
+                  {%- set partitions = [] -%}
+                  {%- if device.children is defined and disk_info.collect_partition_info | default(true) -%}
+                    {%- for child in device.children -%}
+                      {%- if child.type == "part" -%}
+                        {%- set part_size_gb = (child.size | default(0) | int / (1024**3)) | round(2) -%}
+                        {%- if partitions.append({
+                          'name': child.name,
+                          'size_gb': part_size_gb,
+                          'fstype': child.fstype | default('Unknown'),
+                          'mountpoint': child.mountpoint | default('Not mounted')
+                        }) -%}{%- endif -%}
+                      {%- endif -%}
+                    {%- endfor -%}
+                  {%- endif -%}
+                  {%- if disk_info_dict.update({'partitions': partitions}) -%}{%- endif -%}
+                  
+                  {%- if disks.append(disk_info_dict) -%}{%- endif -%}
+                {%- endif -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {{ disks }}
+
+    - name: Get additional disk information using lshw
+      shell: |
+        lshw -class disk -json 2>/dev/null || echo '[]'
+      register: lshw_disk_output
+      changed_when: false
+      ignore_errors: yes
+      when: disk_info.collect_physical_disks | default(true)
+
+    - name: Enhance disk information with lshw data
+      set_fact:
+        enhanced_physical_disks: |
+          {%- set enhanced_disks = [] -%}
+          {%- for disk in physical_disks_parsed -%}
+            {%- set enhanced_disk = disk -%}
+            {%- if lshw_disk_output.stdout and lshw_disk_output.stdout != '[]' -%}
+              {%- set lshw_data = lshw_disk_output.stdout | from_json -%}
+              {%- for lshw_disk in lshw_data -%}
+                {%- if lshw_disk.logicalname is defined and disk.name in lshw_disk.logicalname -%}
+                  {%- if enhanced_disk.update({
+                    'description': lshw_disk.description | default('Unknown'),
+                    'product': lshw_disk.product | default('Unknown'),
+                    'vendor': lshw_disk.vendor | default(enhanced_disk.vendor),
+                    'serial': lshw_disk.serial | default(enhanced_disk.serial),
+                    'capacity_bytes': lshw_disk.size | default(enhanced_disk.size_bytes),
+                    'configuration': lshw_disk.configuration | default({})
+                  }) -%}{%- endif -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endif -%}
+            {%- if enhanced_disks.append(enhanced_disk) -%}{%- endif -%}
+          {%- endfor -%}
+          {{ enhanced_disks }}
+
+    - name: Get disk usage and performance information
+      block:
+        - name: Get disk read-ahead and scheduler info
+          shell: |
+            for disk in /sys/block/sd* /sys/block/vd* /sys/block/nvme*; do
+              if [ -b "/dev/$(basename $disk)" ]; then
+                echo "Disk: $(basename $disk)"
+                echo "  Read-ahead: $(cat $disk/queue/read_ahead_kb 2>/dev/null || echo 'N/A') KB"
+                echo "  Scheduler: $(cat $disk/queue/scheduler 2>/dev/null || echo 'N/A')"
+                echo "  Size: $(cat $disk/size 2>/dev/null | awk '{print $1*512/1024/1024/1024 " GB"}' || echo 'N/A')"
+                echo "---"
+              fi
+            done
+          register: disk_sys_info
+          changed_when: false
+          ignore_errors: yes
+
+        - name: Parse disk system information
+          set_fact:
+            disk_sysinfo_parsed: |
+              {%- set disk_info_list = [] -%}
+              {%- if disk_sys_info.stdout -%}
+                {%- set disk_blocks = disk_sys_info.stdout.split('---') -%}
+                {%- for block in disk_blocks -%}
+                  {%- if block.strip() -%}
+                    {%- set disk_data = {} -%}
+                    {%- for line in block.strip().split('\n') -%}
+                      {%- if 'Disk:' in line -%}
+                        {%- set disk_name = line.split(':')[1] | trim -%}
+                        {%- if disk_data.update({'name': disk_name}) -%}{%- endif -%}
+                      {%- elif 'Read-ahead:' in line -%}
+                        {%- set read_ahead = line.split(':')[1] | trim -%}
+                        {%- if disk_data.update({'read_ahead': read_ahead}) -%}{%- endif -%}
+                      {%- elif 'Scheduler:' in line -%}
+                        {%- set scheduler = line.split(':')[1] | trim -%}
+                        {%- if disk_data.update({'scheduler': scheduler}) -%}{%- endif -%}
+                      {%- elif 'Size:' in line -%}
+                        {%- set size_str = line.split(':')[1] | trim -%}
+                        {%- if disk_data.update({'sys_size': size_str}) -%}{%- endif -%}
+                      {%- endif -%}
+                    {%- endfor -%}
+                    {%- if disk_info_list.append(disk_data) -%}{%- endif -%}
+                  {%- endif -%}
+                {%- endfor -%}
+              {%- endif -%}
+              {{ disk_info_list }}
+
+      when: disk_info.collect_physical_disks | default(true)
+
+  rescue:
+    - name: Handle disk collection errors
+      debug:
+        msg: "Failed to collect detailed disk information"
+      ignore_errors: yes
+
+- name: Set safe disk facts
+  set_fact:
+    safe_physical_disks: "{{ enhanced_physical_disks | default(physical_disks_parsed) | default([]) }}"
+    safe_disk_sysinfo: "{{ disk_sysinfo_parsed | default([]) }}"
+
+- name: Format physical disks for report
+  set_fact:
+    physical_disks_formatted: |
+      {%- if safe_physical_disks -%}
+        {%- set disk_strings = [] -%}
+        {%- for disk in safe_physical_disks -%}
+          {%- set disk_type = 'HDD' if disk.rotational else 'SSD' -%}
+          {%- set disk_str = disk.name ~ ':' ~ disk.size_gb ~ 'GB:' ~ disk_type ~ ':' ~ disk.model -%}
+          {%- if disk_strings.append(disk_str) -%}{%- endif -%}
+        {%- endfor -%}
+        {{ disk_strings | join('; ') }}
+      {%- else -%}
+        "No physical disks detected"
+      {%- endif -%}
+
+- name: Format disk partitions for report
+  set_fact:
+    disk_partitions_formatted: |
+      {%- if safe_physical_disks -%}
+        {%- set partition_strings = [] -%}
+        {%- for disk in safe_physical_disks -%}
+          {%- for partition in disk.partitions -%}
+            {%- set part_str = partition.name ~ ':' ~ partition.size_gb ~ 'GB:' ~ partition.fstype ~ ':' ~ partition.mountpoint -%}
+            {%- if partition_strings.append(part_str) -%}{%- endif -%}
+          {%- endfor -%}
+        {%- endfor -%}
+        {{ partition_strings | join('; ') }}
+      {%- else -%}
+        "No partitions detected"
+      {%- endif -%}
+```
+
+## Обновленный CSV заголовок и данные
+
+Обновите задачу добавления CSV заголовка:
+
+```yaml
+- name: Add CSV header (only once)
+  lineinfile:
+    path: "{{ report_path }}/{{ output_filename }}.csv"
+    line: "Hostname,Primary IP,All IPs,Distribution,Version,Architecture,CPU Model,CPU Frequency (MHz),CPU Cores,CPU Sockets,CPU Threads,CPU Cache,CPU Topology,CPU Architecture,Current Memory (GB),Max Physical Memory,Memory Details,Swap (GB),Virtualization,Mounted Disks,Physical Disks,Disk Partitions,Running Services,Service Details"
+    create: yes
+    insertbefore: BOF
+  delegate_to: localhost
+  run_once: true
+  when: inventory_hostname == play_hosts[0]
+```
+
+Обновите задачу добавления данных в отчет:
+
+```yaml
+- name: Add host data to consolidated report
+  lineinfile:
+    path: "{{ report_path }}/{{ output_filename }}.csv"
+    line: |
+      "{{ safe_hostname }}",
+      "{{ primary_ip }}",
+      "{{ ip_addresses | join('; ') }}",
+      "{{ safe_distribution }}",
+      "{{ safe_distribution_version }}",
+      "{{ safe_architecture }}",
+      "{{ safe_cpu_model | replace('"', '""') }}",
+      "{{ safe_cpu_frequency_mhz }}",
+      "{{ safe_processor_cores }}",
+      "{{ safe_processor_count }}",
+      "{{ safe_processor_vcpus }}",
+      "{{ safe_cpu_cache }}",
+      "{{ safe_cpu_topology }}",
+      "{{ safe_cpu_arch_details }}",
+      "{{ safe_memory }}",
+      "{{ safe_max_physical_memory }}",
+      "{{ safe_memory_slots_details | replace('"', '""') }}",
+      "{{ safe_swap }}",
+      "{{ safe_virtualization_type }}/{{ safe_virtualization_role }}",
+      "{% for disk in disk_info %}{{ disk.mount }}:{{ disk.size_gb }}GB({{ disk.fstype }}){% if not loop.last %}; {% endif %}{% endfor %}",
+      "{{ physical_disks_formatted }}",
+      "{{ disk_partitions_formatted }}",
+      "{% for service in services_with_details %}{{ service.name }}{% if not loop.last %}; {% endif %}{% endfor %}",
+      "{% for service in services_with_details %}{% if service.description is defined %}{{ service.name }}:{{ service.description }}:{{ service.active_state }}{% if not loop.last %}|{% endif %}{% else %}{{ service.name }}{% if not loop.last %}|{% endif %}{% endif %}{% endfor %}"
+    create: yes
+  delegate_to: localhost
+  run_once: false
+```
+
+## Новый шаблон для детального отчета о дисках
+
+Добавьте этот шаблон как `templates/disk_report.md.j2`:
+
+```jinja2
+# Physical Disk Report - {{ safe_hostname }}
+
+## Physical Disks Summary
+{% for disk in safe_physical_disks %}
+### Disk {{ disk.name }}
+- **Model**: {{ disk.model }} ({{ disk.vendor }})
+- **Size**: {{ disk.size_gb }} GB ({{ disk.size_bytes }} bytes)
+- **Type**: {% if disk.rotational %}HDD (Rotational){% else %}SSD (Non-rotational){% endif %}
+- **Transport**: {{ disk.transport }}
+- **Serial**: {{ disk.serial }}
+{% if disk.description and disk.description != 'Unknown' %}- **Description**: {{ disk.description }}{% endif %}
+{% if disk.product and disk.product != 'Unknown' %}- **Product**: {{ disk.product }}{% endif %}
+
+### Partitions on {{ disk.name }}
+{% if disk.partitions %}
+{% for part in disk.partitions %}
+- **{{ part.name }}**: {{ part.size_gb }} GB, {{ part.fstype }}, Mount: {{ part.mountpoint }}
+{% endfor %}
+{% else %}
+- No partitions found
+{% endif %}
+{% if not loop.last %}
+---
+{% endif %}
+{% else %}
+No physical disks detected
+{% endfor %}
+
+## Disk System Information
+{% for disk_sys in safe_disk_sysinfo %}
+- **{{ disk_sys.name }}**: Scheduler: {{ disk_sys.scheduler | default('N/A') }}, Read-ahead: {{ disk_sys.read_ahead | default('N/A') }}
+{% else %}
+- No system disk information available
+{% endfor %}
+
+## Mounted Filesystems
+{% for disk in disk_info %}
+- **{{ disk.mount }}**: {{ disk.size_gb }} GB ({{ disk.fstype }})
+{% else %}
+- No mounted filesystems information available
+{% endfor %}
+```
+
+## Основные возможности сбора информации о дисках:
+
+1. **Физические диски**:
+   - Имя устройства (sda, sdb, nvme0n1 и т.д.)
+   - Модель и производитель
+   - Размер в GB и байтах
+   - Тип (HDD/SSD) на основе rotational flag
+   - Интерфейс подключения (SATA, SAS, NVMe и т.д.)
+   - Серийный номер
+
+2. **Разделы**:
+   - Имена разделов
+   - Размеры разделов
+   - Типы файловых систем
+   - Точки монтирования
+
+3. **Системная информация**:
+   - Планировщики ввода-вывода
+   - Read-ahead настройки
+   - Размеры через sysfs
+
+4. **Гибкая конфигурация**:
+   - Исключение loop-устройств
+   - Минимальный размер диска для отображения
+   - Возможность отключения сбора
+
+## Пример вывода в CSV:
+
+```
+Physical Disks: "sda:476.94GB:SSD:Samsung SSD 860; sdb:931.51GB:HDD:WDC WD10EFRX"
+Disk Partitions: "sda1:0.49GB:ext4:/boot; sda2:476.45GB:LVM2_member:Not mounted"
+```
+
+## Пример структурированных данных:
+
+```json
+{
+  "name": "sda",
+  "size_gb": 476.94,
+  "type": "disk", 
+  "model": "Samsung SSD 860",
+  "vendor": "Samsung",
+  "rotational": false,
+  "transport": "sata",
+  "serial": "S1234567890",
+  "partitions": [
+    {
+      "name": "sda1",
+      "size_gb": 0.49,
+      "fstype": "ext4",
+      "mountpoint": "/boot"
+    }
+  ]
+}
+```
+
+Этот улучшенный сбор информации о дисках дает полную картину о физической структуре хранилища системы, что особенно полезно для планирования апгрейдов, миграций и оптимизации хранилища.
+
+
+
+
+
+
+
+
+
