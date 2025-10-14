@@ -3762,6 +3762,115 @@ Disk Partitions: "sda1:0.49GB:ext4:/boot; sda2:476.45GB:LVM2_member:Not mounted"
 
 
 
+Проблема в том, что в текущей роли Ansible отсутствует вывод информации об установленном программном обеспечении в итоговый CSV отчет. Нужно добавить колонку для отображения отфильтрованного ПО.
+
+Вот исправления, которые нужно внести в файл `main.yml`:
+
+## 1. Добавьте колонку для ПО в заголовок CSV
+
+Замените задачу `Add CSV header`:
+
+```yaml
+- name: Add CSV header (only once)
+  lineinfile:
+    path: "{{ report_path }}/{{ output_filename }}.csv"
+    line: "Hostname,Primary IP,All IPs,Distribution,Version,Architecture,CPU Model,CPU Frequency (MHz),CPU Cores,CPU Sockets,CPU Threads,CPU Cache,CPU Topology,CPU Architecture,Current Memory (GB),Max Physical Memory,Memory Details,Swap (GB),Virtualization,Disks,Running Services,Service Details,Installed Software"
+    create: yes
+    insertbefore: BOF
+  delegate_to: localhost
+  run_once: true
+  when: inventory_hostname == play_hosts[0]
+```
+
+## 2. Добавьте данные об установленном ПО в строку отчета
+
+Замените задачу `Add host data to consolidated report`:
+
+```yaml
+- name: Add host data to consolidated report
+  lineinfile:
+    path: "{{ report_path }}/{{ output_filename }}.csv"
+    line: |
+      "{{ safe_hostname }}","{{ primary_ip }}","{{ ip_addresses | join('; ') }}","{{ safe_distribution }}","{{ safe_distribution_version }}","{{ safe_architecture }}","{{ safe_cpu_model }}","{{ safe_cpu_frequency_mhz }}","{{ safe_processor_cores }}","{{ safe_processor_count }}","{{ safe_processor_vcpus }}","{{ safe_cpu_cache }}","{{ safe_cpu_topology }}","{{ safe_cpu_arch_details }}","{{ safe_memory }}","{{ safe_max_physical_memory }}","{{ safe_memory_slots_details }}","{{ safe_swap }}","{{ safe_virtualization_type }}/{{ safe_virtualization_role }}","{% for disk in disk_info %}{{ disk.mount }}:{{ disk.size_gb }}GB{% if not loop.last %}; {% endif %}{% endfor %}","{% for service in services_with_details %}{{ service.name }}{% if not loop.last %}; {% endif %}{% endfor %}","{% for service in services_with_details %}{% if service.description is defined %}Name: {{ service.name }}; Description: {{ service.description }}; Status: {{ service.active_state }}; PID: {{ service.main_pid }}; Memory: {{ service.memory_usage }}; Config: {{ service.config_path }}{% else %}{{ service.name }}{% endif %}{% if not loop.last %}| {% endif %}{% endfor %}","{% for software in filtered_software %}{{ software.name }} ({{ software.version }}){% if not loop.last %}; {% endif %}{% endfor %}"
+    create: yes
+  delegate_to: localhost
+  run_once: false
+```
+
+## 3. Улучшите фильтрацию ПО (опционально)
+
+Если хотите улучшить фильтрацию, можно модифицировать задачу `Filter software based on patterns`:
+
+```yaml
+- name: Filter software based on patterns
+  set_fact:
+    filtered_software: |
+      {%- set software_list = [] -%}
+      {%- if ansible_facts.packages is defined -%}
+        {%- for pattern in software_filter -%}
+          {%- for pkg_name, pkg_info in ansible_facts.packages.items() -%}
+            {%- set pkg_lower = pkg_name | lower -%}
+            {%- set pattern_lower = pattern | lower -%}
+            {%- if pattern_lower in pkg_lower or pkg_lower in pattern_lower -%}
+              {%- set software_item = {"name": pkg_name, "version": pkg_info[0].version} -%}
+              {%- if software_item not in software_list -%}
+                {%- if software_list.append(software_item) -%}{%- endif -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+        {%- endfor -%}
+      {%- endif -%}
+      {{ software_list | unique | sort(attribute='name') }}
+```
+
+## 4. Убедитесь, что переменные определены
+
+Добавьте в файл `defaults/main.yml` или в переменные плейбука:
+
+```yaml
+# Фильтры для сбора информации
+software_filter: []
+service_filter: []
+exclude_mount_types: []
+exclude_mount_points: []
+
+# Настройки отчета
+report_path: "/tmp/ansible_reports"
+output_filename: "system_inventory"
+include_all_ips: false
+collect_detailed_service_info: false
+collect_service_descriptions: false
+encrypt_report: false
+remove_unencrypted: false
+vault_password_file: ""
+```
+
+## 5. Пример использования
+
+При запуске роли укажите фильтры для ПО:
+
+```yaml
+- hosts: all
+  vars:
+    software_filter:
+      - "python"
+      - "nginx"
+      - "mysql"
+      - "postgresql"
+      - "docker"
+    service_filter:
+      - "nginx"
+      - "mysql"
+      - "docker"
+  roles:
+    - your-role-name
+```
+
+После этих изменений в CSV отчете появится новая колонка "Installed Software", в которой будет перечислено все найденное программное обеспечение, соответствующее указанным фильтрам, в формате: `package_name (version); package_name2 (version2)`
+
+
+
+
 
 
 
