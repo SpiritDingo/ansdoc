@@ -253,3 +253,209 @@ ansible-playbook -i inventory install_nexus_repo.yml --ask-vault-pass
 · Безопасное хранение секретов через ansible-vault
 
 Роль готова к использованию и может быть легко адаптирована под ваши конкретные требования к репозиторию Nexus.
+
+
+
+Ошибка указывает на проблему с синтаксисом YAML в файле main.yml. Вот исправленная версия:
+
+roles/nexus_repo/tasks/main.yml
+
+```yaml
+---
+- name: Check if running on supported OS
+  fail:
+    msg: "Unsupported OS {{ ansible_distribution }} version {{ ansible_distribution_major_version }}. Only Oracle Linux 8, 9 and Red Hat 8, 9 are supported."
+  when: >
+    (ansible_distribution not in ["OracleLinux", "RedHat"]) or
+    (ansible_distribution_major_version not in ["8", "9"])
+
+- name: Include OS-specific variables
+  include_vars: "{{ ansible_distribution }}_{{ ansible_distribution_major_version }}.yml"
+  ignore_errors: yes
+  register: os_vars_result
+
+- name: Debug message if OS-specific variables not found
+  debug:
+    msg: "No OS-specific variables found for {{ ansible_distribution }}_{{ ansible_distribution_major_version }}, using defaults"
+  when: os_vars_result is failed
+
+- name: Create YUM repository directory
+  become: yes
+  file:
+    path: /etc/yum.repos.d
+    state: directory
+    mode: '0755'
+
+- name: Create repository configuration file
+  become: yes
+  template:
+    src: "nexus.repo.j2"
+    dest: "/etc/yum.repos.d/{{ repo_filename | default('nexus.repo') }}"
+    mode: '0644'
+
+- name: Download and install GPG key with authentication
+  become: yes
+  get_url:
+    url: "{{ gpg_key_url }}"
+    dest: "/etc/pki/rpm-gpg/{{ gpg_key_file }}"
+    mode: '0644'
+    url_username: "{{ nexus_username }}"
+    url_password: "{{ nexus_password }}"
+    force_basic_auth: yes
+    validate_certs: "{{ validate_certs | default(no) }}"
+  when: >
+    nexus_username is defined and
+    nexus_password is defined and
+    nexus_username | length > 0 and
+    nexus_password | length > 0
+
+- name: Download and install GPG key without authentication
+  become: yes
+  get_url:
+    url: "{{ gpg_key_url }}"
+    dest: "/etc/pki/rpm-gpg/{{ gpg_key_file }}"
+    mode: '0644'
+    validate_certs: "{{ validate_certs | default(no) }}"
+  when: >
+    nexus_username is not defined or
+    nexus_username | default('') | length == 0 or
+    nexus_password is not defined or
+    nexus_password | default('') | length == 0
+
+- name: Import RPM GPG key
+  become: yes
+  rpm_key:
+    state: present
+    key: "/etc/pki/rpm-gpg/{{ gpg_key_file }}"
+
+- name: Clean YUM/DNF cache
+  become: yes
+  command:
+    cmd: "{{ 'dnf' if ansible_distribution_major_version == '9' else 'yum' }} clean all"
+  args:
+    warn: false
+
+- name: Validate repository access
+  become: yes
+  command:
+    cmd: "{{ 'dnf' if ansible_distribution_major_version == '9' else 'yum' }} repolist enabled"
+  register: repo_validation_result
+  ignore_errors: yes
+  changed_when: false
+  when: validate_repo | default(true) | bool
+
+- name: Fail if repository validation failed
+  fail:
+    msg: "Nexus repository validation failed. Please check credentials, network connectivity and repository configuration."
+  when: >
+    repo_validation_result is failed and
+    (validate_repo | default(true) | bool)
+
+- name: Install mdatp package
+  become: yes
+  yum:
+    name: "{{ package_name | default('mdatp') }}"
+    state: "{{ package_state | default('latest') }}"
+  when: install_package | default(true) | bool
+  notify: refresh package cache
+```
+
+Основные исправления:
+
+1. Упрощены сложные условия when - использован многострочный формат с >
+2. Убраны вложенные списки в условиях - теперь используется простое логическое выражение
+3. Упрощен блок включения переменных - убран loop и rescue, используется ignore_errors с регистрацией
+4. Добавлены значения по умолчанию везде, где возможны неопределенные переменные
+5. Убраны сложные вложенные конструкции, которые могли вызвать проблемы с парсингом YAML
+
+Альтернативная упрощенная версия (если вышеуказанная не работает):
+
+```yaml
+---
+- name: Check OS support
+  fail:
+    msg: "Unsupported OS. Only Oracle Linux/Red Hat 8/9 supported."
+  when: ansible_distribution not in ["OracleLinux", "RedHat"]
+
+- name: Check OS version support
+  fail:
+    msg: "Unsupported OS version. Only versions 8 and 9 supported."
+  when: ansible_distribution_major_version not in ["8", "9"]
+
+- name: Include variables for Oracle Linux 8
+  include_vars: OracleLinux_8.yml
+  when: ansible_distribution == "OracleLinux" and ansible_distribution_major_version == "8"
+
+- name: Include variables for Oracle Linux 9
+  include_vars: OracleLinux_9.yml
+  when: ansible_distribution == "OracleLinux" and ansible_distribution_major_version == "9"
+
+- name: Include variables for Red Hat 8
+  include_vars: OracleLinux_8.yml
+  when: ansible_distribution == "RedHat" and ansible_distribution_major_version == "8"
+
+- name: Include variables for Red Hat 9
+  include_vars: OracleLinux_9.yml
+  when: ansible_distribution == "RedHat" and ansible_distribution_major_version == "9"
+
+- name: Create YUM repository directory
+  become: yes
+  file:
+    path: /etc/yum.repos.d
+    state: directory
+    mode: '0755'
+
+- name: Create repository configuration file
+  become: yes
+  template:
+    src: "nexus.repo.j2"
+    dest: "/etc/yum.repos.d/{{ repo_filename | default('nexus.repo') }}"
+    mode: '0644'
+
+- name: Download and install GPG key
+  become: yes
+  get_url:
+    url: "{{ gpg_key_url }}"
+    dest: "/etc/pki/rpm-gpg/{{ gpg_key_file }}"
+    mode: '0644'
+    url_username: "{{ nexus_username | default(omit) }}"
+    url_password: "{{ nexus_password | default(omit) }}"
+    force_basic_auth: yes
+    validate_certs: "{{ validate_certs | default(no) }}"
+
+- name: Import RPM GPG key
+  become: yes
+  rpm_key:
+    state: present
+    key: "/etc/pki/rpm-gpg/{{ gpg_key_file }}"
+
+- name: Clean package cache
+  become: yes
+  command:
+    cmd: "{{ 'dnf' if ansible_distribution_major_version == '9' else 'yum' }} clean all"
+  args:
+    warn: false
+
+- name: Validate repository
+  become: yes
+  command:
+    cmd: "{{ 'dnf' if ansible_distribution_major_version == '9' else 'yum' }} repolist enabled"
+  register: repo_validation_result
+  ignore_errors: yes
+  changed_when: false
+  when: validate_repo | default(true) | bool
+
+- name: Fail if validation failed
+  fail:
+    msg: "Repository validation failed."
+  when: repo_validation_result is failed and validate_repo | default(true) | bool
+
+- name: Install package
+  become: yes
+  yum:
+    name: "{{ package_name | default('mdatp') }}"
+    state: "{{ package_state | default('latest') }}"
+  notify: refresh package cache
+```
+
+Попробуйте первую версию, и если будут проблемы - используйте вторую, более простую версию.
