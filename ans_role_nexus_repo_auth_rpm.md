@@ -459,3 +459,165 @@ roles/nexus_repo/tasks/main.yml
 ```
 
 Попробуйте первую версию, и если будут проблемы - используйте вторую, более простую версию.
+
+
+Ошибка возникает из-за использования параметра warn в модуле command, который не поддерживается в вашей версии Ansible. Вот исправленная версия роли:
+
+roles/nexus_repo/tasks/main.yml
+
+```yaml
+---
+- name: Check if running on supported OS
+  fail:
+    msg: "Unsupported OS {{ ansible_distribution }} version {{ ansible_distribution_major_version }}. Only Oracle Linux 8, 9 and Red Hat 8, 9 are supported."
+  when: >
+    (ansible_distribution not in ["OracleLinux", "RedHat"]) or
+    (ansible_distribution_major_version not in ["8", "9"])
+
+- name: Include OS-specific variables
+  include_vars: "{{ ansible_distribution }}_{{ ansible_distribution_major_version }}.yml"
+  ignore_errors: yes
+  register: os_vars_result
+
+- name: Debug message if OS-specific variables not found
+  debug:
+    msg: "No OS-specific variables found for {{ ansible_distribution }}_{{ ansible_distribution_major_version }}, using defaults"
+  when: os_vars_result is failed
+
+- name: Create YUM repository directory
+  become: yes
+  file:
+    path: /etc/yum.repos.d
+    state: directory
+    mode: '0755'
+
+- name: Create repository configuration file
+  become: yes
+  template:
+    src: "nexus.repo.j2"
+    dest: "/etc/yum.repos.d/{{ repo_filename | default('nexus.repo') }}"
+    mode: '0644'
+
+- name: Download and install GPG key with authentication
+  become: yes
+  get_url:
+    url: "{{ gpg_key_url }}"
+    dest: "/etc/pki/rpm-gpg/{{ gpg_key_file }}"
+    mode: '0644'
+    url_username: "{{ nexus_username }}"
+    url_password: "{{ nexus_password }}"
+    force_basic_auth: yes
+    validate_certs: "{{ validate_certs | default(no) }}"
+  when: >
+    nexus_username is defined and
+    nexus_password is defined and
+    nexus_username | length > 0 and
+    nexus_password | length > 0
+
+- name: Download and install GPG key without authentication
+  become: yes
+  get_url:
+    url: "{{ gpg_key_url }}"
+    dest: "/etc/pki/rpm-gpg/{{ gpg_key_file }}"
+    mode: '0644'
+    validate_certs: "{{ validate_certs | default(no) }}"
+  when: >
+    nexus_username is not defined or
+    nexus_username | default('') | length == 0 or
+    nexus_password is not defined or
+    nexus_password | default('') | length == 0
+
+- name: Import RPM GPG key
+  become: yes
+  rpm_key:
+    state: present
+    key: "/etc/pki/rpm-gpg/{{ gpg_key_file }}"
+
+- name: Clean YUM/DNF cache
+  become: yes
+  shell: "{{ 'dnf' if ansible_distribution_major_version == '9' else 'yum' }} clean all"
+  args:
+    executable: /bin/bash
+
+- name: Validate repository access
+  become: yes
+  shell: "{{ 'dnf' if ansible_distribution_major_version == '9' else 'yum' }} repolist enabled"
+  register: repo_validation_result
+  ignore_errors: yes
+  changed_when: false
+  when: validate_repo | default(true) | bool
+
+- name: Fail if repository validation failed
+  fail:
+    msg: "Nexus repository validation failed. Please check credentials, network connectivity and repository configuration."
+  when: >
+    repo_validation_result is failed and
+    (validate_repo | default(true) | bool)
+
+- name: Install mdatp package
+  become: yes
+  package:
+    name: "{{ package_name | default('mdatp') }}"
+    state: "{{ package_state | default('latest') }}"
+  when: install_package | default(true) | bool
+  notify: refresh package cache
+```
+
+roles/nexus_repo/handlers/main.yml
+
+```yaml
+---
+- name: refresh package cache
+  become: yes
+  shell: "{{ 'dnf' if ansible_distribution_major_version == '9' else 'yum' }} clean all"
+  args:
+    executable: /bin/bash
+```
+
+Основные исправления:
+
+1. Заменил command на shell для выполнения команд yum/dnf
+2. Добавил executable: /bin/bash для явного указания интерпретатора
+3. Заменил yum модуль на package - более универсальный модуль для управления пакетами
+4. Убрал параметр warn который вызывал ошибку
+
+Альтернативный вариант с использованием модулей yum/dnf:
+
+Если вы предпочитаете использовать специфичные модули, вот альтернативная версия:
+
+```yaml
+---
+- name: Clean YUM cache for OL8/RHEL8
+  become: yes
+  yum:
+    clean: all
+  when: ansible_distribution_major_version == "8"
+
+- name: Clean DNF cache for OL9/RHEL9
+  become: yes
+  dnf:
+    clean: all
+  when: ansible_distribution_major_version == "9"
+
+- name: Validate repository access for OL8/RHEL8
+  become: yes
+  command: yum repolist enabled
+  register: repo_validation_result
+  ignore_errors: yes
+  changed_when: false
+  when: 
+    - validate_repo | default(true) | bool
+    - ansible_distribution_major_version == "8"
+
+- name: Validate repository access for OL9/RHEL9
+  become: yes
+  command: dnf repolist enabled
+  register: repo_validation_result
+  ignore_errors: yes
+  changed_when: false
+  when: 
+    - validate_repo | default(true) | bool
+    - ansible_distribution_major_version == "9"
+```
+
+Первый вариант с shell более универсален и должен работать надежно. Выберите тот, который лучше подходит для вашей среды.
