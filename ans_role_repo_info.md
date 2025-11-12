@@ -381,3 +381,253 @@ tasks/main.yml (минимальная версия):
 ```
 
 Это должно решить проблему с неопределенными переменными в hostvars.
+
+
+
+
+Проблема в сериализации данных в set_fact. Вот исправленная версия:
+
+Исправленная структура роли
+
+```
+repo_info/
+├── tasks
+│   └── main.yml
+└── templates
+    └── repo_report.csv.j2
+```
+
+Содержание файлов
+
+1. tasks/main.yml:
+
+```yaml
+---
+- name: "Collect repository files information"
+  block:
+    - name: "Find APT repository files (Ubuntu)"
+      ansible.builtin.find:
+        paths:
+          - /etc/apt/sources.list
+          - /etc/apt/sources.list.d
+        patterns: "*.list"
+        file_type: file
+      register: apt_repo_files
+      when: ansible_distribution == 'Ubuntu'
+
+    - name: "Read APT repository files content (Ubuntu)"
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      loop: "{{ apt_repo_files.files | default([]) }}"
+      register: apt_repo_contents
+      when: ansible_distribution == 'Ubuntu'
+
+    - name: "Find YUM/DNF repository files (Oracle Linux 9)"
+      ansible.builtin.find:
+        paths: /etc/yum.repos.d
+        patterns: "*.repo"
+        file_type: file
+      register: yum_repo_files
+      when: ansible_distribution == 'OracleLinux' and ansible_distribution_major_version == '9'
+
+    - name: "Read YUM/DNF repository files content (Oracle Linux 9)"
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      loop: "{{ yum_repo_files.files | default([]) }}"
+      register: yum_repo_contents
+      when: ansible_distribution == 'OracleLinux' and ansible_distribution_major_version == '9'
+
+  rescue:
+    - name: "Handle errors during collection"
+      ansible.builtin.debug:
+        msg: "Error collecting repo info for {{ ansible_distribution }}"
+
+- name: "Create repo data structure without serialization"
+  ansible.builtin.set_fact:
+    host_repo_data:
+      hostname: "{{ ansible_hostname }}"
+      distribution: "{{ ansible_distribution }}"
+      os_family: "{{ ansible_os_family }}"
+      version: "{{ ansible_distribution_version }}"
+      architecture: "{{ ansible_architecture }}"
+      apt_files: "{{ apt_repo_files.files | default([]) }}"
+      yum_files: "{{ yum_repo_files.files | default([]) }}"
+
+- name: "Create local reports directory"
+  ansible.builtin.file:
+    path: "{{ playbook_dir }}/reports"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  run_once: true
+
+- name: "Generate CSV report"
+  ansible.builtin.template:
+    src: repo_report.csv.j2
+    dest: "{{ playbook_dir }}/reports/repos_report.csv"
+  delegate_to: localhost
+  run_once: true
+```
+
+1. templates/repo_report.csv.j2:
+
+```jinja2
+Hostname,OS,OS Family,Version,Architecture,Repo File Path,Repo File Name
+{% for host in groups['all'] %}
+{% if hostvars[host].host_repo_data is defined %}
+{% set host_data = hostvars[host].host_repo_data %}
+{% if host_data.distribution == 'Ubuntu' and host_data.apt_files %}
+  {% for file in host_data.apt_files %}
+"{{ host_data.hostname }}","{{ host_data.distribution }}","{{ host_data.os_family }}","{{ host_data.version }}","{{ host_data.architecture }}","{{ file.path }}","{{ file.path | basename }}"
+  {% endfor %}
+{% elif host_data.distribution == 'OracleLinux' and host_data.yum_files %}
+  {% for file in host_data.yum_files %}
+"{{ host_data.hostname }}","{{ host_data.distribution }}","{{ host_data.os_family }}","{{ host_data.version }}","{{ host_data.architecture }}","{{ file.path }}","{{ file.path | basename }}"
+  {% endfor %}
+{% else %}
+"{{ host_data.hostname }}","{{ host_data.distribution }}","{{ host_data.os_family }}","{{ host_data.version }}","{{ host_data.architecture }}","No repo files found",""
+{% endif %}
+{% endif %}
+{% endfor %}
+```
+
+Альтернативная версия с содержимым файлов (если нужен контент)
+
+Если нужно содержимое файлов, вот отдельная задача для сбора данных:
+
+tasks/main.yml (версия с контентом):
+
+```yaml
+---
+- name: "Collect repository files information"
+  block:
+    - name: "Find APT repository files (Ubuntu)"
+      ansible.builtin.find:
+        paths:
+          - /etc/apt/sources.list
+          - /etc/apt/sources.list.d
+        patterns: "*.list"
+        file_type: file
+      register: apt_repo_files
+      when: ansible_distribution == 'Ubuntu'
+
+    - name: "Get APT repo file contents (Ubuntu)"
+      ansible.builtin.shell:
+        cmd: |
+          cat "{{ item.path }}" | sed 's/"/""/g' | tr '\n' ';'
+      register: apt_file_contents
+      loop: "{{ apt_repo_files.files | default([]) }}"
+      when: ansible_distribution == 'Ubuntu'
+
+    - name: "Find YUM/DNF repository files (Oracle Linux 9)"
+      ansible.builtin.find:
+        paths: /etc/yum.repos.d
+        patterns: "*.repo"
+        file_type: file
+      register: yum_repo_files
+      when: ansible_distribution == 'OracleLinux' and ansible_distribution_major_version == '9'
+
+    - name: "Get YUM repo file contents (Oracle Linux 9)"
+      ansible.builtin.shell:
+        cmd: |
+          cat "{{ item.path }}" | sed 's/"/""/g' | tr '\n' ';'
+      register: yum_file_contents
+      loop: "{{ yum_repo_files.files | default([]) }}"
+      when: ansible_distribution == 'OracleLinux' and ansible_distribution_major_version == '9'
+
+  rescue:
+    - name: "Handle errors during collection"
+      ansible.builtin.debug:
+        msg: "Error collecting repo info for {{ ansible_distribution }}"
+
+- name: "Create repo data with file contents"
+  ansible.builtin.set_fact:
+    host_repo_data:
+      hostname: "{{ ansible_hostname }}"
+      distribution: "{{ ansible_distribution }}"
+      os_family: "{{ ansible_os_family }}"
+      version: "{{ ansible_distribution_version }}"
+      architecture: "{{ ansible_architecture }}"
+      apt_files: "{{ apt_repo_files.files | default([]) }}"
+      apt_contents: "{{ apt_file_contents.results | default([]) }}"
+      yum_files: "{{ yum_repo_files.files | default([]) }}"
+      yum_contents: "{{ yum_file_contents.results | default([]) }}"
+
+- name: "Create local reports directory"
+  ansible.builtin.file:
+    path: "{{ playbook_dir }}/reports"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  run_once: true
+
+- name: "Generate CSV report with contents"
+  ansible.builtin.template:
+    src: repo_report_with_content.csv.j2
+    dest: "{{ playbook_dir }}/reports/repos_report.csv"
+  delegate_to: localhost
+  run_once: true
+```
+
+templates/repo_report_with_content.csv.j2:
+
+```jinja2
+Hostname,OS,OS Family,Version,Architecture,Repo File Path,Repo File Name,Repo File Content
+{% for host in groups['all'] %}
+{% if hostvars[host].host_repo_data is defined %}
+{% set host_data = hostvars[host].host_repo_data %}
+{% if host_data.distribution == 'Ubuntu' and host_data.apt_files %}
+  {% for file in host_data.apt_files %}
+    {% set file_content = '' %}
+    {% for content_result in host_data.apt_contents %}
+      {% if content_result.item.path == file.path %}
+        {% set file_content = content_result.stdout %}
+      {% endif %}
+    {% endfor %}
+"{{ host_data.hostname }}","{{ host_data.distribution }}","{{ host_data.os_family }}","{{ host_data.version }}","{{ host_data.architecture }}","{{ file.path }}","{{ file.path | basename }}","{{ file_content }}"
+  {% endfor %}
+{% elif host_data.distribution == 'OracleLinux' and host_data.yum_files %}
+  {% for file in host_data.yum_files %}
+    {% set file_content = '' %}
+    {% for content_result in host_data.yum_contents %}
+      {% if content_result.item.path == file.path %}
+        {% set file_content = content_result.stdout %}
+      {% endif %}
+    {% endfor %}
+"{{ host_data.hostname }}","{{ host_data.distribution }}","{{ host_data.os_family }}","{{ host_data.version }}","{{ host_data.architecture }}","{{ file.path }}","{{ file.path | basename }}","{{ file_content }}"
+  {% endfor %}
+{% else %}
+"{{ host_data.hostname }}","{{ host_data.distribution }}","{{ host_data.os_family }}","{{ host_data.version }}","{{ host_data.architecture }}","No repo files found","",""
+{% endif %}
+{% endif %}
+{% endfor %}
+```
+
+Playbook
+
+site.yml:
+
+```yaml
+---
+- name: "Collect repository information from all hosts"
+  hosts: all
+  gather_facts: true
+  roles:
+    - repo_info
+```
+
+Запуск
+
+```bash
+ansible-playbook -i inventory.ini site.yml
+```
+
+Ключевые исправления:
+
+1. Убрана сериализация в set_fact
+2. Упрощена структура данных - без вложенных объектов
+3. Использование shell для контента - вместо slurp
+4. Проверки на существование всех переменных
+5. Экранирование кавычек для CSV
+
+Начните с простой версии (без контента файлов), а потом переходите к версии с содержимым, если это необходимо.
