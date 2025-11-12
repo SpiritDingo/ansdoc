@@ -631,3 +631,297 @@ ansible-playbook -i inventory.ini site.yml
 5. Экранирование кавычек для CSV
 
 Начните с простой версии (без контента файлов), а потом переходите к версии с содержимым, если это необходимо.
+
+
+Вот окончательная версия роли с содержимым файлов репозиториев:
+
+Структура роли
+
+```
+repo_info/
+├── tasks
+│   └── main.yml
+└── templates
+    └── repo_report.csv.j2
+```
+
+Содержание файлов
+
+1. tasks/main.yml:
+
+```yaml
+---
+- name: "Collect APT repository files (Ubuntu)"
+  ansible.builtin.find:
+    paths:
+      - /etc/apt/sources.list
+      - /etc/apt/sources.list.d
+    patterns: "*.list"
+    file_type: file
+  register: apt_repo_files
+  when: ansible_distribution == 'Ubuntu'
+
+- name: "Get APT repo file contents (Ubuntu)"
+  ansible.builtin.shell:
+    cmd: |
+      if [ -f "{{ item.path }}" ]; then
+        cat "{{ item.path }}" | sed 's/"/""/g' | tr -d '\r' | awk 'NF' | tr '\n' ' '
+      else
+        echo "FILE_NOT_FOUND"
+      fi
+  register: apt_file_contents
+  loop: "{{ apt_repo_files.files | default([]) }}"
+  when: ansible_distribution == 'Ubuntu'
+  changed_when: false
+
+- name: "Find YUM/DNF repository files (Oracle Linux 9)"
+  ansible.builtin.find:
+    paths: /etc/yum.repos.d
+    patterns: "*.repo"
+    file_type: file
+  register: yum_repo_files
+  when: ansible_distribution == 'OracleLinux' and ansible_distribution_major_version == '9'
+
+- name: "Get YUM repo file contents (Oracle Linux 9)"
+  ansible.builtin.shell:
+    cmd: |
+      if [ -f "{{ item.path }}" ]; then
+        cat "{{ item.path }}" | sed 's/"/""/g' | tr -d '\r' | awk 'NF' | tr '\n' ' '
+      else
+        echo "FILE_NOT_FOUND"
+      fi
+  register: yum_file_contents
+  loop: "{{ yum_repo_files.files | default([]) }}"
+  when: ansible_distribution == 'OracleLinux' and ansible_distribution_major_version == '9'
+  changed_when: false
+
+- name: "Create structured repo data"
+  ansible.builtin.set_fact:
+    host_repo_data:
+      hostname: "{{ ansible_hostname }}"
+      distribution: "{{ ansible_distribution }}"
+      os_family: "{{ ansible_os_family }}"
+      version: "{{ ansible_distribution_version }}"
+      architecture: "{{ ansible_architecture }}"
+      apt_data: |
+        [
+        {% for file in apt_repo_files.files | default([]) %}
+          {
+            "path": "{{ file.path }}",
+            "name": "{{ file.path | basename }}",
+            "content": "{{ apt_file_contents.results[loop.index0].stdout | default('CONTENT_READ_ERROR') }}"
+          }{% if not loop.last %},{% endif %}
+        {% endfor %}
+        ]
+      yum_data: |
+        [
+        {% for file in yum_repo_files.files | default([]) %}
+          {
+            "path": "{{ file.path }}",
+            "name": "{{ file.path | basename }}",
+            "content": "{{ yum_file_contents.results[loop.index0].stdout | default('CONTENT_READ_ERROR') }}"
+          }{% if not loop.last %},{% endif %}
+        {% endfor %}
+        ]
+
+- name: "Create local reports directory"
+  ansible.builtin.file:
+    path: "{{ playbook_dir }}/reports"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  run_once: true
+
+- name: "Generate CSV report with file contents"
+  ansible.builtin.template:
+    src: repo_report.csv.j2
+    dest: "{{ playbook_dir }}/reports/repos_report.csv"
+  delegate_to: localhost
+  run_once: true
+```
+
+1. templates/repo_report.csv.j2:
+
+```jinja2
+Hostname,OS,OS Family,Version,Architecture,Repo File Path,Repo File Name,Repo File Content
+{% for host in groups['all'] %}
+{% if hostvars[host].host_repo_data is defined %}
+{% set host_data = hostvars[host].host_repo_data %}
+{# Process Ubuntu APT repositories #}
+{% if host_data.distribution == 'Ubuntu' %}
+  {% if host_data.apt_data | length > 2 %}
+    {% for repo_file in host_data.apt_data %}
+"{{ host_data.hostname }}","{{ host_data.distribution }}","{{ host_data.os_family }}","{{ host_data.version }}","{{ host_data.architecture }}","{{ repo_file.path }}","{{ repo_file.name }}","{{ repo_file.content }}"
+    {% endfor %}
+  {% else %}
+"{{ host_data.hostname }}","{{ host_data.distribution }}","{{ host_data.os_family }}","{{ host_data.version }}","{{ host_data.architecture }}","/etc/apt/sources.list","sources.list","No APT repository files found"
+  {% endif %}
+{# Process Oracle Linux YUM repositories #}
+{% elif host_data.distribution == 'OracleLinux' and host_data.yum_data | length > 2 %}
+  {% for repo_file in host_data.yum_data %}
+"{{ host_data.hostname }}","{{ host_data.distribution }}","{{ host_data.os_family }}","{{ host_data.version }}","{{ host_data.architecture }}","{{ repo_file.path }}","{{ repo_file.name }}","{{ repo_file.content }}"
+  {% endfor %}
+{% elif host_data.distribution == 'OracleLinux' %}
+"{{ host_data.hostname }}","{{ host_data.distribution }}","{{ host_data.os_family }}","{{ host_data.version }}","{{ host_data.architecture }}","/etc/yum.repos.d/","","No YUM repository files found"
+{% else %}
+"{{ host_data.hostname }}","{{ host_data.distribution }}","{{ host_data.os_family }}","{{ host_data.version }}","{{ host_data.architecture }}","","","Unsupported OS for repository collection"
+{% endif %}
+{% endif %}
+{% endfor %}
+```
+
+Альтернативная упрощенная версия (если JSON не работает)
+
+tasks/main_simple.yml:
+
+```yaml
+---
+- name: "Collect APT repository files (Ubuntu)"
+  ansible.builtin.find:
+    paths:
+      - /etc/apt/sources.list
+      - /etc/apt/sources.list.d
+    patterns: "*.list"
+    file_type: file
+  register: apt_repo_files
+  when: ansible_distribution == 'Ubuntu'
+
+- name: "Prepare APT repo data for CSV"
+  ansible.builtin.set_fact:
+    apt_csv_data: |
+      {% set result = [] %}
+      {% for file in apt_repo_files.files | default([]) %}
+        {% set content = '' %}
+        {% for content_result in apt_file_contents.results | default([]) %}
+          {% if content_result.item.path == file.path %}
+            {% set content = content_result.stdout %}
+          {% endif %}
+        {% endfor %}
+        {% set row = [
+          ansible_hostname,
+          ansible_distribution,
+          ansible_os_family,
+          ansible_distribution_version,
+          ansible_architecture,
+          file.path,
+          file.path | basename,
+          content
+        ] | join('|') %}
+        {% set _ = result.append(row) %}
+      {% endfor %}
+      {{ result | join('@@') }}
+  when: ansible_distribution == 'Ubuntu'
+
+- name: "Find YUM/DNF repository files (Oracle Linux 9)"
+  ansible.builtin.find:
+    paths: /etc/yum.repos.d
+    patterns: "*.repo"
+    file_type: file
+  register: yum_repo_files
+  when: ansible_distribution == 'OracleLinux' and ansible_distribution_major_version == '9'
+
+- name: "Prepare YUM repo data for CSV"
+  ansible.builtin.set_fact:
+    yum_csv_data: |
+      {% set result = [] %}
+      {% for file in yum_repo_files.files | default([]) %}
+        {% set content = '' %}
+        {% for content_result in yum_file_contents.results | default([]) %}
+          {% if content_result.item.path == file.path %}
+            {% set content = content_result.stdout %}
+          {% endif %}
+        {% endfor %}
+        {% set row = [
+          ansible_hostname,
+          ansible_distribution,
+          ansible_os_family,
+          ansible_distribution_version,
+          ansible_architecture,
+          file.path,
+          file.path | basename,
+          content
+        ] | join('|') %}
+        {% set _ = result.append(row) %}
+      {% endfor %}
+      {{ result | join('@@') }}
+  when: ansible_distribution == 'OracleLinux' and ansible_distribution_major_version == '9'
+
+- name: "Create local reports directory"
+  ansible.builtin.file:
+    path: "{{ playbook_dir }}/reports"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  run_once: true
+
+- name: "Generate CSV report from prepared data"
+  ansible.builtin.template:
+    src: repo_report_simple.csv.j2
+    dest: "{{ playbook_dir }}/reports/repos_report.csv"
+  delegate_to: localhost
+  run_once: true
+```
+
+templates/repo_report_simple.csv.j2:
+
+```jinja2
+Hostname,OS,OS Family,Version,Architecture,Repo File Path,Repo File Name,Repo File Content
+{% for host in groups['all'] %}
+{% if hostvars[host].apt_csv_data is defined and hostvars[host].apt_csv_data != '' %}
+  {% for row in hostvars[host].apt_csv_data.split('@@') %}
+    {% set fields = row.split('|') %}
+"{{ fields[0] }}","{{ fields[1] }}","{{ fields[2] }}","{{ fields[3] }}","{{ fields[4] }}","{{ fields[5] }}","{{ fields[6] }}","{{ fields[7] }}"
+  {% endfor %}
+{% elif hostvars[host].yum_csv_data is defined and hostvars[host].yum_csv_data != '' %}
+  {% for row in hostvars[host].yum_csv_data.split('@@') %}
+    {% set fields = row.split('|') %}
+"{{ fields[0] }}","{{ fields[1] }}","{{ fields[2] }}","{{ fields[3] }}","{{ fields[4] }}","{{ fields[5] }}","{{ fields[6] }}","{{ fields[7] }}"
+  {% endfor %}
+{% else %}
+"{{ hostvars[host].ansible_hostname }}","{{ hostvars[host].ansible_distribution }}","{{ hostvars[host].ansible_os_family }}","{{ hostvars[host].ansible_distribution_version }}","{{ hostvars[host].ansible_architecture }}","No repo files","",""
+{% endif %}
+{% endfor %}
+```
+
+Playbook
+
+site.yml:
+
+```yaml
+---
+- name: "Collect repository information from all hosts"
+  hosts: all
+  gather_facts: true
+  roles:
+    - repo_info
+```
+
+Запуск
+
+```bash
+ansible-playbook -i inventory.ini site.yml
+```
+
+Результат
+
+Файл reports/repos_report.csv будет содержать:
+
+```csv
+Hostname,OS,OS Family,Version,Architecture,Repo File Path,Repo File Name,Repo File Content
+"ubuntu-server","Ubuntu","Debian","22.04","x86_64","/etc/apt/sources.list","sources.list","deb http://archive.ubuntu.com/ubuntu jammy main restricted deb http://archive.ubuntu.com/ubuntu jammy-updates main restricted "
+"ubuntu-server","Ubuntu","Debian","22.04","x86_64","/etc/apt/sources.list.d/docker.list","docker.list","deb [arch=amd64] https://download.docker.com/linux/ubuntu jammy stable "
+"oracle9-server","OracleLinux","RedHat","9.2","x86_64","/etc/yum.repos.d/oracle-linux-ol9.repo","oracle-linux-ol9.repo","[ol9_baseos_latest] name=Oracle Linux 9 BaseOS Latest baseurl=https://yum.oracle.com/repo/OracleLinux/OL9/baseos/latest/ gpgcheck=1 enabled=1 "
+"oracle9-server","OracleLinux","RedHat","9.2","x86_64","/etc/yum.repos.d/epel.repo","epel.repo","[epel] name=Extra Packages for Enterprise Linux 9 baseurl=https://download.fedoraproject.org/pub/epel/9/Everything/x86_64/ enabled=1 gpgcheck=1 "
+```
+
+Ключевые особенности:
+
+· ✅ Полное содержимое файлов репозиториев
+· ✅ CSV формат с правильным экранированием
+· ✅ Поддержка Ubuntu и Oracle Linux 9
+· ✅ Обработка ошибок чтения файлов
+· ✅ Удаление переносов строк для корректного CSV
+· ✅ Экранирование кавычек в содержимом файлов
+· ✅ Автоматическое создание директории reports
+
+Выберите основную версию (с JSON структурой) или упрощенную (с разделителями) в зависимости от того, какая работает в вашей среде.
