@@ -1,3 +1,196 @@
+Чтобы создать Ansible роль для настройки Apache и замены SSL-сертификата, следуйте приведенной ниже структуре и инструкциям. Роль установит Apache, настроит виртуальный хост с SSL и обновит сертификаты.
+
+Структура роли:
+
+```bash
+roles/apache_ssl/
+├── tasks
+│   └── main.yml
+├── handlers
+│   └── main.yml
+├── templates
+│   └── apache-ssl.conf.j2
+└── vars
+    └── main.yml
+```
+
+1. Переменные (vars/main.yml)
+
+```yaml
+apache_ssl_packages:
+  - apache2
+  - ssl-cert
+
+apache_ssl_vhost_name: "my-domain"
+apache_ssl_conf_path: "/etc/apache2/sites-available/{{ apache_ssl_vhost_name }}-ssl.conf"
+
+# Пути к новым SSL-сертификатам (должны быть размещены в files/ роли или указаны через переменные)
+ssl_cert_src: "new_cert.crt"
+ssl_key_src: "new_key.key"
+ssl_chain_src: "chain.pem"  # Опционально
+
+apache_ssl_cert_path: "/etc/ssl/certs/{{ ssl_cert_src }}"
+apache_ssl_key_path: "/etc/ssl/private/{{ ssl_key_src }}"
+apache_ssl_chain_path: "/etc/ssl/certs/{{ ssl_chain_src }}"
+
+# Параметры виртуального хоста
+apache_server_name: "example.com"
+apache_document_root: "/var/www/html"
+```
+
+2. Задачи (tasks/main.yml)
+
+```yaml
+---
+- name: "Установка Apache и необходимых пакетов"
+  apt:
+    name: "{{ apache_ssl_packages }}"
+    state: latest
+    update_cache: yes
+  when: ansible_os_family == "Debian"
+
+- name: "Активация модулей Apache"
+  shell: "a2enmod ssl rewrite"
+  notify: restart apache
+
+- name: "Создание директорий для SSL-сертификатов"
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: 0755
+  loop:
+    - "/etc/ssl/certs"
+    - "/etc/ssl/private"
+
+- name: "Копирование нового SSL-сертификата"
+  copy:
+    src: "{{ ssl_cert_src }}"
+    dest: "{{ apache_ssl_cert_path }}"
+    mode: 0644
+    backup: yes
+  notify: restart apache
+
+- name: "Копирование нового приватного ключа"
+  copy:
+    src: "{{ ssl_key_src }}"
+    dest: "{{ apache_ssl_key_path }}"
+    mode: 0600
+    backup: yes
+  notify: restart apache
+
+- name: "Копирование цепочки сертификатов (если есть)"
+  copy:
+    src: "{{ ssl_chain_src }}"
+    dest: "{{ apache_ssl_chain_path }}"
+    mode: 0644
+    backup: yes
+  when: ssl_chain_src is defined
+  notify: restart apache
+
+- name: "Настройка виртуального хоста Apache с SSL"
+  template:
+    src: "apache-ssl.conf.j2"
+    dest: "{{ apache_ssl_conf_path }}"
+    mode: 0644
+  notify: restart apache
+
+- name: "Активация SSL-виртуального хоста"
+  shell: "a2ensite {{ apache_ssl_vhost_name }}-ssl"
+  notify: restart apache
+
+- name: "Проверка конфигурации Apache"
+  shell: "apache2ctl configtest"
+  register: config_test
+  changed_when: false
+  failed_when: "config_test.rc != 0"
+```
+
+3. Обработчики (handlers/main.yml)
+
+```yaml
+---
+- name: restart apache
+  service:
+    name: apache2
+    state: restarted
+    enabled: yes
+```
+
+4. Шаблон виртуального хоста (templates/apache-ssl.conf.j2)
+
+```apache
+<VirtualHost *:443>
+    ServerName {{ apache_server_name }}
+    DocumentRoot {{ apache_document_root }}
+
+    SSLEngine on
+    SSLCertificateFile {{ apache_ssl_cert_path }}
+    SSLCertificateKeyFile {{ apache_ssl_key_path }}
+    {% if ssl_chain_src is defined %}
+    SSLCertificateChainFile {{ apache_ssl_chain_path }}
+    {% endif %}
+
+    # Дополнительные настройки безопасности
+    SSLProtocol All -SSLv3 -TLSv1 -TLSv1.1
+    SSLCipherSuite ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
+    SSLHonorCipherOrder off
+    SSLSessionTickets off
+
+    # Логирование
+    ErrorLog ${APACHE_LOG_DIR}/{{ apache_ssl_vhost_name }}_ssl_error.log
+    CustomLog ${APACHE_LOG_DIR}/{{ apache_ssl_vhost_name }}_ssl_access.log combined
+</VirtualHost>
+
+# Перенаправление HTTP -> HTTPS
+<VirtualHost *:80>
+    ServerName {{ apache_server_name }}
+    Redirect permanent / https://{{ apache_server_name }}/
+</VirtualHost>
+```
+
+Использование роли в плейбуке:
+
+```yaml
+---
+- hosts: web_servers
+  roles:
+    - role: apache_ssl
+      vars:
+        ssl_cert_src: "new_cert.crt"
+        ssl_key_src: "new_key.key"
+        apache_server_name: "example.com"
+```
+
+Примечания:
+
+1. Подготовка сертификатов:
+      Разместите новые файлы сертификатов в директории files/ роли или укажите абсолютные пути в переменных ssl_cert_src, ssl_key_src.
+2. Для CentOS/RHEL:
+      Измените задачи для использования yum и путей конфигурации (например, /etc/httpd/conf.d/).
+3. Безопасность:
+   · Приватный ключ должен храниться в зашифрованном виде (используйте Ansible Vault).
+   · Настройте корректные права доступа к файлам.
+4. Проверка:
+      После выполнения роли проверьте конфигурацию:
+   ```bash
+   openssl s_client -connect example.com:443 -servername example.com
+   ```
+
+Пример использования Ansible Vault для шифрования ключа:
+
+```bash
+ansible-vault encrypt roles/apache_ssl/files/new_key.key
+```
+
+Запуск плейбука с vault:
+
+```bash
+ansible-playbook playbook.yml --ask-vault-pass
+```
+
+
+
+
 Создадим универсальную Ansible роль для настройки Apache и SSL на Ubuntu 22.04, Ubuntu 24.04 и Oracle Linux 9.
 
 Структура роли:
