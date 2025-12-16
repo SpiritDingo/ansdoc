@@ -381,3 +381,240 @@ templates/report_html.j2:
 ```bash
 ansible-playbook -i inventory.ini audit_playbook.yml
 ```
+
+
+Ошибка возникает из-за неправильного обращения к структуре данных в шаблоне. Вот исправленная версия задачи формирования отчета:
+
+Исправленный tasks/main.yml (только часть с формированием отчета):
+
+```yaml
+- name: Формирование финального отчета
+  ansible.builtin.template:
+    src: report_template.j2
+    dest: "{{ report_path }}"
+    mode: '0644'
+  vars:
+    network_info: "{{ network_info_alt if network_info is failed else network_info }}"
+    firewall_info: "{{ nftables_info if iptables_info is failed else iptables_info }}"
+    users_info:
+      passwd: "{{ passwd_info }}"
+      group: "{{ group_info }}"
+    sudo_info:
+      sudoers: "{{ sudoers_info }}"
+      sudoers_d_content: "{{ sudoers_d_content if sudoers_d_content is defined else '' }}"
+      sudoers_d_files: "{{ sudoers_d_files.files if sudoers_d_files is defined and sudoers_d_files.files is defined else [] }}"
+    sssd_info: "{{ sssd_info }}"
+    nsswitch_info: "{{ nsswitch_info }}"
+    postgres_info:
+      pg_hba_results: "{{ pg_hba_content.results if pg_hba_content is defined and pg_hba_content.results is defined else [] }}"
+      postgresql_conf_results: "{{ postgresql_conf_content.results if postgresql_conf_content is defined and postgresql_conf_content.results is defined else [] }}"
+    services_info: "{{ services_info }}"
+```
+
+Исправленный шаблон templates/report_template.j2:
+
+```jinja2
+==================================================
+СИСТЕМНЫЙ АУДИТ ХОСТА: {{ ansible_hostname }}
+Время сбора: {{ ansible_date_time.iso8601 }}
+==================================================
+
+{% if network_info is defined and network_info.stdout is defined %}
+1. ОТКРЫТЫЕ ПОРТЫ И ПРОЦЕССЫ:
+{{ network_info.stdout }}
+
+{% endif %}
+
+{% if firewall_info is defined and firewall_info.stdout is defined %}
+2. ПРАВИЛА МЕЖСЕТЕВОГО ЭКРАНА:
+{{ firewall_info.stdout }}
+
+{% endif %}
+
+{% if users_info is defined %}
+3. ПОЛЬЗОВАТЕЛИ И ГРУППЫ:
+{% if users_info.passwd.stdout is defined %}
+Пользователи (/etc/passwd):
+{{ users_info.passwd.stdout }}
+{% endif %}
+
+{% if users_info.group.stdout is defined %}
+Группы (/etc/group):
+{{ users_info.group.stdout }}
+{% endif %}
+
+{% endif %}
+
+{% if sudo_info is defined %}
+4. КОНФИГУРАЦИЯ SUDO:
+{% if sudo_info.sudoers.stdout is defined %}
+Основной файл sudoers:
+{{ sudo_info.sudoers.stdout }}
+{% endif %}
+
+{% if sudo_info.sudoers_d_content.stdout is defined %}
+Файлы из /etc/sudoers.d/:
+{{ sudo_info.sudoers_d_content.stdout }}
+{% endif %}
+
+{% if sudo_info.sudoers_d_files %}
+Файлы из /etc/sudoers.d/:
+{% for file in sudo_info.sudoers_d_files %}
+=== {{ file.path }} ===
+{% endfor %}
+{% endif %}
+
+{% endif %}
+
+{% if sssd_info is defined and sssd_info.stdout is defined %}
+5. КОНФИГУРАЦИЯ SSSD:
+{{ sssd_info.stdout }}
+
+{% endif %}
+
+{% if nsswitch_info is defined and nsswitch_info.stdout is defined %}
+6. КОНФИГУРАЦИЯ NSSWITCH:
+{{ nsswitch_info.stdout }}
+
+{% endif %}
+
+{% if postgres_info is defined %}
+7. КОНФИГУРАЦИЯ POSTGRESQL:
+{% if postgres_info.pg_hba_results %}
+pg_hba.conf:
+{% for result in postgres_info.pg_hba_results %}
+=== {{ result.item }} ===
+{{ result.stdout if result.stdout is defined else "ФАЙЛ НЕ НАЙДЕН ИЛИ НЕ ЧИТАЕМ" }}
+{% endfor %}
+{% endif %}
+
+{% if postgres_info.postgresql_conf_results %}
+postgresql.conf:
+{% for result in postgres_info.postgresql_conf_results %}
+=== {{ result.item }} ===
+{{ result.stdout if result.stdout is defined else "ФАЙЛ НЕ НАЙДЕН ИЛИ НЕ ЧИТАЕМ" }}
+{% endfor %}
+{% endif %}
+
+{% endif %}
+
+{% if services_info is defined and services_info.stdout is defined %}
+8. ВКЛЮЧЕННЫЕ СЛУЖБЫ SYSTEMD:
+{{ services_info.stdout }}
+
+{% endif %}
+```
+
+Альтернативное решение - более безопасный подход с проверками:
+
+Создайте фильтры для безопасного доступа к данным. Добавьте файл filter_plugins/safe_filters.py:
+
+```python
+class FilterModule(object):
+    def filters(self):
+        return {
+            'safe_get': self.safe_get,
+        }
+
+    def safe_get(self, data, key, default=''):
+        """Безопасное получение значения из словаря"""
+        if not isinstance(data, dict):
+            return default
+        return data.get(key, default)
+```
+
+И обновите шаблон:
+
+```jinja2
+{% if network_info.stdout is defined and network_info.stdout %}
+1. ОТКРЫТЫЕ ПОРТЫ И ПРОЦЕССЫ:
+{{ network_info.stdout }}
+
+{% endif %}
+```
+
+Упрощенная версия задачи сбора sudoers.d:
+
+Замените задачи сбора sudoers.d на более простую:
+
+```yaml
+- name: Сбор конфигурации sudo
+  block:
+    - name: Чтение /etc/sudoers
+      ansible.builtin.command: "cat /etc/sudoers"
+      register: sudoers_info
+      changed_when: false
+      ignore_errors: true
+      tags: sudo
+
+    - name: Сбор содержимого /etc/sudoers.d/
+      ansible.builtin.shell: |
+        if [ -d /etc/sudoers.d ]; then
+          for file in /etc/sudoers.d/*; do
+            if [ -f "$file" ]; then
+              echo "=== $file ==="
+              cat "$file" 2>/dev/null || echo "Ошибка чтения файла"
+              echo ""
+            fi
+          done
+        else
+          echo "Директория /etc/sudoers.d не существует"
+        fi
+      register: sudoers_d_content
+      changed_when: false
+      tags: sudo
+  when: collect_sudo_info
+```
+
+Упрощенная версия формирования отчета:
+
+```yaml
+- name: Формирование финального отчета
+  ansible.builtin.template:
+    src: report_template.j2
+    dest: "{{ report_path }}"
+    mode: '0644'
+  vars:
+    network_info_stdout: "{{ network_info_alt.stdout if network_info is failed and network_info_alt.stdout is defined else network_info.stdout if network_info.stdout is defined else '' }}"
+    firewall_info_stdout: "{{ nftables_info.stdout if iptables_info is failed and nftables_info.stdout is defined else iptables_info.stdout if iptables_info.stdout is defined else '' }}"
+    passwd_stdout: "{{ passwd_info.stdout if passwd_info.stdout is defined else '' }}"
+    group_stdout: "{{ group_info.stdout if group_info.stdout is defined else '' }}"
+    sudoers_stdout: "{{ sudoers_info.stdout if sudoers_info.stdout is defined else '' }}"
+    sudoers_d_stdout: "{{ sudoers_d_content.stdout if sudoers_d_content.stdout is defined else '' }}"
+    sssd_stdout: "{{ sssd_info.stdout if sssd_info.stdout is defined else '' }}"
+    nsswitch_stdout: "{{ nsswitch_info.stdout if nsswitch_info.stdout is defined else '' }}"
+    services_stdout: "{{ services_info.stdout if services_info.stdout is defined else '' }}"
+```
+
+Самый простой вариант - использовать debug для проверки структуры:
+
+Добавьте задачу для отладки перед формированием отчета:
+
+```yaml
+- name: Отладка структуры данных
+  ansible.builtin.debug:
+    var: sudoers_d_content
+    verbosity: 2
+```
+
+Это поможет увидеть фактическую структуру данных, которую возвращают модули Ansible.
+
+Рекомендуемое решение:
+
+Используйте упрощенный подход с прямым обращением к stdout:
+
+1. Исправьте все задачи сбора данных, чтобы они регистрировали результат
+2. В шаблоне обращайтесь только к .stdout
+3. Добавьте проверки на существование переменных
+
+Пример окончательного шаблона:
+
+```jinja2
+{% if network_info_stdout %}
+1. ОТКРЫТЫЕ ПОРТЫ И ПРОЦЕССЫ:
+{{ network_info_stdout }}
+
+{% endif %}
+```
+
+Это устранит ошибку 'dict object' has no attribute 'files', так как вы будете обращаться только к существующим атрибутам словарей, которые возвращают модули Ansible.
