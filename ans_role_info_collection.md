@@ -175,3 +175,132 @@ README.md – описание роли
 - Для определения типа диска используется атрибут `rotational` (0 – SSD, 1 – HDD).
 - Отчёт сохраняется локально на управляющем хосте, имя файла содержит имя целевого хоста и дату.
 - Список пакетов можно адаптировать под конкретные ОС через переменные или `vars/` в зависимости от окружения.
+
+
+
+Ошибка возникает из-за неправильного применения фильтра map(attribute='value') в задаче формирования отчёта. Переменная physical_disks уже содержит список значений value (словари с информацией о дисках), поэтому повторное извлечение value приводит к обращению к несуществующему атрибуту.
+
+Исправленная роль info-collector
+
+Структура
+
+```
+info-collector/
+├── defaults/
+│   └── main.yml
+├── tasks/
+│   └── main.yml
+├── meta/
+│   └── main.yml
+└── README.md
+```
+
+Файлы
+
+defaults/main.yml
+
+```yaml
+---
+report_dir: "./reports"
+package_names:
+  - postgresql
+  - nginx
+  - apache2
+  - httpd
+```
+
+tasks/main.yml
+
+```yaml
+---
+- name: Сбор фактов о пакетах
+  package_facts:
+    manager: auto
+  when: ansible_facts.packages is not defined
+
+- name: Создание директории для отчётов на control node
+  local_action:
+    module: file
+    path: "{{ report_dir }}"
+    state: directory
+  run_once: true
+  delegate_to: localhost
+
+- name: Сбор информации о физических дисках
+  set_fact:
+    disk_details: >-
+      {{ ansible_facts.devices | dict2items
+         | selectattr('value.rotational', 'defined')
+         | map(attribute='value') | list }}
+  when: ansible_facts.devices is defined
+
+- name: Формирование структуры отчёта
+  set_fact:
+    report_data:
+      hostname: "{{ ansible_facts.hostname | default('') }}"
+      ip_addresses:
+        all_ipv4: "{{ ansible_facts.all_ipv4_addresses | default([]) }}"
+        default_ipv4: "{{ ansible_facts.default_ipv4.address | default('') }}"
+      cpu:
+        model: "{{ ansible_facts.processor[0] | default('') }}"
+        cores: "{{ ansible_facts.processor_cores | default(ansible_facts.processor_count) | default(0) }}"
+        vcpus: "{{ ansible_facts.processor_vcpus | default(ansible_facts.processor_count) | default(0) }}"
+      ram_mb: "{{ ansible_facts.memtotal_mb | default(0) }}"
+      os:
+        distribution: "{{ ansible_facts.distribution | default('') }}"
+        version: "{{ ansible_facts.distribution_version | default('') }}"
+        family: "{{ ansible_facts.os_family | default('') }}"
+      disks: >-
+        {% if disk_details is defined %}
+          {{ disk_details | map(attribute='size') | list }}
+        {% else %}
+          []
+        {% endif %}
+      physical_disks_detail: "{{ disk_details | default([]) }}"
+      installed_software: {}
+
+- name: Сбор информации об установленных пакетах по фильтру
+  set_fact:
+    report_data: >-
+      {{ report_data | combine({
+        'installed_software': report_data.installed_software | combine({
+          item: ansible_facts.packages[item] | default([])
+        })
+      }) }}
+  loop: "{{ package_names }}"
+  when: ansible_facts.packages is defined
+
+- name: Запись отчёта в JSON файл
+  local_action:
+    module: copy
+    content: "{{ report_data | to_nice_json }}"
+    dest: "{{ report_dir }}/{{ inventory_hostname }}_{{ lookup('pipe', 'date +%Y%m%d') }}.json"
+  delegate_to: localhost
+```
+
+meta/main.yml
+
+```yaml
+---
+galaxy_info:
+  author: "Your Name"
+  description: "Сбор информации о хосте и формирование JSON отчёта"
+  license: "MIT"
+  min_ansible_version: "2.9"
+  platforms:
+    - name: GenericLinux
+      versions:
+        - all
+dependencies: []
+```
+
+Что изменено
+
+1. Переменная physical_disks переименована в disk_details для ясности.
+2. Убран повторный map(attribute='value') – теперь disk_details сразу содержит список словарей дисков.
+3. В поле disks оставлен только список размеров (можно заменить на имена или детали по желанию).
+4. Удалена дублирующая задача «Детализация физических дисков».
+
+Результат
+
+После выполнения в директории ./reports появится JSON-файл с полной информацией, включая детали по дискам и установленным пакетам. Ошибка больше не возникнет.
