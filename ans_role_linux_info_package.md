@@ -1368,3 +1368,179 @@ ansible-playbook -i inventory.ini collect_packages.yml
 ```
 
 Теперь задача создания сводного отчёта должна выполняться без ошибок.
+
+
+Мы исправили роль, чтобы все данные об установленных пакетах собирались в один единый отчёт и сохранялись в локальную папку.
+Теперь после выполнения роли в папке {{ report_directory }} появляется файл unified_report.csv или unified_report.json, который содержит все пакеты со всех хостов в плоской структуре (с указанием хоста для каждой записи).
+Промежуточные отчёты по каждому хосту также сохраняются, но главный результат — один объединённый файл.
+
+Что изменено/добавлено
+
+1. Новый скрипт create_unified_report.py
+      Копируется на control machine и запускается после сбора всех индивидуальных отчётов.
+   · Для CSV: читает все package_report_*.csv, объединяет их, добавляет колонку Host и сохраняет как unified_report.csv.
+   · Для JSON: читает все package_report_*.json, извлекает список пакетов, добавляет к каждому пакету поле host и сохраняет как unified_report.json (массив объектов).
+2. Обновлён tasks/main.yml – добавлены задачи для копирования и запуска скрипта.
+3. Исправлены ошибки
+   · Синтаксическая ошибка в get_specific_packages.yml (пропущенная скобка).
+   · Проблема с hostvars в шаблонах сводного отчёта – теперь используются значения по умолчанию (default('N/A')).
+
+Файлы для добавления/изменения
+
+1. files/create_unified_report.py
+
+```python
+#!/usr/bin/env python3
+"""
+Скрипт для создания единого отчёта из всех индивидуальных отчётов.
+Поддерживает форматы CSV и JSON.
+"""
+import argparse
+import csv
+import json
+import glob
+import os
+import sys
+
+def create_unified_csv():
+    """Объединяет все CSV отчёты в один с добавлением колонки Host."""
+    csv_files = glob.glob("package_report_*.csv")
+    if not csv_files:
+        print("CSV отчёты не найдены")
+        return
+
+    with open("unified_report.csv", "w", newline='', encoding='utf-8') as outfile:
+        writer = None
+        first_file = True
+
+        for filename in sorted(csv_files):
+            hostname = filename.replace("package_report_", "").replace(".csv", "")
+            with open(filename, 'r', encoding='utf-8') as infile:
+                reader = csv.reader(infile)
+                headers = next(reader)  # пропускаем строки комментариев до заголовка
+                # Ищем строку с заголовками столбцов
+                while headers and not headers[0].startswith('"Package Name"'):
+                    headers = next(reader, None)
+                    if headers is None:
+                        break
+                if headers is None:
+                    continue
+
+                if first_file:
+                    # Записываем заголовок с добавлением Host
+                    writer = csv.writer(outfile)
+                    writer.writerow(['Host'] + headers)
+                    first_file = False
+
+                # Записываем данные, добавляя в начало название хоста
+                for row in reader:
+                    writer.writerow([hostname] + row)
+    print(f"Создан unified_report.csv, включено файлов: {len(csv_files)}")
+
+def create_unified_json():
+    """Объединяет все JSON отчёты в один массив объектов с полем host."""
+    json_files = glob.glob("package_report_*.json")
+    if not json_files:
+        print("JSON отчёты не найдены")
+        return
+
+    unified = []
+    for filename in sorted(json_files):
+        hostname = filename.replace("package_report_", "").replace(".json", "")
+        with open(filename, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            packages = data.get('packages', [])
+            for pkg in packages:
+                pkg['host'] = hostname
+                unified.append(pkg)
+
+    with open("unified_report.json", "w", encoding='utf-8') as f:
+        json.dump(unified, f, indent=2, ensure_ascii=False)
+    print(f"Создан unified_report.json, всего записей: {len(unified)}")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--format', choices=['csv', 'json'], default='csv')
+    args = parser.parse_args()
+
+    if args.format == 'csv':
+        create_unified_csv()
+    else:
+        create_unified_json()
+
+if __name__ == "__main__":
+    main()
+```
+
+2. Добавить в tasks/main.yml (после блока fetch)
+
+```yaml
+- name: Копирование скрипта для создания единого отчета
+  copy:
+    src: create_unified_report.py
+    dest: "{{ report_directory }}/create_unified_report.py"
+    mode: '0755'
+  delegate_to: localhost
+  run_once: true
+
+- name: Создание единого отчета
+  shell: |
+    cd {{ report_directory }}
+    python3 create_unified_report.py --format {{ report_format }}
+  delegate_to: localhost
+  run_once: true
+  register: unified_result
+  changed_when: unified_result.rc == 0
+```
+
+3. Убедиться, что в vars/main.yml определён report_directory и report_format
+
+```yaml
+report_directory: ./package_reports
+report_format: json   # или csv
+```
+
+Результат
+
+После запуска плейбука в папке ./package_reports появятся:
+
+· Индивидуальные отчёты: package_report_<host>.csv (или .json)
+· Сводный отчёт по хостам: summary_report.csv (или .json)
+· Единый отчёт со всеми пакетами: unified_report.csv (или .json)
+
+Пример содержимого unified_report.csv:
+
+```
+Host,Package Name,Version,Architecture,Size,Description
+ubuntu1,nginx,1.18.0-0ubuntu1,amd64,1234,high performance web server
+oracle1,nginx,1.20.1-1.el7,x86_64,5678,nginx web server
+...
+```
+
+Пример unified_report.json:
+
+```json
+[
+  {
+    "name": "nginx",
+    "version": "1.18.0-0ubuntu1",
+    "architecture": "amd64",
+    "size": "1234",
+    "description": "high performance web server",
+    "host": "ubuntu1"
+  },
+  ...
+]
+```
+
+Проверка
+
+Запустите плейбук:
+
+```bash
+ansible-playbook -i inventory.ini collect_packages.yml
+```
+
+Убедитесь, что задача создания единого отчёта выполняется без ошибок и файл unified_report создан.
+
+Если нужна только плоская структура без промежуточных файлов, можно удалить задачи создания индивидуальных отчётов, но мы рекомендуем оставить их для отладки.
