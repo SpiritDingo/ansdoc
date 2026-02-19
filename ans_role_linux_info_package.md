@@ -1219,3 +1219,89 @@ package_reports/
    · Статистика по хостам
 
 Это решение предоставляет гибкую систему сбора информации о пакетах с возможностью фильтрации и выбора формата вывода, что делает его удобным для различных сценариев использования - от простого аудита до интеграции с системами мониторинга и анализа.
+
+
+
+Ошибка возникает из-за синтаксической проблемы в шаблоне для конкретных пакетов (Oracle Linux). В файле get_specific_packages.yml в строке echo пропущена закрывающая фигурная скобка для переменной package. Также аналогичная проблема может быть в Ubuntu-ветке.
+
+Исправление ошибки
+
+1. Исправленный файл tasks/get_specific_packages.yml
+
+```yaml
+---
+- name: Получение информации о конкретных пакетах (Ubuntu)
+  shell: |
+    {% for pkg in specific_packages %}
+    dpkg-query -W -f='${Package}\t${Version}\t${Status}\n' {{ pkg }} 2>/dev/null || echo "{{ pkg }}\tnot installed\tnot installed"
+    {% endfor %}
+  register: specific_deb_packages
+  when: ansible_os_family == "Debian"
+  changed_when: false
+
+- name: Получение информации о конкретных пакетах (Oracle Linux)
+  shell: |
+    {% for pkg in specific_packages %}
+    rpm -q --queryformat "%{NAME}\t%{VERSION}-%{RELEASE}\n" {{ pkg }} 2>/dev/null || echo "{{ pkg }}\tnot installed"
+    {% endfor %}
+  register: specific_rh_packages
+  when: ansible_os_family == "RedHat"
+  changed_when: false
+
+- name: Сохранение информации о конкретных пакетах
+  set_fact:
+    specific_package_info: >-
+      {%- if ansible_os_family == "Debian" -%}
+        {{ specific_deb_packages.stdout_lines }}
+      {%- elif ansible_os_family == "RedHat" -%}
+        {{ specific_rh_packages.stdout_lines }}
+      {%- endif -%}
+```
+
+Что было исправлено:
+
+· В строках echo для обеих веток теперь правильно закрыта переменная pkg: "{{ pkg }}\tnot installed" (было "{{ package }\tnot installed" – пропущена вторая фигурная скобка).
+· Везде используется переменная pkg вместо package для единообразия (в цикле for pkg in specific_packages).
+
+2. Дополнительная проверка в tasks/main.yml
+
+Чтобы избежать выполнения задачи, если список specific_packages пуст или не определён, добавьте условие:
+
+```yaml
+- name: Получение информации о конкретных пакетах
+  include_tasks: get_specific_packages.yml
+  when: specific_packages is defined and specific_packages | length > 0
+```
+
+3. Полный исправленный файл tasks/get_specific_packages.yml
+
+(см. выше пункт 1)
+
+Причина ошибки
+
+Ansible пытается интерпретировать содержимое shell как шаблон Jinja2. Внутри этого шаблона использовалась конструкция {{ package }, которая не была закрыта, из-за чего парсер Jinja2 не смог корректно разобрать выражение и выдал ошибку.
+
+Проверка
+
+После исправления запустите плейбук снова:
+
+```bash
+ansible-playbook -i inventory.ini collect_packages.yml
+```
+
+Убедитесь, что задача Получение информации о конкретных пакетах выполняется без ошибок. Если список specific_packages пуст, задача будет пропущена благодаря добавленному условию.
+
+Дополнительные рекомендации
+
+· Для избежания проблем с интерпретацией символа табуляции \t в echo можно использовать printf (более переносимо), например:
+  ```bash
+  printf "%s\t%s\n" "{{ pkg }}" "not installed"
+  ```
+  Но текущий вариант с echo также будет работать в большинстве случаев, так как \t в двойных кавычках обычно преобразуется в табуляцию.
+· Убедитесь, что переменная specific_packages в вашем плейбуке или инвентаре определена корректно как список. Пример:
+  ```yaml
+  specific_packages:
+    - nginx
+    - docker
+    - python3
+  ```
