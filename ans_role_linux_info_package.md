@@ -1,3 +1,279 @@
+Вот решение для создания Ansible роли, которая собирает информацию об установленных пакетах на Ubuntu и Oracle Linux и объединяет её в один отчет.
+
+Структура роли
+
+```
+package-info-collector/
+├── tasks/
+│   └── main.yml
+├── templates/
+│   └── report.j2
+└── vars/
+    └── main.yml
+```
+
+Содержимое файлов
+
+tasks/main.yml
+
+```yaml
+---
+- name: Сбор информации о системе
+  setup:
+    filter:
+      - ansible_distribution
+      - ansible_distribution_version
+      - ansible_os_family
+      - ansible_hostname
+  register: system_info
+
+- name: Определение менеджера пакетов
+  set_fact:
+    package_manager: >-
+      {%- if ansible_os_family == "Debian" -%}apt
+      {%- elif ansible_os_family == "RedHat" -%}rpm
+      {%- else -%}unknown
+      {%- endif -%}
+
+- name: Получение списка всех установленных пакетов (Debian/Ubuntu)
+  shell: |
+    dpkg-query -W -f='${Package}\t${Version}\t${Status}\n' | grep "install ok installed" | cut -f1,2
+  register: deb_packages
+  when: ansible_os_family == "Debian"
+  changed_when: false
+
+- name: Получение списка всех установленных пакетов (RedHat/Oracle Linux)
+  shell: |
+    rpm -qa --queryformat "%{NAME}\t%{VERSION}-%{RELEASE}\n" | sort
+  register: rh_packages
+  when: ansible_os_family == "RedHat"
+  changed_when: false
+
+- name: Получение информации о конкретных пакетах (по списку)
+  include_tasks: get_specific_packages.yml
+  when: specific_packages is defined
+
+- name: Подсчет общего количества пакетов
+  set_fact:
+    total_packages: >-
+      {%- if ansible_os_family == "Debian" -%}
+        {{ deb_packages.stdout_lines | length }}
+      {%- elif ansible_os_family == "RedHat" -%}
+        {{ rh_packages.stdout_lines | length }}
+      {%- else -%}
+        0
+      {%- endif -%}
+
+- name: Создание структурированных данных о пакетах
+  set_fact:
+    package_data: >-
+      {%- if ansible_os_family == "Debian" -%}
+        {%- set packages = [] -%}
+        {%- for line in deb_packages.stdout_lines -%}
+          {%- set parts = line.split('\t') -%}
+          {%- set _ = packages.append({'name': parts[0], 'version': parts[1]}) -%}
+        {%- endfor -%}
+        {{ packages }}
+      {%- elif ansible_os_family == "RedHat" -%}
+        {%- set packages = [] -%}
+        {%- for line in rh_packages.stdout_lines -%}
+          {%- set parts = line.split('\t') -%}
+          {%- set _ = packages.append({'name': parts[0], 'version': parts[1]}) -%}
+        {%- endfor -%}
+        {{ packages }}
+      {%- else -%}
+        []
+      {%- endif -%}
+
+- name: Сохранение отчета на целевой машине
+  template:
+    src: report.j2
+    dest: /tmp/package_report_{{ ansible_hostname }}.txt
+    mode: '0644'
+  delegate_to: "{{ inventory_hostname }}"
+
+- name: Сбор всех отчетов на контрольной машине
+  fetch:
+    src: /tmp/package_report_{{ ansible_hostname }}.txt
+    dest: "{{ report_directory }}/"
+    flat: yes
+  run_once: true
+  delegate_to: "{{ inventory_hostname }}"
+
+- name: Создание сводного отчета на контрольной машине
+  template:
+    src: summary_report.j2
+    dest: "{{ report_directory }}/summary_report.txt"
+  delegate_to: localhost
+  run_once: true
+```
+
+tasks/get_specific_packages.yml
+
+```yaml
+---
+- name: Получение информации о конкретных пакетах (Ubuntu)
+  shell: |
+    {% for package in specific_packages %}
+    dpkg-query -W -f='${Package}\t${Version}\t${Status}\n' {{ package }} 2>/dev/null || echo "{{ package }}\tnot installed\tnot installed"
+    {% endfor %}
+  register: specific_deb_packages
+  when: ansible_os_family == "Debian"
+  changed_when: false
+
+- name: Получение информации о конкретных пакетах (Oracle Linux)
+  shell: |
+    {% for package in specific_packages %}
+    rpm -q --queryformat "%{NAME}\t%{VERSION}-%{RELEASE}\n" {{ package }} 2>/dev/null || echo "{{ package }\tnot installed"
+    {% endfor %}
+  register: specific_rh_packages
+  when: ansible_os_family == "RedHat"
+  changed_when: false
+
+- name: Сохранение информации о конкретных пакетах
+  set_fact:
+    specific_package_info: >-
+      {%- if ansible_os_family == "Debian" -%}
+        {{ specific_deb_packages.stdout_lines }}
+      {%- elif ansible_os_family == "RedHat" -%}
+        {{ specific_rh_packages.stdout_lines }}
+      {%- endif -%}
+```
+
+templates/report.j2
+
+```jinja2
+==================================================
+ОТЧЕТ ОБ УСТАНОВЛЕННЫХ ПАКЕТАХ
+==================================================
+Хост: {{ ansible_hostname }}
+Дата: {{ ansible_date_time.date }} {{ ansible_date_time.time }}
+ОС: {{ ansible_distribution }} {{ ansible_distribution_version }}
+Семейство ОС: {{ ansible_os_family }}
+Менеджер пакетов: {{ package_manager }}
+Всего пакетов: {{ total_packages }}
+
+==================================================
+СПИСОК ВСЕХ УСТАНОВЛЕННЫХ ПАКЕТОВ
+==================================================
+{% for package in package_data %}
+{{ package.name }} : {{ package.version }}
+{% endfor %}
+
+{% if specific_package_info is defined %}
+==================================================
+ИНФОРМАЦИЯ О КОНКРЕТНЫХ ПАКЕТАХ
+==================================================
+{% for line in specific_package_info %}
+{{ line }}
+{% endfor %}
+{% endif %}
+```
+
+templates/summary_report.j2
+
+```jinja2
+==================================================
+СВОДНЫЙ ОТЧЕТ ПО ВСЕМ ХОСТАМ
+==================================================
+Дата создания: {{ ansible_date_time.date }} {{ ansible_date_time.time }}
+
+{% for host in groups['all'] %}
+--------------------------------------------------
+Хост: {{ host }}
+--------------------------------------------------
+{% endwith %}
+{% endfor %}
+
+==================================================
+ДЕТАЛЬНЫЕ ОТЧЕТЫ ПО КАЖДОМУ ХОСТУ
+==================================================
+Для просмотра детальной информации по каждому хосту,
+смотрите файлы package_report_*.txt в директории {{ report_directory }}
+```
+
+vars/main.yml
+
+```yaml
+---
+# Директория для сохранения отчетов
+report_directory: ./package_reports
+
+# Список конкретных пакетов для проверки (можно переопределить в плейбуке)
+# specific_packages:
+#   - nginx
+#   - docker-ce
+#   - python3
+```
+
+Пример плейбука для использования роли
+
+collect_packages.yml
+
+```yaml
+---
+- name: Сбор информации о пакетах с Ubuntu и Oracle Linux
+  hosts: all
+  become: yes
+  
+  vars:
+    # Директория для отчетов
+    report_directory: /tmp/package_reports
+    # Список пакетов для детальной проверки
+    specific_packages:
+      - nginx
+      - docker
+      - python3
+      - git
+      - curl
+  
+  roles:
+    - package-info-collector
+```
+
+Инвентарный файл
+
+inventory.ini
+
+```ini
+[ubuntu_servers]
+ubuntu1 ansible_host=192.168.1.10 ansible_user=ubuntu
+ubuntu2 ansible_host=192.168.1.11 ansible_user=ubuntu
+
+[oracle_servers]
+oracle1 ansible_host=192.168.1.20 ansible_user=opc
+oracle2 ansible_host=192.168.1.21 ansible_user=opc
+
+[all:children]
+ubuntu_servers
+oracle_servers
+```
+
+Запуск
+
+```bash
+# Запуск сбора информации
+ansible-playbook -i inventory.ini collect_packages.yml
+
+# Результат будет в директории /tmp/package_reports/
+# - summary_report.txt - сводный отчет
+# - package_report_*.txt - отчеты по каждому хосту
+```
+
+Особенности решения
+
+1. Кроссплатформенность: Работает на Ubuntu (Debian) и Oracle Linux (RedHat)
+2. Два уровня отчетов:
+   · Индивидуальные отчеты по каждому серверу
+   · Сводный отчет по всем серверам
+3. Гибкость: Можно задать список конкретных пакетов для проверки
+4. Структурированные данные: Информация сохраняется в удобном для анализа формате
+5. Автоматический сбор: Все отчеты собираются на контрольной машине
+
+Это решение предоставляет полную информацию об установленных пакетах и может быть легко расширено для добавления дополнительных функций, таких как сравнение версий или поиск уязвимостей.
+
+
+
 Вот обновленная Ansible роль с фильтрацией пакетов и поддержкой CSV и JSON форматов:
 
 Обновленная структура роли
