@@ -1305,3 +1305,66 @@ ansible-playbook -i inventory.ini collect_packages.yml
     - docker
     - python3
   ```
+
+
+
+Ошибка возникает из-за того, что в момент создания сводного отчета на localhost не все факты (переменные ansible_distribution и др.) доступны в hostvars для некоторых хостов. Это может случиться, если для каких-то хостов не были собраны факты (например, из-за проблем с подключением или если gather_facts: no). Чтобы избежать ошибки, нужно использовать значения по умолчанию в шаблоне.
+
+Исправление шаблонов сводного отчета
+
+1. Исправленный templates/summary_report_csv.j2
+
+```jinja2
+# СВОДНЫЙ ОТЧЕТ ПО ВСЕМ ХОСТАМ
+# Дата создания: {{ ansible_date_time.date }} {{ ansible_date_time.time }}
+# Формат: CSV
+
+"Host","OS","Version","Total Packages","Report File"
+{% for host in groups['all'] -%}
+{% set h = hostvars[host] %}
+"{{ host }}","{{ h['ansible_distribution'] | default('N/A') }}","{{ h['ansible_distribution_version'] | default('N/A') }}","{{ h['total_filtered_packages'] | default(0) }}","package_report_{{ host }}.csv"
+{% endfor %}
+```
+
+2. Исправленный templates/summary_report_json.j2
+
+```jinja2
+{
+  "metadata": {
+    "generated": "{{ ansible_date_time.iso8601 }}",
+    "total_hosts": {{ groups['all'] | length }},
+    "format": "json"
+  },
+  "hosts": [
+    {% for host in groups['all'] %}
+    {% set h = hostvars[host] %}
+    {
+      "hostname": "{{ host }}",
+      "os": {
+        "distribution": "{{ h['ansible_distribution'] | default('N/A') }}",
+        "version": "{{ h['ansible_distribution_version'] | default('N/A') }}",
+        "family": "{{ h['ansible_os_family'] | default('N/A') }}"
+      },
+      "package_stats": {
+        "total_filtered": {{ h['total_filtered_packages'] | default(0) }},
+        "filter_applied": {{ 'true' if h['package_filter'] is defined else 'false' }}
+      },
+      "report_file": "package_report_{{ host }}.json"
+    }{{ ',' if not loop.last else '' }}
+    {% endfor %}
+  ]
+}
+```
+
+Дополнительные рекомендации
+
+· Убедитесь, что в плейбуке включён сбор фактов (gather_facts: yes). Если он отключён, добавьте задачу setup перед использованием фактов.
+· Если некоторые хосты недоступны, они будут отмечены как N/A в отчёте, но ошибка больше не возникнет.
+
+После замены шаблонов запустите плейбук заново:
+
+```bash
+ansible-playbook -i inventory.ini collect_packages.yml
+```
+
+Теперь задача создания сводного отчёта должна выполняться без ошибок.
