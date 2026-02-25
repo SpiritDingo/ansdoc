@@ -214,3 +214,46 @@ logdir /var/log/chrony
 ```
 
 Роль готова к использованию в окружениях с Oracle Linux, Ubuntu и другими системами на базе RHEL/Debian.
+
+
+Ошибка возникает из-за неправильного форматирования YAML: параметр backup указан на том же уровне, что и модуль replace, вместо того чтобы быть вложенным в него.
+Вот исправленный файл modify_replace.yml:
+
+```yaml
+---
+- name: Comment out existing pool and server lines
+  replace:
+    path: "{{ chrony_config_file }}"
+    regexp: '^(pool|server)\s+.*$'
+    replace: '# \g<0> (commented by Ansible)'
+    backup: no                     # <-- теперь внутри модуля replace
+  notify: restart chrony
+
+- name: Add custom NTP servers
+  blockinfile:
+    path: "{{ chrony_config_file }}"
+    block: |
+      {% for server in chrony_servers %}
+      server {{ server }}
+      {% endfor %}
+    marker: "# {mark} ANSIBLE MANAGED NTP SERVERS"
+    insertafter: EOF
+    backup: no                     # можно добавить и здесь, если нужно
+  notify: restart chrony
+```
+
+Что было не так:
+В предыдущей версии backup находился на том же уровне, что и replace, из-за чего Ansible пытался интерпретировать его как отдельное действие (модуль), но модуля с именем backup не существует.
+
+Проверьте также файл modify_template.yml (если используете) – там похожая ситуация может возникнуть с параметром backup в задаче template. Правильно:
+
+```yaml
+- name: Deploy chrony configuration from template
+  template:
+    src: "{{ chrony_template }}"
+    dest: "{{ chrony_config_file }}"
+    backup: yes                    # параметр внутри модуля template
+  notify: restart chrony
+```
+
+После исправления отступов роль будет работать без ошибок.
