@@ -428,3 +428,352 @@ Handlers позволяют перезапускать Apache только в с
 ```
 
 Эти улучшения сделают роль надёжной, безопасной и удобной в использовании в реальных условиях.
+
+
+
+Вот полная и улучшенная роль Ansible для замены SSL-сертификатов Apache на Oracle Linux и Ubuntu. Она включает автоматическое создание резервных копий с датой, проверку новых сертификатов, идемпотентность, поддержку SELinux и автоматический откат при ошибках.
+
+Структура роли
+
+```
+replace_apache_certs/
+├── tasks/
+│   └── main.yml
+├── handlers/
+│   └── main.yml
+├── defaults/
+│   └── main.yml
+├── vars/
+│   └── main.yml
+└── files/
+    (сюда поместите новые сертификаты: server.crt, server.key, chain.crt при необходимости)
+```
+
+Файлы роли
+
+defaults/main.yml
+
+```yaml
+---
+# Директория для резервных копий
+backup_dir: /backup/apache_certs
+
+# Сколько последних бэкапов хранить
+keep_backups: 5
+
+# Перезапускать Apache после замены?
+restart_apache: true
+
+# Имена исходных файлов новых сертификатов (ожидаются в files/ роли)
+apache_cert_src: "server.crt"
+apache_key_src: "server.key"
+apache_chain_src: ""   # если пусто, chain не используется
+
+# Имена целевых файлов (без пути)
+apache_cert_name: "server.crt"
+apache_key_name: "server.key"
+apache_chain_name: "chain.crt"
+```
+
+vars/main.yml
+
+```yaml
+---
+# Переменные определяются динамически в tasks в зависимости от ОС
+# Файл оставлен для совместимости
+```
+
+tasks/main.yml
+
+```yaml
+---
+- name: Определить переменные в зависимости от ОС
+  set_fact:
+    apache_service: "{{ 'apache2' if ansible_os_family == 'Debian' else 'httpd' }}"
+    apache_config_test_command: "{{ 'apache2ctl configtest' if ansible_os_family == 'Debian' else 'httpd -t' }}"
+    apache_cert_dir: "{{ '/etc/ssl/certs' if ansible_os_family == 'Debian' else '/etc/pki/tls/certs' }}"
+    apache_key_dir: "{{ '/etc/ssl/private' if ansible_os_family == 'Debian' else '/etc/pki/tls/private' }}"
+    apache_chain_dir: "{{ '/etc/ssl/certs' if ansible_os_family == 'Debian' else '/etc/pki/tls/certs' }}"
+    apache_key_group: "{{ 'ssl-cert' if ansible_os_family == 'Debian' else 'root' }}"
+
+- name: Составить полные пути к целевым файлам
+  set_fact:
+    apache_cert_file: "{{ apache_cert_dir }}/{{ apache_cert_name }}"
+    apache_key_file: "{{ apache_key_dir }}/{{ apache_key_name }}"
+    apache_chain_file: "{{ apache_chain_dir }}/{{ apache_chain_name if apache_chain_name else '' }}"
+
+- name: Собрать факты, если ещё не собраны (нужна дата)
+  setup:
+    gather_subset: "!all,min"
+  when: ansible_date_time is not defined
+
+- name: Создать директорию для бэкапов
+  file:
+    path: "{{ backup_dir }}"
+    state: directory
+    mode: '0750'
+  tags: [backup, always]
+
+- name: Проверить локальные файлы новых сертификатов
+  local_action: stat path="files/{{ item }}"
+  register: local_files_stat
+  loop:
+    - "{{ apache_cert_src }}"
+    - "{{ apache_key_src }}"
+  when: item != ''
+  run_once: true
+  tags: [always]
+
+- name: Проверить валидность нового сертификата (локально)
+  local_action: command openssl x509 -in "files/{{ apache_cert_src }}" -text -noout
+  changed_when: false
+  register: cert_validation
+  ignore_errors: yes
+  when: apache_cert_src != ''
+  run_once: true
+  tags: [validate]
+
+- name: Остановить выполнение, если сертификат невалиден
+  fail:
+    msg: "Файл {{ apache_cert_src }} не является корректным сертификатом X.509"
+  when: cert_validation is failed
+  tags: [validate]
+
+- name: Проверить наличие локального ключа
+  local_action: stat path="files/{{ apache_key_src }}"
+  register: key_stat
+  when: apache_key_src != ''
+  run_once: true
+
+- name: Остановить выполнение, если ключ не найден
+  fail:
+    msg: "Ключ {{ apache_key_src }} не найден в files/"
+  when: not key_stat.stat.exists
+  tags: [validate]
+
+# Если указан chain, проверим его наличие и валидность (опционально)
+- name: Проверить локальный chain файл (если указан)
+  local_action: stat path="files/{{ apache_chain_src }}"
+  register: chain_stat
+  when: apache_chain_src != ''
+  run_once: true
+
+- name: Проверить валидность chain (если есть)
+  local_action: command openssl x509 -in "files/{{ apache_chain_src }}" -text -noout
+  changed_when: false
+  register: chain_validation
+  ignore_errors: yes
+  when: apache_chain_src != ''
+  run_once: true
+
+- name: Предупреждение, если chain невалиден
+  debug:
+    msg: "Внимание: chain файл {{ apache_chain_src }} не является валидным сертификатом, но продолжение возможно."
+  when: chain_validation is failed and apache_chain_src != ''
+
+# Получить информацию о текущих файлах на удалённом хосте
+- name: Получить статус текущих сертификатов
+  stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ apache_cert_file }}"
+    - "{{ apache_key_file }}"
+    - "{{ apache_chain_file if apache_chain_file != '' else omit }}"
+  register: remote_files_stat
+  tags: [always]
+
+- name: Вычислить контрольные суммы новых файлов (локально)
+  set_fact:
+    new_cert_checksum: "{{ local_files_stat.results[0].stat.checksum | default('') }}"
+    new_key_checksum: "{{ local_files_stat.results[1].stat.checksum | default('') }}"
+    new_chain_checksum: "{{ chain_stat.stat.checksum | default('') if apache_chain_src != '' else '' }}"
+  run_once: true
+  tags: [always]
+
+- name: Определить, нужно ли обновление (если хотя бы один файл отличается)
+  set_fact:
+    need_update: >-
+      {{ (remote_files_stat.results[0].stat.checksum | default('') != new_cert_checksum) or
+         (remote_files_stat.results[1].stat.checksum | default('') != new_key_checksum) or
+         (apache_chain_src != '' and (remote_files_stat.results[2].stat.checksum | default('') != new_chain_checksum)) }}
+  tags: [always]
+
+- name: Блок замены сертификатов (если требуется обновление)
+  when: need_update
+  block:
+    - name: Создать резервную копию текущих сертификатов
+      block:
+        - name: Создать временную директорию для бэкапа
+          tempfile:
+            state: directory
+            suffix: apache_certs_backup
+          register: backup_temp
+
+        - name: Скопировать текущие файлы во временную папку
+          copy:
+            src: "{{ item.stat.path }}"
+            dest: "{{ backup_temp.path }}/"
+            remote_src: yes
+          loop: "{{ remote_files_stat.results }}"
+          when: item.stat is defined and item.stat.exists
+
+        - name: Создать архив с меткой времени
+          archive:
+            path: "{{ backup_temp.path }}/*"
+            dest: "{{ backup_dir }}/certs_{{ ansible_date_time.epoch }}.tar.gz"
+            format: gz
+            remove: yes
+      rescue:
+        - name: Очистить временную папку в случае ошибки
+          file:
+            path: "{{ backup_temp.path }}"
+            state: absent
+          when: backup_temp.path is defined
+        - fail: msg="Не удалось создать резервную копию. Операция прервана."
+      tags: [backup]
+
+    - name: Загрузить новые сертификаты на сервер
+      copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "{{ item.mode }}"
+        owner: root
+        group: "{{ item.group }}"
+        backup: no
+      loop:
+        - { src: "{{ apache_cert_src }}", dest: "{{ apache_cert_file }}", mode: '0644', group: 'root' }
+        - { src: "{{ apache_key_src }}", dest: "{{ apache_key_file }}", mode: '0640', group: "{{ apache_key_group }}" }
+        - { src: "{{ apache_chain_src }}", dest: "{{ apache_chain_file }}", mode: '0644', group: 'root' }
+      when: item.src != '' and item.dest != ''
+      notify: перезапустить apache
+      tags: [deploy]
+
+    - name: Восстановить контекст SELinux (если включен)
+      command: restorecon -Rv {{ apache_cert_dir }} {{ apache_key_dir }}
+      when: ansible_selinux is defined and ansible_selinux.status == "enabled"
+      changed_when: false
+      tags: [deploy, selinux]
+
+    - name: Проверить конфигурацию Apache
+      command: "{{ apache_config_test_command }}"
+      register: config_test
+      changed_when: false
+      tags: [deploy, validate]
+
+    - name: Перезапустить Apache (если конфиг верен и требуется)
+      service:
+        name: "{{ apache_service }}"
+        state: restarted
+      when: restart_apache | bool and config_test.rc == 0
+      tags: [deploy]
+
+    - name: Ошибка, если конфиг неверен
+      fail:
+        msg: "Конфигурация Apache неверна. Запущен откат."
+      when: config_test.rc != 0
+      tags: [deploy, validate]
+
+  rescue:
+    - name: Восстановить сертификаты из последнего бэкапа в случае ошибки
+      block:
+        - name: Найти последний архив бэкапа
+          find:
+            paths: "{{ backup_dir }}"
+            patterns: "certs_*.tar.gz"
+          register: backup_files
+
+        - name: Взять самый свежий файл
+          set_fact:
+            latest_backup: "{{ (backup_files.files | sort(attribute='mtime') | last).path }}"
+          when: backup_files.files | length > 0
+
+        - name: Распаковать последний бэкап
+          unarchive:
+            src: "{{ latest_backup }}"
+            dest: "{{ apache_cert_dir | dirname if ansible_os_family == 'Debian' else '/etc/pki/tls' }}"
+            remote_src: yes
+          when: latest_backup is defined
+
+        - name: Восстановить контекст SELinux
+          command: restorecon -Rv {{ apache_cert_dir }} {{ apache_key_dir }}
+          when: ansible_selinux is defined and ansible_selinux.status == "enabled"
+          changed_when: false
+
+        - name: Перезапустить Apache со старыми сертификатами
+          service:
+            name: "{{ apache_service }}"
+            state: restarted
+          when: latest_backup is defined
+      rescue:
+        - debug:
+            msg: "Критическая ошибка при восстановлении. Проверьте вручную."
+
+    - fail:
+        msg: "Ошибка при замене сертификатов. Выполнена попытка отката. Проверьте логи."
+
+  always:
+    - name: Очистить ротацию старых бэкапов (оставить только последние N)
+      block:
+        - name: Найти все архивы бэкапов
+          find:
+            paths: "{{ backup_dir }}"
+            patterns: "certs_*.tar.gz"
+          register: all_backups
+
+        - name: Отсортировать по времени и удалить старые
+          file:
+            path: "{{ item.path }}"
+            state: absent
+          loop: "{{ all_backups.files | sort(attribute='mtime') | reverse | list[keep_backups:] }}"
+          when: all_backups.files | length > keep_backups
+      tags: [backup, cleanup]
+
+- name: Сообщить, что обновление не требуется
+  debug:
+    msg: "Сертификаты уже актуальны, обновление не требуется."
+  when: not need_update
+  tags: [always]
+```
+
+handlers/main.yml
+
+```yaml
+---
+- name: перезапустить apache
+  service:
+    name: "{{ apache_service }}"
+    state: restarted
+  when: restart_apache | bool
+```
+
+Использование
+
+1. Поместите новые сертификаты в директорию files/ роли (например, files/server.crt, files/server.key, files/chain.crt).
+2. В playbook укажите необходимые переменные (если нужно переопределить имена файлов или пути).
+3. Запустите плейбук.
+
+Пример playbook:
+
+```yaml
+- hosts: apache_servers
+  become: yes
+  vars:
+    apache_cert_src: "wildcard.example.com.crt"
+    apache_key_src: "wildcard.example.com.key"
+    apache_chain_src: "ca-bundle.crt"
+    backup_dir: /opt/backups/apache_certs
+    keep_backups: 10
+  roles:
+    - replace_apache_certs
+```
+
+Особенности
+
+· Поддержка двух ОС: автоматически определяет пути и команды для Ubuntu (Debian) и Oracle Linux (RedHat).
+· Проверка новых сертификатов локально с помощью openssl до начала замены.
+· Резервное копирование всех текущих файлов в архив с временной меткой (epoch).
+· Ротация бэкапов – оставляет только последние N копий.
+· Идемпотентность – сравнивает контрольные суммы и выполняет замену только при изменениях.
+· SELinux – восстанавливает контекст после замены (если включен).
+· Автоматический откат – при ошибке проверки конфигурации Apache восстанавливает предыдущие сертификаты из последнего бэкапа и перезапускает сервис.
+· Теги – позволяют запускать только отдельные этапы: backup, deploy, validate, cleanup.
