@@ -777,3 +777,98 @@ handlers/main.yml
 · SELinux – восстанавливает контекст после замены (если включен).
 · Автоматический откат – при ошибке проверки конфигурации Apache восстанавливает предыдущие сертификаты из последнего бэкапа и перезапускает сервис.
 · Теги – позволяют запускать только отдельные этапы: backup, deploy, validate, cleanup.
+
+
+
+
+
+
+
+Ошибка возникает из-за того, что задача проверки валидности сертификата запускается даже если файл физически отсутствует в каталоге files/. Хотя мы игнорируем ошибку (ignore_errors: yes), последующая задача fail срабатывает, потому что регистр cert_validation помечен как failed. Нужно проверять существование файла перед попыткой его валидации и уточнить сообщение об ошибке.
+
+Ниже приведён исправленный блок задач, относящихся к проверке локальных файлов и валидации сертификатов (заменяет соответствующие части в tasks/main.yml).
+
+Исправленный фрагмент tasks/main.yml
+
+```yaml
+# ... (предыдущие задачи до проверки локальных файлов)
+
+- name: Проверить локальные файлы новых сертификатов
+  local_action: stat path="files/{{ item }}"
+  register: local_files_stat
+  loop:
+    - "{{ apache_cert_src }}"
+    - "{{ apache_key_src }}"
+  when: item != ''
+  run_once: true
+  tags: [always]
+
+- name: Проверить существование файла сертификата
+  fail:
+    msg: "Файл сертификата {{ apache_cert_src }} не найден в директории files/ роли."
+  when: not local_files_stat.results[0].stat.exists
+  run_once: true
+  tags: [validate]
+
+- name: Проверить валидность нового сертификата (локально)
+  local_action: command openssl x509 -in "files/{{ apache_cert_src }}" -text -noout
+  changed_when: false
+  register: cert_validation
+  ignore_errors: yes
+  when: local_files_stat.results[0].stat.exists   # файл уже точно есть, но проверка на всякий случай
+  run_once: true
+  tags: [validate]
+
+- name: Остановить выполнение, если сертификат невалиден
+  fail:
+    msg: "Файл {{ apache_cert_src }} присутствует, но не является корректным сертификатом X.509 (ошибка openssl)."
+  when: cert_validation is failed
+  tags: [validate]
+
+# Аналогично для ключа (можно не проверять валидность openssl, только существование)
+- name: Проверить существование файла ключа
+  fail:
+    msg: "Файл ключа {{ apache_key_src }} не найден в директории files/ роли."
+  when: not local_files_stat.results[1].stat.exists
+  run_once: true
+  tags: [validate]
+
+# Для chain (если указан)
+- name: Проверить локальный chain файл (если указан)
+  local_action: stat path="files/{{ apache_chain_src }}"
+  register: chain_stat
+  when: apache_chain_src != ''
+  run_once: true
+
+- name: Проверить существование chain файла (если указан)
+  fail:
+    msg: "Файл chain {{ apache_chain_src }} указан, но не найден в files/."
+  when: apache_chain_src != '' and not chain_stat.stat.exists
+  run_once: true
+  tags: [validate]
+
+- name: Проверить валидность chain (если есть)
+  local_action: command openssl x509 -in "files/{{ apache_chain_src }}" -text -noout
+  changed_when: false
+  register: chain_validation
+  ignore_errors: yes
+  when: apache_chain_src != '' and chain_stat.stat.exists
+  run_once: true
+
+- name: Предупреждение, если chain невалиден
+  debug:
+    msg: "Внимание: chain файл {{ apache_chain_src }} не является валидным сертификатом, но продолжение возможно."
+  when: chain_validation is failed and apache_chain_src != ''
+  tags: [validate]
+
+# ... (остальные задачи)
+```
+
+Что изменилось
+
+1. Проверка существования файла сертификата до его валидации. Если файла нет – выполнение прерывается с понятным сообщением.
+2. Проверка валидности теперь выполняется только при гарантированном наличии файла (условие when). Это предотвращает ложные срабатывания openssl.
+3. Сообщение об ошибке уточнено: теперь различается ситуация "файл отсутствует" и "файл есть, но невалиден".
+4. Аналогичные проверки добавлены для ключа (только существование, так как ключ не обязан быть в формате PEM для проверки через openssl) и для chain-файла.
+
+После этих исправлений роль будет корректно обрабатывать отсутствие файлов и не будет пытаться проверить несуществующий сертификат.
