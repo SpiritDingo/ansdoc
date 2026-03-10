@@ -1231,3 +1231,160 @@ tasks/main.yml
 
 · При использовании нестандартных путей автоматический откат из резервной копии может не восстановить файлы в правильные места, так как архив не сохраняет полную структуру каталогов. В таком случае рекомендуется после выполнения вручную проверить состояние сертификатов или доработать роль под свои нужды.
 · Для ключей задаётся группа apache_key_group (ssl-cert на Ubuntu, root на Oracle Linux), чтобы обеспечить корректный доступ.
+
+
+
+Мы добавили поддержку произвольных локальных путей к исходным файлам сертификатов. Теперь можно указывать:
+
+· просто имя файла (тогда он ищется в поддиректории files/ роли), например: apache_cert_src: "Y1CAPDN.crt"
+· абсолютный путь на управляющей машине (начинается с /), например: apache_cert_src: "/tmp/Y1CAPDN.crt"
+
+Это позволяет гибко задавать местоположение новых сертификатов без необходимости копировать их внутрь структуры роли.
+
+Изменения в tasks/main.yml (ключевые блоки)
+
+Ниже приведён обновлённый код с комментариями. Замените соответствующие части вашего файла tasks/main.yml.
+
+1. Определение фактических локальных путей
+
+Добавьте эту задачу сразу после определения переменных ОС (или в начале раздела проверок):
+
+```yaml
+- name: Определить полные локальные пути к исходным файлам
+  set_fact:
+    local_cert_path: "{{ apache_cert_src if apache_cert_src.startswith('/') else role_path + '/files/' + apache_cert_src }}"
+    local_key_path: "{{ apache_key_src if apache_key_src.startswith('/') else role_path + '/files/' + apache_key_src }}"
+    local_chain_path: "{{ apache_chain_src if apache_chain_src.startswith('/') else (role_path + '/files/' + apache_chain_src) if apache_chain_src else '' }}"
+  run_once: true
+  tags: [always]
+```
+
+2. Проверка локальных файлов (используем вычисленные пути)
+
+```yaml
+- name: Проверить локальные файлы новых сертификатов
+  local_action: stat path="{{ item }}"
+  register: local_files_stat
+  loop:
+    - "{{ local_cert_path }}"
+    - "{{ local_key_path }}"
+  when: item != ''
+  run_once: true
+  tags: [always]
+```
+
+3. Проверка существования сертификата
+
+```yaml
+- name: Проверить существование файла сертификата
+  fail:
+    msg: "Файл сертификата {{ apache_cert_src }} не найден (искали по пути: {{ local_cert_path }})."
+  when: not local_files_stat.results[0].stat.exists
+  run_once: true
+  tags: [validate]
+```
+
+4. Проверка валидности (используем локальный путь)
+
+```yaml
+- name: Проверить валидность нового сертификата (локально)
+  local_action: command openssl x509 -in "{{ local_cert_path }}" -text -noout
+  changed_when: false
+  register: cert_validation
+  ignore_errors: yes
+  when: local_files_stat.results[0].stat.exists
+  run_once: true
+  tags: [validate]
+```
+
+5. Проверка ключа
+
+```yaml
+- name: Проверить существование файла ключа
+  fail:
+    msg: "Файл ключа {{ apache_key_src }} не найден (искали по пути: {{ local_key_path }})."
+  when: not local_files_stat.results[1].stat.exists
+  run_once: true
+  tags: [validate]
+```
+
+6. Проверка chain-файла (аналогично)
+
+```yaml
+- name: Проверить локальный chain файл (если указан)
+  local_action: stat path="{{ local_chain_path }}"
+  register: chain_stat
+  when: apache_chain_src != ''
+  run_once: true
+
+- name: Проверить существование chain файла (если указан)
+  fail:
+    msg: "Файл chain {{ apache_chain_src }} указан, но не найден (искали по пути: {{ local_chain_path }})."
+  when: apache_chain_src != '' and not chain_stat.stat.exists
+  run_once: true
+  tags: [validate]
+
+- name: Проверить валидность chain (если есть)
+  local_action: command openssl x509 -in "{{ local_chain_path }}" -text -noout
+  changed_when: false
+  register: chain_validation
+  ignore_errors: yes
+  when: apache_chain_src != '' and chain_stat.stat.exists
+  run_once: true
+```
+
+7. Вычисление контрольных сумм (используем локальные пути)
+
+```yaml
+- name: Вычислить контрольные суммы новых файлов (локально)
+  set_fact:
+    new_cert_checksum: "{{ local_files_stat.results[0].stat.checksum | default('') }}"
+    new_key_checksum: "{{ local_files_stat.results[1].stat.checksum | default('') }}"
+    new_chain_checksum: "{{ chain_stat.stat.checksum | default('') if apache_chain_src != '' else '' }}"
+  run_once: true
+  tags: [always]
+```
+
+8. Загрузка новых сертификатов (используем локальные пути в src)
+
+```yaml
+- name: Загрузить новые сертификаты на сервер
+  copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    mode: "{{ item.mode }}"
+    owner: root
+    group: "{{ item.group }}"
+    backup: no
+  loop:
+    - { src: "{{ local_cert_path }}", dest: "{{ apache_cert_file }}", mode: '0644', group: 'root' }
+    - { src: "{{ local_key_path }}", dest: "{{ apache_key_file }}", mode: '0640', group: "{{ apache_key_group }}" }
+    - { src: "{{ local_chain_path }}", dest: "{{ apache_chain_file }}", mode: '0644', group: 'root' }
+  when: item.src != '' and item.dest != ''
+  notify: перезапустить apache
+  tags: [deploy]
+```
+
+Пример использования с произвольным путём
+
+```yaml
+- hosts: apache_servers
+  become: yes
+  vars:
+    apache_cert_src: "/home/user/certs/Y1CAPDN.crt"
+    apache_key_src: "/home/user/certs/Y1CAPDN.key"
+    apache_chain_src: ""   # если не нужен
+    # можно также указать целевые пути, если они нестандартные
+    apache_cert_file: /etc/ssl/certs/Y1CAPDN.crt
+    apache_key_file: /etc/ssl/private/Y1CAPDN.key
+  roles:
+    - replace_apache_certs
+```
+
+Важные замечания
+
+· Переменная role_path автоматически доступна внутри роли и указывает на её корневую директорию.
+· Если файл не найден ни по абсолютному пути, ни в files/, выполнение прерывается с понятным сообщением, содержащим оба варианта.
+· При использовании относительных путей (не абсолютных) роль по-прежнему ищет файлы в files/ (стандартное поведение Ansible для копирования файлов из роли). Благодаря явному указанию role_path мы сохраняем совместимость и прозрачность.
+
+Теперь роль полностью поддерживает как локальные пути на control node (абсолютные), так и файлы внутри структуры роли (относительные).
