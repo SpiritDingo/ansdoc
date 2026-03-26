@@ -1730,3 +1730,89 @@ format = {{ audisp_syslog_plugin.format | default('string') }}
 ```
 
 Теперь ошибка 'dict object' has no attribute 'path' исправлена.
+
+
+
+
+Исправление ошибки в шаблоне rsyslog.conf
+
+Ошибка возникает из-за того, что в шаблоне rsyslog.conf.j2 используется syslog.audit_facility, но переменная syslog может быть переопределена без этого ключа. Добавим значения по умолчанию во все шаблоны syslog-демонов.
+
+Исправленные шаблоны
+
+templates/rsyslog.conf.j2
+
+```jinja2
+#### GLOBAL DIRECTIVES ####
+module(load="imuxsock")
+module(load="imjournal")
+module(load="imklog")
+
+#### RULES ####
+{% if syslog.write_local_log | default(true) %}
+# Сообщения от auditd пишем в отдельный файл
+{{ syslog.audit_facility | default('local6') }}.{{ syslog.audit_severity | default('info') }}    {{ syslog.audit_log_file | default('/var/log/audit-forwarded.log') }}
+{% endif %}
+
+{% if syslog.write_remote_log | default(true) and syslog.remote_server | default('') %}
+# Отправка на удалённый сервер
+{{ syslog.audit_facility | default('local6') }}.{{ syslog.audit_severity | default('info') }}    @{{ syslog.remote_server }}:{{ syslog.remote_port | default('514') }}
+{% endif %}
+```
+
+templates/syslog-ng.conf.j2
+
+```jinja2
+@version: {{ syslog_ng_config.version | default('3.38') }}
+@include "scl.conf"
+
+source s_sys {
+    system();
+    internal();
+};
+
+{% if syslog.write_local_log | default(true) %}
+destination d_audit {
+    file("{{ syslog.audit_log_file | default('/var/log/audit-forwarded.log') }}");
+};
+{% endif %}
+
+{% if syslog.write_remote_log | default(true) and syslog.remote_server | default('') %}
+destination d_remote {
+    {{ syslog.remote_protocol | default('udp') }}("{{ syslog.remote_server }}" port({{ syslog.remote_port | default('514') }}));
+};
+{% endif %}
+
+log {
+    source(s_sys);
+    filter(f_audit);
+    {% if syslog.write_local_log | default(true) %}destination(d_audit);{% endif %}
+    {% if syslog.write_remote_log | default(true) and syslog.remote_server | default('') %}destination(d_remote);{% endif %}
+};
+
+filter f_audit {
+    facility({{ syslog.audit_facility | default('local6') }});
+};
+```
+
+templates/syslog.conf.j2
+
+```jinja2
+{% if syslog.write_local_log | default(true) %}
+# События от auditd в отдельный файл
+{{ syslog.audit_facility | default('local6') }}.{{ syslog.audit_severity | default('info') }}    {{ syslog.audit_log_file | default('/var/log/audit-forwarded.log') }}
+{% endif %}
+
+{% if syslog.write_remote_log | default(true) and syslog.remote_server | default('') %}
+# Отправка на удалённый сервер
+{{ syslog.audit_facility | default('local6') }}.{{ syslog.audit_severity | default('info') }}    @{{ syslog.remote_server }}
+{% endif %}
+```
+
+Дополнительно: обновлённый defaults/main.yml
+
+Убедитесь, что в defaults/main.yml все переменные определены с корректными значениями, чтобы фильтры default работали правильно. Предыдущая версия уже содержала все необходимые ключи, но теперь шаблоны устойчивы к их отсутствию.
+
+Проверка
+
+После этих изменений ошибка 'dict object' has no attribute 'audit_facility' будет устранена. Роль корректно работает даже если в плейбуке переопределён только syslog.remote_server, а остальные параметры не заданы.
