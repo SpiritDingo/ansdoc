@@ -1486,3 +1486,247 @@ dependencies: []
 · Плагин audisp-syslog: настроен с использованием args для передачи facility (например, LOG_LOCAL6), что позволяет гибко маршрутизировать события аудита в syslog.
 
 Роль готова к использованию и корректно работает на RHEL/CentOS 7–9, Ubuntu 20.04/22.04, Debian 11/12.
+
+
+Исправление ошибки в шаблоне плагина syslog
+
+Ошибка возникает из-за того, что в переменной audisp_syslog_plugin отсутствует ключ path, но шаблон пытается его использовать. Это может произойти, если переменная переопределена в плейбуке или инвентори без указания всех полей.
+
+Решение: добавить значения по умолчанию в шаблоне
+
+Исправленный файл templates/syslog_plugin.conf.j2:
+
+```jinja2
+active = {{ 'yes' if (audisp_syslog_plugin.active | default(false)) else 'no' }}
+direction = {{ audisp_syslog_plugin.direction | default('out') }}
+path = {{ audisp_syslog_plugin.path | default('/sbin/audisp-syslog') }}
+type = {{ audisp_syslog_plugin.type | default('builtin') }}
+args = {{ audisp_syslog_plugin.args | default('') }}
+format = {{ audisp_syslog_plugin.format | default('string') }}
+```
+
+Полная обновлённая роль
+
+defaults/main.yml
+
+```yaml
+---
+syslog_daemon: rsyslog
+
+audit_package_name: "{{ 'audit' if ansible_os_family == 'RedHat' else 'auditd' }}"
+
+syslog_package_names:
+  rsyslog: "{{ 'rsyslog' if ansible_os_family == 'RedHat' else 'rsyslog' }}"
+  syslog-ng: "{{ 'syslog-ng' if ansible_os_family == 'RedHat' else 'syslog-ng' }}"
+  syslogd: "{{ 'rsyslog' if ansible_os_family == 'RedHat' else 'inetutils-syslogd' }}"
+
+auditd:
+  log_file: /var/log/audit/audit.log
+  log_format: RAW
+  log_group: root
+  priority_boost: 4
+  flush: INCREMENTAL
+  freq: 20
+  num_logs: 5
+  disp_qos: lossy
+  dispatcher: /sbin/audispd
+  name_format: NONE
+  max_log_file: 8
+  max_log_file_action: ROTATE
+  space_left: 75
+  space_left_action: SYSLOG
+  action_mail_acct: root
+  admin_space_left: 50
+  admin_space_left_action: SUSPEND
+  disk_full_action: SUSPEND
+  disk_error_action: SUSPEND
+
+audispd:
+  q_depth: 80
+  overflow_action: SYSLOG
+  priority_boost: 4
+  max_restarts: 10
+  name_format: HOSTNAME
+
+audisp_syslog_plugin:
+  active: yes
+  direction: out
+  path: /sbin/audisp-syslog
+  type: builtin
+  args: ""
+  format: string
+
+syslog:
+  audit_log_file: /var/log/audit-forwarded.log
+  remote_server: ""
+  remote_port: 514
+  remote_protocol: udp
+  audit_facility: local6
+  audit_severity: info
+  write_local_log: yes
+  write_remote_log: yes
+
+rsyslog_config:
+  modules:
+    - imuxsock
+    - imjournal
+  work_directory: /var/spool/rsyslog
+
+syslog_ng_config:
+  version: 3.38
+  include: /etc/syslog-ng/conf.d/*.conf
+```
+
+tasks/main.yml
+
+```yaml
+---
+- name: Установка auditd
+  package:
+    name: "{{ audit_package_name }}"
+    state: present
+
+- name: Установка выбранного syslog-демона
+  package:
+    name: "{{ syslog_package_names[syslog_daemon] }}"
+    state: present
+  when: syslog_daemon in syslog_package_names
+
+- name: Создание директории для плагинов audisp
+  file:
+    path: /etc/audit/plugins.d
+    state: directory
+    owner: root
+    group: root
+    mode: 0755
+
+- name: Копирование конфигурации auditd
+  template:
+    src: auditd.conf.j2
+    dest: /etc/audit/auditd.conf
+    owner: root
+    group: root
+    mode: 0640
+  notify: restart auditd
+
+- name: Копирование конфигурации audispd
+  template:
+    src: audispd.conf.j2
+    dest: /etc/audit/audispd.conf
+    owner: root
+    group: root
+    mode: 0640
+  notify: restart auditd
+
+- name: Копирование конфигурации плагина syslog для audispd
+  template:
+    src: syslog_plugin.conf.j2
+    dest: /etc/audit/plugins.d/syslog.conf
+    owner: root
+    group: root
+    mode: 0640
+  notify: restart auditd
+
+- name: Настройка rsyslog
+  block:
+    - name: Копирование конфигурации rsyslog
+      template:
+        src: rsyslog.conf.j2
+        dest: /etc/rsyslog.conf
+        owner: root
+        group: root
+        mode: 0644
+      notify: restart rsyslog
+  when: syslog_daemon == "rsyslog"
+
+- name: Настройка syslog-ng
+  block:
+    - name: Копирование конфигурации syslog-ng
+      template:
+        src: syslog-ng.conf.j2
+        dest: /etc/syslog-ng/syslog-ng.conf
+        owner: root
+        group: root
+        mode: 0644
+      notify: restart syslog-ng
+  when: syslog_daemon == "syslog-ng"
+
+- name: Настройка классического syslogd
+  block:
+    - name: Копирование конфигурации syslogd
+      template:
+        src: syslog.conf.j2
+        dest: /etc/syslog.conf
+        owner: root
+        group: root
+        mode: 0644
+      notify: restart syslogd
+  when: syslog_daemon == "syslogd"
+
+- name: Запуск и включение auditd
+  service:
+    name: auditd
+    state: started
+    enabled: yes
+
+- name: Запуск и включение syslog-демона
+  service:
+    name: "{{ syslog_daemon }}"
+    state: started
+    enabled: yes
+```
+
+handlers/main.yml (без изменений)
+
+```yaml
+---
+- name: restart auditd
+  service:
+    name: auditd
+    state: restarted
+
+- name: restart rsyslog
+  service:
+    name: rsyslog
+    state: restarted
+
+- name: restart syslog-ng
+  service:
+    name: syslog-ng
+    state: restarted
+
+- name: restart syslogd
+  service:
+    name: syslogd
+    state: restarted
+```
+
+templates/syslog_plugin.conf.j2 (исправлен)
+
+```jinja2
+active = {{ 'yes' if (audisp_syslog_plugin.active | default(false)) else 'no' }}
+direction = {{ audisp_syslog_plugin.direction | default('out') }}
+path = {{ audisp_syslog_plugin.path | default('/sbin/audisp-syslog') }}
+type = {{ audisp_syslog_plugin.type | default('builtin') }}
+args = {{ audisp_syslog_plugin.args | default('') }}
+format = {{ audisp_syslog_plugin.format | default('string') }}
+```
+
+Остальные шаблоны остаются без изменений (приведены ранее).
+
+Примечание
+
+Если вы используете переопределение audisp_syslog_plugin в плейбуке, убедитесь, что вы не удалили необходимые ключи. Например:
+
+```yaml
+- hosts: all
+  vars:
+    audisp_syslog_plugin:
+      active: yes
+      args: "LOG_LOCAL6"
+      # path, direction, type, format будут взяты из defaults благодаря фильтру default()
+  roles:
+    - audit_syslog
+```
+
+Теперь ошибка 'dict object' has no attribute 'path' исправлена.
