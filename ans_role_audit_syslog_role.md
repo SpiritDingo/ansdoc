@@ -386,3 +386,70 @@ syslog_package_rsyslog_debian: rsyslog
 · Для применения правил аудита (например, добавление своих watch) роль можно расширить задачами, которые копируют файлы правил в /etc/audit/rules.d/.
 
 Данная роль даёт гибкость в выборе syslog-демона и полностью настраивает отправку событий аудита в системный журнал, что удобно для централизованного сбора логов безопасности.
+
+
+
+
+------------------------------
+
+
+
+
+Ошибка возникает из-за того, что в шаблоне syslog_plugin.conf.j2 используется переменная audisp_syslog_plugin.direction, но в словаре audisp_syslog_plugin нет ключа direction. Это может быть вызвано тем, что переменная не полностью определена в defaults/main.yml или переопределена в другом месте без этого ключа.
+
+Решение
+
+1. Добавить недостающий ключ в defaults/main.yml
+
+Убедитесь, что структура audisp_syslog_plugin содержит все необходимые поля, включая direction:
+
+```yaml
+audisp_syslog_plugin:
+  active: yes
+  direction: out          # обязательно
+  path: /sbin/audisp-syslog
+  type: builtin
+  args: ""                # опционально
+  format: string          # опционально
+```
+
+2. Использовать в шаблоне фильтр default() для защиты от отсутствующих ключей
+
+Измените templates/syslog_plugin.conf.j2:
+
+```jinja2
+active = {{ 'yes' if audisp_syslog_plugin.active else 'no' }}
+direction = {{ audisp_syslog_plugin.direction | default('out') }}
+path = {{ audisp_syslog_plugin.path }}
+type = {{ audisp_syslog_plugin.type }}
+args = {{ audisp_syslog_plugin.args | default('') }}
+format = {{ audisp_syslog_plugin.format | default('string') }}
+```
+
+3. Проверьте переопределение переменных в плейбуке
+
+Если вы задаёте audisp_syslog_plugin в плейбуке или инвентори, убедитесь, что указаны все ключи, например:
+
+```yaml
+- hosts: all
+  vars:
+    audisp_syslog_plugin:
+      active: yes
+      direction: out
+      path: /sbin/audisp-syslog
+      type: builtin
+      args: "LOG_LOCAL6"
+      format: string
+  roles:
+    - audit-syslog-role
+```
+
+Почему это произошло?
+
+· В defaults/main.yml либо отсутствовал ключ direction, либо он был случайно удалён при редактировании.
+· Или вы переопределили audisp_syslog_plugin в другом месте, но не включили direction.
+· Ansible ожидает, что атрибут существует, и выдает ошибку, если его нет.
+
+Рекомендация
+
+Всегда задавайте полные структуры переменных в defaults и используйте фильтр default() в шаблонах для критически важных атрибутов. Это повышает устойчивость роли к частичным переопределениям.
