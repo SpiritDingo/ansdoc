@@ -909,3 +909,176 @@ dependencies: []
 · Если задан remote_server, проверьте отправку на удалённый syslog-сервер.
 
 Эта роль теперь корректно обрабатывает все предыдущие ошибки и готова к использованию.
+
+----------------------fix------------------
+
+Обновлённая роль с параметрами write_log
+
+Добавлены переменные write_local_log и write_remote_log в секцию syslog для гибкого управления записью событий аудита в локальный файл и на удалённый сервер. Это позволяет отдельно включать/отключать каждый канал логирования.
+
+Обновлённый defaults/main.yml
+
+```yaml
+---
+# Выбор демона syslog: "rsyslog", "syslog-ng" или "syslogd"
+syslog_daemon: rsyslog
+
+# Настройки auditd
+auditd:
+  log_file: /var/log/audit/audit.log
+  log_format: RAW
+  log_group: root
+  priority_boost: 4
+  flush: INCREMENTAL
+  freq: 20
+  num_logs: 5
+  disp_qos: lossy
+  dispatcher: /sbin/audispd
+  name_format: NONE
+  max_log_file: 8
+  max_log_file_action: ROTATE
+  space_left: 75
+  space_left_action: SYSLOG
+  action_mail_acct: root
+  admin_space_left: 50
+  admin_space_left_action: SUSPEND
+  disk_full_action: SUSPEND
+  disk_error_action: SUSPEND
+
+# Настройки audispd (общие)
+audispd:
+  q_depth: 80
+  overflow_action: SYSLOG
+  priority_boost: 4
+  max_restarts: 10
+  name_format: HOSTNAME
+
+# Конфигурация плагина syslog для audispd
+audisp_syslog_plugin:
+  active: yes
+  direction: out
+  path: /sbin/audisp-syslog
+  type: builtin
+  args: ""                # можно указать facility, например "LOG_LOCAL6"
+  format: string
+
+# Общие настройки syslog (для всех демонов)
+syslog:
+  # Файл, куда будут писаться события аудита (локально)
+  audit_log_file: /var/log/audit-forwarded.log
+  # Удалённый сервер (опционально)
+  remote_server: ""
+  remote_port: 514
+  remote_protocol: udp   # udp или tcp
+  # Facility и severity для событий аудита (используется в правилах)
+  audit_facility: local6
+  audit_severity: info
+  # Флаги управления записью
+  write_local_log: yes    # записывать ли в локальный файл
+  write_remote_log: yes   # отправлять ли на удалённый сервер (если задан)
+
+# Специфичные настройки для rsyslog (дополнительно)
+rsyslog_config:
+  modules:
+    - imuxsock
+    - imjournal
+  work_directory: /var/spool/rsyslog
+
+# Специфичные настройки для syslog-ng
+syslog_ng_config:
+  version: 3.38
+  include: /etc/syslog-ng/conf.d/*.conf
+```
+
+Обновлённые шаблоны syslog-демонов
+
+templates/rsyslog.conf.j2
+
+```jinja2
+#### GLOBAL DIRECTIVES ####
+module(load="imuxsock")
+module(load="imjournal")
+module(load="imklog")
+
+#### RULES ####
+{% if syslog.write_local_log %}
+# Сообщения от auditd (facility local6) пишем в отдельный файл
+{{ syslog.audit_facility }}.{{ syslog.audit_severity }}    {{ syslog.audit_log_file }}
+{% endif %}
+
+{% if syslog.write_remote_log and syslog.remote_server %}
+# Отправка на удалённый сервер
+{{ syslog.audit_facility }}.{{ syslog.audit_severity }}    @{{ syslog.remote_server }}:{{ syslog.remote_port }}
+{% endif %}
+```
+
+templates/syslog-ng.conf.j2
+
+```jinja2
+@version: {{ syslog_ng_config.version }}
+@include "scl.conf"
+
+source s_sys {
+    system();
+    internal();
+};
+
+{% if syslog.write_local_log %}
+destination d_audit {
+    file("{{ syslog.audit_log_file }}");
+};
+{% endif %}
+
+{% if syslog.write_remote_log and syslog.remote_server %}
+destination d_remote {
+    {{ 'udp' if syslog.remote_protocol == 'udp' else 'tcp' }}("{{ syslog.remote_server }}" port({{ syslog.remote_port }}));
+};
+{% endif %}
+
+log {
+    source(s_sys);
+    filter(f_audit);
+    {% if syslog.write_local_log %}destination(d_audit);{% endif %}
+    {% if syslog.write_remote_log and syslog.remote_server %}destination(d_remote);{% endif %}
+};
+
+filter f_audit {
+    facility({{ syslog.audit_facility }});
+};
+```
+
+templates/syslog.conf.j2 (для классического syslogd)
+
+```jinja2
+{% if syslog.write_local_log %}
+# События local6 в отдельный файл
+{{ syslog.audit_facility }}.{{ syslog.audit_severity }}    {{ syslog.audit_log_file }}
+{% endif %}
+
+{% if syslog.write_remote_log and syslog.remote_server %}
+# Отправка на удалённый сервер
+{{ syslog.audit_facility }}.{{ syslog.audit_severity }}    @{{ syslog.remote_server }}
+{% endif %}
+```
+
+Дополнительные пояснения
+
+· write_local_log: если yes (по умолчанию), то в конфигурации syslog-демона создаётся правило записи в локальный файл, указанный в audit_log_file.
+· write_remote_log: если yes (по умолчанию) и задан remote_server, то в конфигурацию добавляется правило отправки на удалённый сервер.
+· Оба флага работают независимо, позволяя, например, писать локально, но не отправлять на удалённый сервер, и наоборот.
+
+Пример использования
+
+```yaml
+- hosts: all
+  vars:
+    syslog_daemon: rsyslog
+    syslog:
+      remote_server: "192.168.1.100"
+      write_local_log: no        # не писать локально
+      write_remote_log: yes      # только отправлять на сервер
+  roles:
+    - audit_syslog
+```
+
+Теперь роль позволяет гибко управлять записью логов через параметры write_local_log и write_remote_log.
