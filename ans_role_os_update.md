@@ -421,3 +421,320 @@ Playbook остаётся прежним:
 · Для более структурированного логирования можно использовать JSON-формат и модуль ansible.builtin.copy с content: "{{ log_data | to_nice_json }}".
 
 Этот подход обеспечивает полную прозрачность действий роли и упрощает отладку.
+
+
+------------------
+
+Понял, нужно, чтобы лог создавался на сервере, с которого запускается Ansible (control node), а не на целевых хостах.
+
+Адаптируем роль: после выполнения обновления на каждом целевом хосте будем формировать запись лога и дописывать её в файл на управляющем узле. Для этого используем delegate_to: localhost с модулем copy (или lineinfile для дописывания).
+
+Изменения в роли
+
+1. Добавим переменную для пути к логам (например, в vars/main.yml)
+
+```yaml
+# vars/main.yml
+log_dir: "{{ playbook_dir }}/logs"
+```
+
+2. В tasks/main.yml создадим директорию на контроллере, если её нет
+
+```yaml
+- name: Ensure log directory exists on control node
+  ansible.builtin.file:
+    path: "{{ log_dir }}"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  run_once: true
+```
+
+3. В tasks/debian.yml после обновления дописываем лог в локальный файл
+
+```yaml
+- name: Write update log to control node
+  ansible.builtin.lineinfile:
+    path: "{{ log_dir }}/os_update_{{ ansible_date_time.date }}.log"
+    line: |
+      ---
+      Timestamp: {{ ansible_date_time.iso8601 }}
+      Host: {{ inventory_hostname }}
+      OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+      
+      === Held packages check ===
+      {{ held_packages.stdout | default('No held packages') }}
+      
+      === Unhold operation ===
+      {{ unhold_result.stdout | default('No unhold performed') }}
+      {{ unhold_result.stderr | default('') }}
+      
+      === APT update ===
+      {{ apt_update_result.stdout | default('') }}
+      {{ apt_update_result.stderr | default('') }}
+      
+      === APT upgrade ===
+      {{ apt_upgrade_result.stdout | default('') }}
+      {{ apt_upgrade_result.stderr | default('') }}
+    insertafter: EOF
+    create: yes
+  delegate_to: localhost
+  when: apt_upgrade_result is defined
+```
+
+Но lineinfile не поддерживает многострочный line напрямую (можно добавить с помощью blockinfile). Удобнее использовать blockinfile для вставки многострочного блока в конец файла:
+
+```yaml
+- name: Write update log to control node
+  ansible.builtin.blockinfile:
+    path: "{{ log_dir }}/os_update_{{ ansible_date_time.date }}.log"
+    block: |
+      ---
+      Timestamp: {{ ansible_date_time.iso8601 }}
+      Host: {{ inventory_hostname }}
+      OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+      
+      === Held packages check ===
+      {{ held_packages.stdout | default('No held packages') }}
+      
+      === Unhold operation ===
+      {{ unhold_result.stdout | default('No unhold performed') }}
+      {{ unhold_result.stderr | default('') }}
+      
+      === APT update ===
+      {{ apt_update_result.stdout | default('') }}
+      {{ apt_update_result.stderr | default('') }}
+      
+      === APT upgrade ===
+      {{ apt_upgrade_result.stdout | default('') }}
+      {{ apt_upgrade_result.stderr | default('') }}
+      
+    marker: "# {mark} ANSIBLE MANAGED BLOCK {{ inventory_hostname }}"
+    create: yes
+  delegate_to: localhost
+  when: apt_upgrade_result is defined
+```
+
+blockinfile позволяет вставлять блок с разделителями, но если мы хотим просто дописывать логи с разделителем между записями, лучше использовать lineinfile с line и insertafter: EOF, но многострочный текст в line не подойдёт. Альтернатива: использовать copy с content, но тогда файл будет перезаписываться каждый раз для каждого хоста, что не годится. Поэтому blockinfile – хороший вариант.
+
+Однако blockinfile вставляет блок с маркерами, и если маркеры уникальны для каждого хоста, то блоки будут добавляться последовательно. Можно использовать маркер # {mark} {{ inventory_hostname }}, тогда каждый хост получит свой блок. Это нормально, но может создать много блоков. Если нужно просто дописывать в конец без маркеров, можно использовать lineinfile с line и insertafter: EOF, но тогда каждая строка лога будет отдельной записью. Проще всего – использовать copy с content и dest на контроллере, но с уникальным именем файла для каждого хоста (тогда не будет проблем с перезаписью). Это проще.
+
+Альтернативный подход: создавать отдельный лог-файл для каждого хоста
+
+```yaml
+- name: Write update log to control node
+  ansible.builtin.copy:
+    content: |
+      ---
+      Timestamp: {{ ansible_date_time.iso8601 }}
+      Host: {{ inventory_hostname }}
+      OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+      
+      === Held packages check ===
+      {{ held_packages.stdout | default('No held packages') }}
+      
+      === Unhold operation ===
+      {{ unhold_result.stdout | default('No unhold performed') }}
+      {{ unhold_result.stderr | default('') }}
+      
+      === APT update ===
+      {{ apt_update_result.stdout | default('') }}
+      {{ apt_update_result.stderr | default('') }}
+      
+      === APT upgrade ===
+      {{ apt_upgrade_result.stdout | default('') }}
+      {{ apt_upgrade_result.stderr | default('') }}
+    dest: "{{ log_dir }}/{{ inventory_hostname }}_os_update_{{ ansible_date_time.epoch }}.log"
+    mode: '0644'
+  delegate_to: localhost
+  when: apt_upgrade_result is defined
+```
+
+Этот подход проще, но создаёт много файлов. Пользователь может выбрать.
+
+Я предложу вариант с отдельными файлами на контроллере для каждого хоста, так как это наиболее чисто и не требует сложных манипуляций с вставкой блоков.
+
+Итоговая роль с логированием на контроллере
+
+Обновлённые файлы
+
+tasks/main.yml
+
+```yaml
+---
+- name: Include OS‑specific variables (optional)
+  include_vars: "{{ ansible_os_family }}.yml"
+  ignore_errors: yes
+
+- name: Ensure log directory exists on control node
+  ansible.builtin.file:
+    path: "{{ log_dir | default(playbook_dir + '/logs') }}"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  run_once: true
+
+- name: Update system for Debian family
+  include_tasks: debian.yml
+  when: ansible_os_family == "Debian"
+
+- name: Update system for RedHat family
+  include_tasks: redhat.yml
+  when: ansible_os_family == "RedHat"
+```
+
+tasks/debian.yml (только логирование на контроллере)
+
+```yaml
+---
+- name: Check for running apt or dpkg processes
+  ansible.builtin.command: pgrep -f "apt|dpkg"
+  register: apt_processes
+  changed_when: false
+  failed_when: false
+
+- name: Wait for package managers to finish
+  ansible.builtin.wait_for:
+    path: /var/lib/dpkg/lock
+    state: absent
+    timeout: 300
+  when: apt_processes.stdout != ""
+  ignore_errors: yes
+
+- name: Get held packages
+  ansible.builtin.command: apt-mark showhold
+  register: held_packages
+  changed_when: false
+  failed_when: false
+
+- name: Unhold packages if any
+  ansible.builtin.command: apt-mark unhold {{ held_packages.stdout_lines | join(' ') }}
+  when: held_packages.stdout != ""
+  changed_when: true
+  register: unhold_result
+  ignore_errors: yes
+
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: yes
+    cache_valid_time: 3600
+  register: apt_update_result
+
+- name: Upgrade all packages
+  ansible.builtin.apt:
+    upgrade: dist
+    update_cache: no
+  register: apt_upgrade_result
+
+- name: Write update log to control node (Debian)
+  ansible.builtin.copy:
+    content: |
+      ---
+      Timestamp: {{ ansible_date_time.iso8601 }}
+      Host: {{ inventory_hostname }}
+      OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+      
+      === Held packages check ===
+      {{ held_packages.stdout | default('No held packages') }}
+      
+      === Unhold operation ===
+      {{ unhold_result.stdout | default('No unhold performed') }}
+      {{ unhold_result.stderr | default('') }}
+      
+      === APT update ===
+      {{ apt_update_result.stdout | default('') }}
+      {{ apt_update_result.stderr | default('') }}
+      
+      === APT upgrade ===
+      {{ apt_upgrade_result.stdout | default('') }}
+      {{ apt_upgrade_result.stderr | default('') }}
+    dest: "{{ log_dir | default(playbook_dir + '/logs') }}/{{ inventory_hostname }}_os_update_{{ ansible_date_time.epoch }}.log"
+    mode: '0644'
+  delegate_to: localhost
+  when: apt_upgrade_result is defined
+```
+
+tasks/redhat.yml (аналогично)
+
+```yaml
+---
+- name: Check for running yum or dnf processes
+  ansible.builtin.command: pgrep -f "yum|dnf"
+  register: rpm_processes
+  changed_when: false
+  failed_when: false
+
+- name: Wait for package managers to finish
+  ansible.builtin.wait_for:
+    path: /var/run/yum.pid
+    state: absent
+    timeout: 300
+  when: rpm_processes.stdout != ""
+  ignore_errors: yes
+
+- name: Get versionlock packages
+  ansible.builtin.command: yum versionlock list
+  register: versionlock_packages
+  changed_when: false
+  failed_when: false
+  ignore_errors: yes
+
+- name: Clear versionlock if any
+  ansible.builtin.command: yum versionlock clear
+  when: versionlock_packages.stdout != ""
+  changed_when: true
+  register: versionlock_clear_result
+  ignore_errors: yes
+
+- name: Update all packages
+  ansible.builtin.yum:
+    name: '*'
+    state: latest
+    update_cache: yes
+  register: yum_upgrade_result
+
+- name: Write update log to control node (RedHat)
+  ansible.builtin.copy:
+    content: |
+      ---
+      Timestamp: {{ ansible_date_time.iso8601 }}
+      Host: {{ inventory_hostname }}
+      OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+      
+      === Versionlock packages ===
+      {{ versionlock_packages.stdout | default('No versionlock entries') }}
+      
+      === Versionlock clear operation ===
+      {{ versionlock_clear_result.stdout | default('No clear performed') }}
+      {{ versionlock_clear_result.stderr | default('') }}
+      
+      === YUM/DNF upgrade ===
+      {{ yum_upgrade_result.stdout | default('') }}
+      {{ yum_upgrade_result.stderr | default('') }}
+    dest: "{{ log_dir | default(playbook_dir + '/logs') }}/{{ inventory_hostname }}_os_update_{{ ansible_date_time.epoch }}.log"
+    mode: '0644'
+  delegate_to: localhost
+  when: yum_upgrade_result is defined
+```
+
+vars/main.yml (опционально)
+
+```yaml
+---
+log_dir: "{{ playbook_dir }}/logs"
+```
+
+Использование
+
+Playbook остаётся без изменений:
+
+```yaml
+- hosts: all
+  become: yes
+  roles:
+    - os_update
+```
+
+Логи будут сохраняться в директории logs/ рядом с playbook (или в указанной переменной log_dir) с именем <hostname>_os_update_<timestamp>.log. На каждом целевом хосте файл создаётся на контроллере с полным отчётом.
+
+Этот подход удобен для последующего анализа и не требует доступа на запись на целевых хостах для логирования.
