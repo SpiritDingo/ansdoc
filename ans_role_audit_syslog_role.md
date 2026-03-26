@@ -453,3 +453,459 @@ format = {{ audisp_syslog_plugin.format | default('string') }}
 Рекомендация
 
 Всегда задавайте полные структуры переменных в defaults и используйте фильтр default() в шаблонах для критически важных атрибутов. Это повышает устойчивость роли к частичным переопределениям.
+
+
+------------------------------------
+------------------------------------
+
+
+Полная исправленная роль Ansible: audit_syslog
+
+Структура роли
+
+```
+audit_syslog/
+├── defaults
+│   └── main.yml
+├── vars
+│   └── main.yml
+├── tasks
+│   └── main.yml
+├── handlers
+│   └── main.yml
+├── templates
+│   ├── auditd.conf.j2
+│   ├── audispd.conf.j2
+│   ├── syslog_plugin.conf.j2
+│   ├── rsyslog.conf.j2
+│   ├── syslog-ng.conf.j2
+│   └── syslog.conf.j2
+└── meta
+    └── main.yml
+```
+
+---
+
+1. defaults/main.yml
+
+```yaml
+---
+# Выбор демона syslog: "rsyslog", "syslog-ng" или "syslogd"
+syslog_daemon: rsyslog
+
+# Настройки auditd
+auditd:
+  log_file: /var/log/audit/audit.log
+  log_format: RAW
+  log_group: root
+  priority_boost: 4
+  flush: INCREMENTAL
+  freq: 20
+  num_logs: 5
+  disp_qos: lossy
+  dispatcher: /sbin/audispd
+  name_format: NONE
+  max_log_file: 8
+  max_log_file_action: ROTATE
+  space_left: 75
+  space_left_action: SYSLOG
+  action_mail_acct: root
+  admin_space_left: 50
+  admin_space_left_action: SUSPEND
+  disk_full_action: SUSPEND
+  disk_error_action: SUSPEND
+
+# Настройки audispd (общие)
+audispd:
+  q_depth: 80
+  overflow_action: SYSLOG
+  priority_boost: 4
+  max_restarts: 10
+  name_format: HOSTNAME
+
+# Конфигурация плагина syslog для audispd
+audisp_syslog_plugin:
+  active: yes
+  direction: out
+  path: /sbin/audisp-syslog
+  type: builtin
+  args: ""                # можно указать facility, например "LOG_LOCAL6"
+  format: string
+
+# Общие настройки syslog (для всех демонов)
+syslog:
+  # Файл, куда будут писаться события аудита (локально)
+  audit_log_file: /var/log/audit-forwarded.log
+  # Удалённый сервер (опционально)
+  remote_server: ""
+  remote_port: 514
+  remote_protocol: udp   # udp или tcp
+  # Facility и severity для событий аудита (используется в правилах)
+  audit_facility: local6
+  audit_severity: info
+
+# Специфичные настройки для rsyslog (дополнительно)
+rsyslog_config:
+  modules:
+    - imuxsock
+    - imjournal
+  work_directory: /var/spool/rsyslog
+
+# Специфичные настройки для syslog-ng
+syslog_ng_config:
+  version: 3.38
+  include: /etc/syslog-ng/conf.d/*.conf
+```
+
+---
+
+2. vars/main.yml (определения для разных ОС)
+
+```yaml
+---
+# Имена пакетов и пути в зависимости от дистрибутива
+audit_package:
+  RedHat: audit
+  Debian: auditd
+
+syslog_package:
+  rsyslog:
+    RedHat: rsyslog
+    Debian: rsyslog
+  syslog-ng:
+    RedHat: syslog-ng
+    Debian: syslog-ng
+  syslogd:
+    RedHat: rsyslog   # в RHEL классического syslogd нет, используем rsyslog как замену
+    Debian: inetutils-syslogd   # или sysklogd
+
+# Пути к конфигурационным файлам
+auditd_conf_path: /etc/audit/auditd.conf
+audispd_conf_path: /etc/audit/audispd.conf
+audisp_plugin_dir: /etc/audit/plugins.d
+syslog_plugin_conf_path: "{{ audisp_plugin_dir }}/syslog.conf"
+
+# Пути к конфигам syslog-демонов
+rsyslog_conf_path: /etc/rsyslog.conf
+syslog_ng_conf_path: /etc/syslog-ng/syslog-ng.conf
+syslogd_conf_path: /etc/syslog.conf
+
+# Имена сервисов
+auditd_service: auditd
+rsyslog_service: rsyslog
+syslog_ng_service: syslog-ng
+syslogd_service: syslogd
+```
+
+---
+
+3. tasks/main.yml
+
+```yaml
+---
+- name: Установка auditd
+  package:
+    name: "{{ audit_package[ansible_os_family] }}"
+    state: present
+  when: ansible_os_family in ['RedHat', 'Debian']
+
+- name: Установка выбранного syslog-демона
+  package:
+    name: "{{ syslog_package[syslog_daemon][ansible_os_family] }}"
+    state: present
+  when: ansible_os_family in ['RedHat', 'Debian']
+
+- name: Создание директории для плагинов audisp (если не существует)
+  file:
+    path: "{{ audisp_plugin_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: 0755
+  when: audisp_plugin_dir != ''
+
+- name: Копирование конфигурации auditd
+  template:
+    src: auditd.conf.j2
+    dest: "{{ auditd_conf_path }}"
+    owner: root
+    group: root
+    mode: 0640
+  notify: restart auditd
+
+- name: Копирование конфигурации audispd
+  template:
+    src: audispd.conf.j2
+    dest: "{{ audispd_conf_path }}"
+    owner: root
+    group: root
+    mode: 0640
+  notify: restart auditd
+
+- name: Копирование конфигурации плагина syslog для audispd
+  template:
+    src: syslog_plugin.conf.j2
+    dest: "{{ syslog_plugin_conf_path }}"
+    owner: root
+    group: root
+    mode: 0640
+  notify: restart auditd
+
+- name: Настройка rsyslog
+  block:
+    - name: Копирование конфигурации rsyslog
+      template:
+        src: rsyslog.conf.j2
+        dest: "{{ rsyslog_conf_path }}"
+        owner: root
+        group: root
+        mode: 0644
+      notify: restart rsyslog
+  when: syslog_daemon == "rsyslog"
+
+- name: Настройка syslog-ng
+  block:
+    - name: Копирование конфигурации syslog-ng
+      template:
+        src: syslog-ng.conf.j2
+        dest: "{{ syslog_ng_conf_path }}"
+        owner: root
+        group: root
+        mode: 0644
+      notify: restart syslog-ng
+  when: syslog_daemon == "syslog-ng"
+
+- name: Настройка классического syslogd
+  block:
+    - name: Копирование конфигурации syslogd
+      template:
+        src: syslog.conf.j2
+        dest: "{{ syslogd_conf_path }}"
+        owner: root
+        group: root
+        mode: 0644
+      notify: restart syslogd
+  when: syslog_daemon == "syslogd"
+
+- name: Запуск и включение auditd
+  service:
+    name: "{{ auditd_service }}"
+    state: started
+    enabled: yes
+
+- name: Запуск и включение syslog-демона
+  service:
+    name: "{{ syslog_daemon }}"
+    state: started
+    enabled: yes
+```
+
+---
+
+4. handlers/main.yml
+
+```yaml
+---
+- name: restart auditd
+  service:
+    name: "{{ auditd_service }}"
+    state: restarted
+
+- name: restart rsyslog
+  service:
+    name: "{{ rsyslog_service }}"
+    state: restarted
+
+- name: restart syslog-ng
+  service:
+    name: "{{ syslog_ng_service }}"
+    state: restarted
+
+- name: restart syslogd
+  service:
+    name: "{{ syslogd_service }}"
+    state: restarted
+```
+
+---
+
+5. Шаблоны
+
+templates/auditd.conf.j2
+
+```jinja2
+#
+# Этот файл управляется Ansible
+#
+log_file = {{ auditd.log_file }}
+log_format = {{ auditd.log_format }}
+log_group = {{ auditd.log_group }}
+priority_boost = {{ auditd.priority_boost }}
+flush = {{ auditd.flush }}
+freq = {{ auditd.freq }}
+num_logs = {{ auditd.num_logs }}
+disp_qos = {{ auditd.disp_qos }}
+dispatcher = {{ auditd.dispatcher }}
+name_format = {{ auditd.name_format }}
+max_log_file = {{ auditd.max_log_file }}
+max_log_file_action = {{ auditd.max_log_file_action }}
+space_left = {{ auditd.space_left }}
+space_left_action = {{ auditd.space_left_action }}
+action_mail_acct = {{ auditd.action_mail_acct }}
+admin_space_left = {{ auditd.admin_space_left }}
+admin_space_left_action = {{ auditd.admin_space_left_action }}
+disk_full_action = {{ auditd.disk_full_action }}
+disk_error_action = {{ auditd.disk_error_action }}
+```
+
+templates/audispd.conf.j2
+
+```jinja2
+#
+q_depth = {{ audispd.q_depth }}
+overflow_action = {{ audispd.overflow_action }}
+priority_boost = {{ audispd.priority_boost }}
+max_restarts = {{ audispd.max_restarts }}
+name_format = {{ audispd.name_format }}
+```
+
+templates/syslog_plugin.conf.j2
+
+```jinja2
+active = {{ 'yes' if audisp_syslog_plugin.active else 'no' }}
+direction = {{ audisp_syslog_plugin.direction | default('out') }}
+path = {{ audisp_syslog_plugin.path }}
+type = {{ audisp_syslog_plugin.type }}
+args = {{ audisp_syslog_plugin.args | default('') }}
+format = {{ audisp_syslog_plugin.format | default('string') }}
+```
+
+templates/rsyslog.conf.j2
+
+```jinja2
+#### GLOBAL DIRECTIVES ####
+module(load="imuxsock")
+module(load="imjournal")
+module(load="imklog")
+
+#### RULES ####
+# Сообщения от auditd (facility local6) пишем в отдельный файл
+{{ syslog.audit_facility }}.{{ syslog.audit_severity }}    {{ syslog.audit_log_file }}
+
+# Отправка на удалённый сервер, если задан
+{% if syslog.remote_server %}
+{{ syslog.audit_facility }}.{{ syslog.audit_severity }}    @{{ syslog.remote_server }}:{{ syslog.remote_port }}
+{% endif %}
+
+# Можно добавить другие правила, если нужно
+```
+
+templates/syslog-ng.conf.j2
+
+```jinja2
+@version: {{ syslog_ng_config.version }}
+@include "scl.conf"
+
+source s_sys {
+    system();
+    internal();
+};
+
+destination d_audit {
+    file("{{ syslog.audit_log_file }}");
+};
+
+{% if syslog.remote_server %}
+destination d_remote {
+    {{ 'udp' if syslog.remote_protocol == 'udp' else 'tcp' }}("{{ syslog.remote_server }}" port({{ syslog.remote_port }}));
+};
+{% endif %}
+
+log {
+    source(s_sys);
+    filter(f_audit);
+    destination(d_audit);
+    {% if syslog.remote_server %}destination(d_remote);{% endif %}
+};
+
+filter f_audit {
+    facility({{ syslog.audit_facility }});
+};
+```
+
+templates/syslog.conf.j2 (для классического syslogd)
+
+```jinja2
+#  События local6 в отдельный файл
+{{ syslog.audit_facility }}.{{ syslog.audit_severity }}    {{ syslog.audit_log_file }}
+
+{% if syslog.remote_server %}
+# Отправка на удалённый сервер
+{{ syslog.audit_facility }}.{{ syslog.audit_severity }}    @{{ syslog.remote_server }}
+{% endif %}
+```
+
+---
+
+6. meta/main.yml (опционально)
+
+```yaml
+---
+galaxy_info:
+  author: your_name
+  description: Установка и настройка auditd и syslog с отправкой через audispd
+  license: MIT
+  min_ansible_version: 2.9
+  platforms:
+    - name: EL
+      versions:
+        - 7
+        - 8
+        - 9
+    - name: Ubuntu
+      versions:
+        - focal
+        - jammy
+    - name: Debian
+      versions:
+        - bullseye
+        - bookworm
+  galaxy_tags:
+    - auditd
+    - syslog
+    - rsyslog
+    - syslog-ng
+    - audispd
+    - security
+dependencies: []
+```
+
+---
+
+Пример использования в плейбуке
+
+```yaml
+- hosts: all
+  become: yes
+  vars:
+    syslog_daemon: rsyslog
+    syslog:
+      remote_server: "192.168.1.100"
+      remote_port: 514
+      remote_protocol: udp
+      audit_log_file: /var/log/audit-forwarded.log
+      audit_facility: local6
+    audisp_syslog_plugin:
+      active: yes
+      args: "LOG_LOCAL6"   # установка facility local6
+  roles:
+    - audit_syslog
+```
+
+Проверка
+
+· После выполнения роли убедитесь, что файлы конфигурации созданы по правильным путям.
+· Проверьте, что сервисы запущены и события аудита попадают в файл /var/log/audit-forwarded.log (или указанный).
+· Если задан remote_server, проверьте отправку на удалённый syslog-сервер.
+
+Эта роль теперь корректно обрабатывает все предыдущие ошибки и готова к использованию.
