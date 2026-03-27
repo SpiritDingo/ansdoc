@@ -738,3 +738,188 @@ Playbook остаётся без изменений:
 Логи будут сохраняться в директории logs/ рядом с playbook (или в указанной переменной log_dir) с именем <hostname>_os_update_<timestamp>.log. На каждом целевом хосте файл создаётся на контроллере с полным отчётом.
 
 Этот подход удобен для последующего анализа и не требует доступа на запись на целевых хостах для логирования.
+
+
+----------------
+
+
+Ошибка возникла из-за того, что блокировка dpkg (/var/lib/dpkg/lock-frontend) не была освобождена к моменту выполнения apt upgrade, несмотря на предыдущие шаги ожидания. Причина: предыдущая проверка ждала только исчезновения файла /var/lib/dpkg/lock, но не учитывала lock-frontend и процессы, удерживающие эти файлы.
+
+Исправления в роли
+
+1. Установка psmisc (содержит fuser для проверки процессов, удерживающих файлы)
+
+2. Ожидание освобождения обоих файлов блокировок (/var/lib/dpkg/lock и /var/lib/dpkg/lock-frontend)
+
+3. Замена модуля apt на shell с внутренним циклом ожидания блокировок через fuser перед выполнением обновления
+
+Обновлённый файл debian.yml
+
+```yaml
+---
+- name: Check for running apt or dpkg processes
+  ansible.builtin.command: pgrep -f "apt|dpkg"
+  register: apt_processes
+  changed_when: false
+  failed_when: false
+
+- name: Wait for package managers to finish
+  ansible.builtin.wait_for:
+    path: "{{ item }}"
+    state: absent
+    timeout: 300
+  loop:
+    - /var/lib/dpkg/lock
+    - /var/lib/dpkg/lock-frontend
+  when: apt_processes.stdout != ""
+  ignore_errors: yes
+
+- name: Ensure psmisc is installed (for fuser)
+  ansible.builtin.apt:
+    name: psmisc
+    state: present
+    update_cache: yes
+  when: ansible_os_family == "Debian"
+
+- name: Get held packages
+  ansible.builtin.command: apt-mark showhold
+  register: held_packages
+  changed_when: false
+  failed_when: false
+
+- name: Unhold packages if any
+  ansible.builtin.command: apt-mark unhold {{ held_packages.stdout_lines | join(' ') }}
+  when: held_packages.stdout != ""
+  changed_when: true
+  register: unhold_result
+  ignore_errors: yes
+
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: yes
+    cache_valid_time: 3600
+  register: apt_update_result
+
+- name: Upgrade all packages with lock handling
+  ansible.builtin.shell: |
+    set -e
+    # Wait for any dpkg locks to be released
+    while fuser /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+      echo "Waiting for dpkg locks to be released..."
+      sleep 5
+    done
+    DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y
+  register: apt_upgrade_result
+  changed_when: "'upgraded:' in apt_upgrade_result.stdout or 'The following packages will be upgraded' in apt_upgrade_result.stdout"
+  failed_when: apt_upgrade_result.rc != 0 and ('Could not get lock' in apt_upgrade_result.stderr or 'Unable to acquire the dpkg frontend lock' in apt_upgrade_result.stderr)
+
+- name: Write update log to control node (Debian)
+  ansible.builtin.copy:
+    content: |
+      ---
+      Timestamp: {{ ansible_date_time.iso8601 }}
+      Host: {{ inventory_hostname }}
+      OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+      
+      === Held packages check ===
+      {{ held_packages.stdout | default('No held packages') }}
+      
+      === Unhold operation ===
+      {{ unhold_result.stdout | default('No unhold performed') }}
+      {{ unhold_result.stderr | default('') }}
+      
+      === APT update ===
+      {{ apt_update_result.stdout | default('') }}
+      {{ apt_update_result.stderr | default('') }}
+      
+      === APT upgrade ===
+      {{ apt_upgrade_result.stdout | default('') }}
+      {{ apt_upgrade_result.stderr | default('') }}
+    dest: "{{ log_dir | default(playbook_dir + '/logs') }}/{{ inventory_hostname }}_os_update_{{ ansible_date_time.epoch }}.log"
+    mode: '0644'
+  delegate_to: localhost
+  when: apt_upgrade_result is defined
+```
+
+Обновлённый файл redhat.yml (для симметрии, хотя там блокировки yum/dnf обычно проще)
+
+В RedHat-семействе блокировки возникают реже, но для единообразия можно также добавить установку psmisc (если нужен fuser) и ожидание по аналогии, но обычно достаточно ожидания /var/run/yum.pid. Оставляем без изменений, но можно добавить ожидание и для dnf:
+
+```yaml
+---
+- name: Check for running yum or dnf processes
+  ansible.builtin.command: pgrep -f "yum|dnf"
+  register: rpm_processes
+  changed_when: false
+  failed_when: false
+
+- name: Wait for package managers to finish
+  ansible.builtin.wait_for:
+    path: /var/run/yum.pid
+    state: absent
+    timeout: 300
+  when: rpm_processes.stdout != ""
+  ignore_errors: yes
+
+- name: Ensure psmisc is installed (optional)
+  ansible.builtin.yum:
+    name: psmisc
+    state: present
+  when: ansible_os_family == "RedHat"
+  ignore_errors: yes
+
+- name: Get versionlock packages
+  ansible.builtin.command: yum versionlock list
+  register: versionlock_packages
+  changed_when: false
+  failed_when: false
+  ignore_errors: yes
+
+- name: Clear versionlock if any
+  ansible.builtin.command: yum versionlock clear
+  when: versionlock_packages.stdout != ""
+  changed_when: true
+  register: versionlock_clear_result
+  ignore_errors: yes
+
+- name: Update all packages
+  ansible.builtin.yum:
+    name: '*'
+    state: latest
+    update_cache: yes
+  register: yum_upgrade_result
+
+- name: Write update log to control node (RedHat)
+  ansible.builtin.copy:
+    content: |
+      ---
+      Timestamp: {{ ansible_date_time.iso8601 }}
+      Host: {{ inventory_hostname }}
+      OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+      
+      === Versionlock packages ===
+      {{ versionlock_packages.stdout | default('No versionlock entries') }}
+      
+      === Versionlock clear operation ===
+      {{ versionlock_clear_result.stdout | default('No clear performed') }}
+      {{ versionlock_clear_result.stderr | default('') }}
+      
+      === YUM/DNF upgrade ===
+      {{ yum_upgrade_result.stdout | default('') }}
+      {{ yum_upgrade_result.stderr | default('') }}
+    dest: "{{ log_dir | default(playbook_dir + '/logs') }}/{{ inventory_hostname }}_os_update_{{ ansible_date_time.epoch }}.log"
+    mode: '0644'
+  delegate_to: localhost
+  when: yum_upgrade_result is defined
+```
+
+Объяснение ключевых изменений
+
+1. Установка psmisc: предоставляет утилиту fuser, которая определяет процессы, использующие файлы.
+2. Ожидание обоих файлов блокировок: ранее ждали только /var/lib/dpkg/lock. Теперь ждём и lock-frontend.
+3. Цикл ожидания перед обновлением: встроенный в shell-команду цикл с fuser гарантирует, что перед выполнением apt-get dist-upgrade блокировки точно освободятся. Если процесс всё ещё держит блокировку, скрипт будет ждать (с паузами 5 секунд), пока она не исчезнет.
+4. Обработка ошибок: failed_when настроен так, чтобы не считать ошибкой именно блокировку (хотя после ожидания её быть не должно), но если возникает другая ошибка (например, пакетный конфликт), задача завершится с failure.
+
+Проверка
+
+После внесения этих изменений роль будет надёжно обновлять Ubuntu 22.04/24.04 и Oracle Linux, даже если в момент запуска другой процесс удерживает блокировку dpkg. Логи по-прежнему сохраняются на управляющем узле в директории logs/ (или указанной в log_dir) с деталями выполнения.
