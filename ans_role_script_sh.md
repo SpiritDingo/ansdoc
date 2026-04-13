@@ -472,3 +472,56 @@ ansible-doc -t module shell | grep -A2 "^timeout"
 ✅ Итог
 
 Добавьте force: yes в задачу get_url – ошибка исчезнет, роль будет работать стабильно.
+
+
+Ошибка возникает, потому что в вашей роли (или в её задаче) используется модуль command, который не поддерживает параметр timeout.
+Вам нужно заменить модуль на shell.
+
+🔧 Что конкретно исправить в файле tasks/main.yml
+
+Было (ошибочно):
+
+```yaml
+- name: "Execute the downloaded script on the remote server"
+  ansible.builtin.command:    # или ansible.legacy.command
+    cmd: "{{ script_dest_path }} {{ script_arguments }}"
+    executable: /bin/bash
+    timeout: "{{ script_timeout }}"
+```
+
+Стало (правильно):
+
+```yaml
+- name: "Execute the downloaded script on the remote server"
+  ansible.builtin.shell:      # ← заменили command на shell
+    cmd: "{{ script_dest_path }} {{ script_arguments }}"
+    executable: /bin/bash
+    timeout: "{{ script_timeout }}"
+```
+
+✅ Полностью исправленный блок задачи
+
+```yaml
+- name: "Execute the downloaded script on the remote server"
+  ansible.builtin.shell:
+    cmd: "{{ script_dest_path }} {{ script_arguments }}"
+    executable: /bin/bash
+    timeout: "{{ script_timeout }}"
+  register: script_execution
+  environment: "{{ script_environment }}"
+  ignore_errors: "{{ not fail_on_script_error | bool }}"
+```
+
+📌 Почему это важно
+
+· command — запускает процесс напрямую, без шелла. Не поддерживает timeout, environment, пайпы, редиректы.
+· shell — запускает через /bin/sh (или указанный executable), поддерживает timeout, environment и все возможности оболочки.
+
+Ваш скрипт, скорее всего, написан на bash и требует шелла, поэтому только shell подходит.
+
+🚀 Если вы используете универсальную роль, которую я дал ранее
+
+Проверьте, что в tasks/main.yml у вас точно написано ansible.builtin.shell, а не command.
+В готовой универсальной роли, которую я привёл в предыдущем ответе, уже используется shell. Просто скопируйте её заново, чтобы исключить ошибки.
+
+После исправления роль отработает без ошибок.
