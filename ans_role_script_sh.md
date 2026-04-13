@@ -392,3 +392,83 @@ ansible-doc -t module shell | grep -A2 "^timeout"
 Если Nexus требует валидации SSL-сертификата, уберите validate_certs: no или укажите yes и добавьте ca_path.
 
 После исправления роль будет корректно обрабатывать ситуацию, когда скрипт уже был скачан ранее и не изменился.
+
+
+
+
+Ошибка из-за того, что модуль ansible.builtin.get_url в вашей версии Ansible не поддерживает параметр status_code. Статус 304 (Not Modified) он считает ошибкой, хотя на самом деле это нормальный ответ, означающий, что файл не изменился.
+
+🚀 Быстрое решение (рекомендую)
+
+Добавьте параметр force: yes в задачу get_url. Тогда модуль всегда будет запрашивать файл без условных заголовков, сервер всегда ответит 200, и ошибка 304 исчезнет.
+
+Исправленный фрагмент tasks/main.yml:
+
+```yaml
+- name: "Download shell script from Nexus Repository"
+  ansible.builtin.get_url:
+    url: "{{ nexus_script_url }}"
+    dest: "{{ script_dest_path }}"
+    url_username: "{{ nexus_username }}"
+    url_password: "{{ nexus_password }}"
+    force_basic_auth: yes
+    force: yes                         # ← добавляем эту строку
+    mode: '0755'
+    backup: yes
+    timeout: 30
+    validate_certs: "{{ nexus_validate_certs | default('yes') }}"
+  register: download_result
+```
+
+Теперь задача не будет проверять, изменился ли файл, а просто скачает его заново (и перезапишет). Статус 304 больше не возникнет.
+
+📌 Если нужно сохранить поведение "не скачивать, если не изменился"
+
+Ваша версия Ansible не поддерживает status_code в get_url, поэтому придётся использовать модуль uri вручную:
+
+```yaml
+- name: "Download script via uri (handles 304)"
+  uri:
+    url: "{{ nexus_script_url }}"
+    user: "{{ nexus_username }}"
+    password: "{{ nexus_password }}"
+    force_basic_auth: yes
+    status_code: [200, 304]
+    return_content: yes
+    validate_certs: "{{ nexus_validate_certs | default('yes') }}"
+    timeout: 30
+  register: nexus_response
+
+- name: "Save script content (status 200)"
+  copy:
+    content: "{{ nexus_response.content }}"
+    dest: "{{ script_dest_path }}"
+    mode: '0755'
+    backup: yes
+  when: nexus_response.status == 200
+
+- name: "If 304, ensure file exists (otherwise force download)"
+  block:
+    - name: "Check if file exists"
+      stat:
+        path: "{{ script_dest_path }}"
+      register: script_file
+    - name: "Force re-download if missing"
+      get_url:
+        url: "{{ nexus_script_url }}"
+        dest: "{{ script_dest_path }}"
+        url_username: "{{ nexus_username }}"
+        url_password: "{{ nexus_password }}"
+        force_basic_auth: yes
+        force: yes
+        mode: '0755'
+        validate_certs: "{{ nexus_validate_certs | default('yes') }}"
+      when: not script_file.stat.exists
+  when: nexus_response.status == 304
+```
+
+Но этот вариант сложнее. Для большинства случаев достаточно простого force: yes.
+
+✅ Итог
+
+Добавьте force: yes в задачу get_url – ошибка исчезнет, роль будет работать стабильно.
