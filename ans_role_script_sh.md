@@ -198,3 +198,121 @@ ansible-playbook -i inventory playbook.yml --ask-vault-pass
 · Обработка ошибок: роль остановится, если скачивание не удалось (код ≠ 200) или если скрипт вернул ненулевой код, а fail_on_script_error: true.
 
 Всё готово к использованию. Скопируйте приведённые файлы в соответствующие каталоги роли.
+
+
+Ошибка возникает из-за того, что в вашей задаче используется модуль ansible.builtin.command (или ansible.legacy.command), который не поддерживает параметр timeout. Параметр timeout есть только у модуля ansible.builtin.shell (и ansible.builtin.expect). Вероятно, в коде роли случайно указан command вместо shell, либо вы переопределили модуль.
+
+🔧 Быстрое исправление
+
+Замените в файле tasks/main.yml строку:
+
+```yaml
+ansible.builtin.command:   # или ansible.legacy.command
+```
+
+на:
+
+```yaml
+ansible.builtin.shell:
+```
+
+Полностью корректный блок задачи:
+
+```yaml
+- name: "Execute the downloaded script on the remote server"
+  ansible.builtin.shell:
+    cmd: "{{ script_dest_path }} {{ script_arguments }}"
+    executable: /bin/bash
+    timeout: "{{ script_timeout }}"
+  register: script_execution
+  environment: "{{ script_environment }}"
+  ignore_errors: "{{ not fail_on_script_error }}"
+```
+
+📌 Почему так произошло?
+
+· Модуль command – выполняет команду без участия шелла (не поддерживает timeout, environment, пайпы, редиректы).
+· Модуль shell – выполняет команду через шелл (поддерживает timeout, environment, &, |, >, <).
+
+Ваш скрипт, скорее всего, требует шелл (#!/bin/bash), поэтому нужен именно shell.
+
+⏳ Если ваша версия Ansible не поддерживает timeout в shell
+
+(Очень старые версии, например, Ansible < 2.4). Тогда используйте асинхронный запуск с опросом:
+
+```yaml
+- name: "Execute script with async timeout"
+  ansible.builtin.shell:
+    cmd: "{{ script_dest_path }} {{ script_arguments }}"
+    executable: /bin/bash
+  async: "{{ script_timeout }}"
+  poll: 10
+  register: script_execution
+  environment: "{{ script_environment }}"
+  ignore_errors: "{{ not fail_on_script_error }}"
+```
+
+🧪 Проверка модуля в вашей среде
+
+Выполните команду, чтобы убедиться, какой модуль используется:
+
+```bash
+ansible-doc -t module shell | grep -A2 "^timeout"
+```
+
+Если timeout есть в выводе – всё поддерживается. Если нет – используйте async.
+
+✅ Итоговый исправленный tasks/main.yml
+
+```yaml
+---
+- name: "Download shell script from Nexus Repository"
+  ansible.builtin.get_url:
+    url: "{{ nexus_script_url }}"
+    dest: "{{ script_dest_path }}"
+    url_username: "{{ nexus_username }}"
+    url_password: "{{ nexus_password }}"
+    force_basic_auth: yes
+    mode: '0755'
+    backup: yes
+    timeout: 30
+  register: download_result
+
+- name: "Fail if download was unsuccessful"
+  ansible.builtin.fail:
+    msg: "Failed to download script from {{ nexus_script_url }}. HTTP status code: {{ download_result.status_code }}"
+  when: download_result.status_code is defined and download_result.status_code != 200
+
+- name: "Execute the downloaded script on the remote server"
+  ansible.builtin.shell:   # ← ИСПРАВЛЕНО: был command, теперь shell
+    cmd: "{{ script_dest_path }} {{ script_arguments }}"
+    executable: /bin/bash
+    timeout: "{{ script_timeout }}"
+  register: script_execution
+  environment: "{{ script_environment }}"
+  ignore_errors: "{{ not fail_on_script_error }}"
+
+- name: "Display stdout from script execution"
+  ansible.builtin.debug:
+    msg: "STDOUT: {{ script_execution.stdout_lines }}"
+  when: script_execution.stdout is defined and script_execution.stdout | length > 0
+
+- name: "Display stderr from script execution (if any)"
+  ansible.builtin.debug:
+    msg: "STDERR: {{ script_execution.stderr_lines }}"
+  when: script_execution.stderr is defined and script_execution.stderr | length > 0
+
+- name: "Display script execution return code"
+  ansible.builtin.debug:
+    msg: "RETURN CODE: {{ script_execution.rc }}"
+
+- name: "Fail if script returned non-zero exit code and fail_on_script_error is true"
+  ansible.builtin.fail:
+    msg: "Script failed with return code {{ script_execution.rc }}. stderr: {{ script_execution.stderr }}"
+  when:
+    - fail_on_script_error | bool
+    - script_execution.rc is defined
+    - script_execution.rc != 0
+```
+
+После исправления роль заработает без ошибки Unsupported parameters for ... command module.
