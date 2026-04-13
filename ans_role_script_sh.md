@@ -316,3 +316,79 @@ ansible-doc -t module shell | grep -A2 "^timeout"
 ```
 
 После исправления роль заработает без ошибки Unsupported parameters for ... command module.
+
+
+Ошибка возникает из-за того, что Nexus вернул HTTP статус 304 Not Modified, а модуль get_url по умолчанию считает успешными только статусы 200 и 201. 304 означает, что файл на сервере не изменился с момента последнего скачивания, и клиент может использовать уже имеющуюся локальную копию. Это не ошибка, а нормальное поведение для кэширования.
+
+🔧 Быстрое исправление
+
+Измените задачу скачивания в tasks/main.yml — добавьте параметр status_code: [200, 304] и (опционально) разрешите самоподписанные сертификаты, если Nexus использует HTTPS с собственным сертификатом.
+
+Исправленный фрагмент:
+
+```yaml
+- name: "Download shell script from Nexus Repository"
+  ansible.builtin.get_url:
+    url: "{{ nexus_script_url }}"
+    dest: "{{ script_dest_path }}"
+    url_username: "{{ nexus_username }}"
+    url_password: "{{ nexus_password }}"
+    force_basic_auth: yes
+    mode: '0755'
+    backup: yes
+    timeout: 30
+    status_code: [200, 304]          # ← разрешаем 304
+    validate_certs: no               # ← если Nexus использует самоподписанный сертификат (иначе уберите)
+  register: download_result
+```
+
+Также обновите проверку ошибки (для надёжности):
+
+```yaml
+- name: "Fail if download was unsuccessful"
+  ansible.builtin.fail:
+    msg: "Failed to download script from {{ nexus_script_url }}. HTTP status code: {{ download_result.status_code }}"
+  when: 
+    - download_result.status_code is defined
+    - download_result.status_code not in [200, 304]
+```
+
+📌 Почему так произошло?
+
+· При первом скачивании сервер отдаёт 200, файл сохраняется.
+· При повторном запуске роли get_url отправляет условный запрос (If-Modified-Since / If-None-Match). Если файл не менялся, Nexus отвечает 304.
+· Модуль get_url без явного status_code считает 304 ошибкой, потому что ожидает тело ответа, но его нет.
+
+✅ Полный исправленный tasks/main.yml (ключевая часть)
+
+```yaml
+---
+- name: "Download shell script from Nexus Repository"
+  ansible.builtin.get_url:
+    url: "{{ nexus_script_url }}"
+    dest: "{{ script_dest_path }}"
+    url_username: "{{ nexus_username }}"
+    url_password: "{{ nexus_password }}"
+    force_basic_auth: yes
+    mode: '0755'
+    backup: yes
+    timeout: 30
+    status_code: [200, 304]
+    validate_certs: "{{ nexus_validate_certs | default('yes') }}"
+  register: download_result
+
+- name: "Fail if download was unsuccessful (status not 200/304)"
+  ansible.builtin.fail:
+    msg: "Failed to download script from {{ nexus_script_url }}. HTTP status code: {{ download_result.status_code }}"
+  when:
+    - download_result.status_code is defined
+    - download_result.status_code not in [200, 304]
+```
+
+🧪 Дополнительная рекомендация
+
+Если вы не хотите каждый раз проверять изменения на сервере (и получать 304), можно принудительно скачивать файл заново, добавив force: yes. Но это увеличит нагрузку на Nexus и время выполнения. Лучше оставить status_code: [200, 304].
+
+Если Nexus требует валидации SSL-сертификата, уберите validate_certs: no или укажите yes и добавьте ca_path.
+
+После исправления роль будет корректно обрабатывать ситуацию, когда скрипт уже был скачан ранее и не изменился.
