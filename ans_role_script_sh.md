@@ -1,0 +1,200 @@
+Ниже представлена полностью готовая Ansible роль nexus_script_runner. Она скачивает shell-скрипт из Nexus (с базовой авторизацией), сохраняет на целевом сервере, запускает и выводит результат.
+
+📁 Структура роли
+
+```
+nexus_script_runner/
+├── defaults
+│   └── main.yml
+├── tasks
+│   └── main.yml
+├── vars
+│   └── main.yml
+└── README.md
+```
+
+🔐 Файл defaults/main.yml
+
+Переменные по умолчанию (можно переопределить в плейбуке).
+
+```yaml
+---
+# Путь для сохранения скрипта на целевом сервере (рекомендуется переопределить)
+script_dest_path: "/tmp/nexus_script_{{ ansible_date_time.epoch }}.sh"
+
+# Аргументы, передаваемые скрипту (пустая строка по умолчанию)
+script_arguments: ""
+
+# Переменные окружения для скрипта (пустой словарь)
+script_environment: {}
+
+# Таймаут выполнения скрипта в секундах (по умолчанию 300)
+script_timeout: 300
+
+# Останавливать ли выполнение плейбука при ошибке скрипта (rc != 0)
+fail_on_script_error: true
+```
+
+🧠 Файл vars/main.yml
+
+В этом файле обычно определяют переменные, которые не должны меняться при вызове роли, либо оставляют пустым. Для безопасности рекомендуется определять nexus_username и nexus_password в плейбуке или в group_vars с шифрованием Vault. Здесь приведён пустой файл, но с комментарием.
+
+```yaml
+---
+# Секретные переменные лучше определять вне роли:
+#   nexus_username: "ваш_логин"
+#   nexus_password: "ваш_пароль"
+#   nexus_script_url: "https://nexus.example.com/repository/scripts/script.sh"
+```
+
+⚙️ Файл tasks/main.yml
+
+Основная логика роли.
+
+```yaml
+---
+- name: "Download shell script from Nexus Repository"
+  ansible.builtin.get_url:
+    url: "{{ nexus_script_url }}"
+    dest: "{{ script_dest_path }}"
+    url_username: "{{ nexus_username }}"
+    url_password: "{{ nexus_password }}"
+    force_basic_auth: yes
+    mode: '0755'
+    backup: yes
+    timeout: 30
+  register: download_result
+  no_log: false   # Установите true, если не хотите логировать URL с паролем (но пароль скрыт автоматически)
+
+- name: "Fail if download was unsuccessful"
+  ansible.builtin.fail:
+    msg: "Failed to download script from {{ nexus_script_url }}. HTTP status code: {{ download_result.status_code }}"
+  when: download_result.status_code is defined and download_result.status_code != 200
+
+- name: "Execute the downloaded script on the remote server"
+  ansible.builtin.shell:
+    cmd: "{{ script_dest_path }} {{ script_arguments }}"
+    executable: /bin/bash
+    timeout: "{{ script_timeout }}"
+  register: script_execution
+  environment: "{{ script_environment }}"
+  ignore_errors: "{{ not fail_on_script_error }}"
+
+- name: "Display stdout from script execution"
+  ansible.builtin.debug:
+    msg: "STDOUT: {{ script_execution.stdout_lines }}"
+  when: script_execution.stdout is defined and script_execution.stdout | length > 0
+
+- name: "Display stderr from script execution (if any)"
+  ansible.builtin.debug:
+    msg: "STDERR: {{ script_execution.stderr_lines }}"
+  when: script_execution.stderr is defined and script_execution.stderr | length > 0
+
+- name: "Display script execution return code"
+  ansible.builtin.debug:
+    msg: "RETURN CODE: {{ script_execution.rc }}"
+
+- name: "Fail if script returned non-zero exit code and fail_on_script_error is true"
+  ansible.builtin.fail:
+    msg: "Script failed with return code {{ script_execution.rc }}. stderr: {{ script_execution.stderr }}"
+  when:
+    - fail_on_script_error | bool
+    - script_execution.rc is defined
+    - script_execution.rc != 0
+```
+
+📄 Файл README.md
+
+Документация роли.
+
+```markdown
+# Nexus Script Runner
+
+Ansible роль для скачивания shell-скрипта из Nexus (с базовой авторизацией) и его выполнения на целевом сервере.
+
+## Требования
+
+- Ansible 2.9+
+- Доступ к Nexus Repository Manager (HTTP Basic Auth)
+- Целевой сервер с `/bin/bash`
+
+## Переменные
+
+| Переменная | Обязательна | Описание |
+|------------|-------------|----------|
+| `nexus_script_url` | Да | Полный URL до скрипта в Nexus |
+| `nexus_username` | Да | Имя пользователя для Basic Auth |
+| `nexus_password` | Да | Пароль (рекомендуется шифровать Ansible Vault) |
+| `script_dest_path` | Нет | Путь сохранения скрипта (по умолчанию `/tmp/nexus_script_<timestamp>.sh`) |
+| `script_arguments` | Нет | Аргументы командной строки для скрипта |
+| `script_environment` | Нет | Словарь с переменными окружения |
+| `script_timeout` | Нет | Таймаут выполнения скрипта в секундах (по умолчанию 300) |
+| `fail_on_script_error` | Нет | Останавливать плейбук при ненулевом коде возврата (по умолчанию `true`) |
+
+## Пример использования
+
+```yaml
+- name: "Deploy and run script from Nexus"
+  hosts: my_servers
+  become: yes
+  vars:
+    nexus_script_url: "https://nexus.internal/repo/scripts/deploy.sh"
+    nexus_username: "deploy_user"
+    nexus_password: "{{ vault_nexus_password }}"  # из Ansible Vault
+    script_dest_path: "/opt/deploy/deploy.sh"
+    script_arguments: "--environment prod --version 2.0"
+    script_environment:
+      APP_CONFIG: "/etc/app/config.json"
+    script_timeout: 600
+  roles:
+    - nexus_script_runner
+```
+
+Безопасность
+
+· Никогда не храните nexus_password в открытом виде. Используйте ansible-vault encrypt_string или внешние секретницы.
+· Параметр no_log: true можно добавить в задачу скачивания, чтобы скрыть URL, но пароль Ansible и так маскирует автоматически.
+
+Лицензия
+
+MIT
+
+```
+
+## ▶️ Пример плейбука для вызова роли
+
+Создайте файл `playbook.yml`:
+
+```yaml
+- name: "Execute script from Nexus"
+  hosts: all
+  become: yes
+  vars:
+    nexus_script_url: "https://nexus.example.com/repository/scripts/healthcheck.sh"
+    nexus_username: "ansible_user"
+    nexus_password: "!vault | ..."   # или используйте --ask-vault-pass
+    script_dest_path: "/usr/local/bin/healthcheck.sh"
+    script_arguments: "--verbose"
+  roles:
+    - nexus_script_runner
+```
+
+🧪 Запуск
+
+```bash
+ansible-playbook -i inventory playbook.yml --ask-vault-pass
+```
+
+📦 Установка роли
+
+Если роль лежит локально в roles/nexus_script_runner, Ansible найдёт её автоматически. Можно также упаковать в архив или использовать ansible-galaxy.
+
+---
+
+🧩 Пояснения к production-среде
+
+· Таймауты: в задаче get_url стоит timeout: 30 для соединения. В shell – script_timeout для выполнения.
+· Идемпотентность: роль не идемпотентна (скрипт запускается каждый раз). Если нужен однократный запуск, добавьте creates или проверку наличия флага.
+· Обработка ошибок: роль остановится, если скачивание не удалось (код ≠ 200) или если скрипт вернул ненулевой код, а fail_on_script_error: true.
+
+Всё готово к использованию. Скопируйте приведённые файлы в соответствующие каталоги роли.
