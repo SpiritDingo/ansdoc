@@ -282,3 +282,138 @@ tasks/main.yml (точка входа)
 После выполнения роли агент сам зарегистрируется в KSC (если указаны корректные параметры сервера). Если нужен отложенный старт (например, после перезагрузки), добавьте handler для перезапуска klnagent.
 
 Такой подход покрывает 90% проблем, возникающих при ручной установке.
+
+
+-----------------------------
+
+Чтобы добавить в вашу Ansible роль установку KESL (Kaspersky Endpoint Security for Linux), нужно учесть, что скрипт kesl-12.4.0-1342.sh — это универсальный установщик, который сам определит тип вашей ОС и установит подходящий пакет (RPM или DEB). Ниже я опишу шаги, которые необходимо добавить в роль.
+
+⚙️ Основные шаги для установки KESL
+
+Процесс добавления KESL в вашу Ansible роль будет включать четыре основных этапа.
+
+1. Подготовка системы: Установка необходимых зависимостей и удаление старых версий.
+2. Загрузка дистрибутива: Скачивание универсального скрипта kesl-12.4.0-1342.sh из вашего Nexus-репозитория.
+3. Запуск установки: Выполнение скрипта для автоматической установки пакета.
+4. Пост-настройка: Запуск скрипта инициализации с файлом ответов autoinstall.ini для настройки продукта.
+
+---
+
+📝 Добавление задач в Ansible роль
+
+Вот примерный код задач, которые нужно добавить в ваш плейбук.
+
+```yaml
+# tasks/install_kesl.yml
+---
+- name: 1. Установка зависимостей для KESL (RedHat/CentOS)
+  ansible.builtin.package:
+    name:
+      - glibc
+      - libstdc++
+      - wget
+      - perl
+      - kernel-devel
+      - make
+      - gcc
+    state: present
+  when: ansible_os_family == "RedHat"
+
+- name: 1. Установка зависимостей для KESL (Debian/Ubuntu)
+  ansible.builtin.package:
+    name:
+      - libc6
+      - libstdc++6
+      - wget
+      - perl
+      - linux-headers-{{ ansible_kernel }}
+      - make
+      - gcc
+    state: present
+  when: ansible_distribution in ["Debian", "Ubuntu"]
+
+- name: 2. Скачать дистрибутив KESL из Nexus
+  ansible.builtin.get_url:
+    url: "{{ kesl_download_url }}"
+    dest: "{{ temp_dir }}/kesl-{{ kesl_version }}.sh"
+    url_username: "{{ nexus_username }}"
+    url_password: "{{ nexus_password }}"
+    force_basic_auth: yes
+    mode: '0755'
+
+- name: 3. Запустить установку KESL
+  ansible.builtin.shell: |
+    cd {{ temp_dir }}
+    ./kesl-{{ kesl_version }}.sh --autoinstall
+  args:
+    creates: /opt/kaspersky/kesl/bin/kesl-setup.pl
+  register: kesl_install
+  failed_when: kesl_install.rc != 0
+
+- name: 4. Создать файл autoinstall.ini для пост-настройки
+  ansible.builtin.copy:
+    dest: "{{ temp_dir }}/autoinstall.ini"
+    content: |
+      # Согласие с лицензией и политикой конфиденциальности
+      EULA_AGREED=yes
+      PRIVACY_POLICY_AGREED=yes
+      
+      # Настройка использования KSN (Kaspersky Security Network)
+      USE_KSN=no
+      
+      # Настройка источника обновлений (SCServer = Сервер администрирования KSC)
+      UPDATER_SOURCE=SCServer
+      
+      # Запустить обновление антивирусных баз после настройки
+      UPDATE_EXECUTE=yes
+      
+      # Автоматически скачать и скомпилировать модуль ядра
+      KERNEL_SRCS_INSTALL=yes
+      
+      # Локаль сервиса (по желанию)
+      SERVICE_LOCALE=en_US.utf8
+    mode: '0644'
+
+- name: 5. Запустить автоматическую пост-настройку KESL
+  ansible.builtin.shell: |
+    /opt/kaspersky/kesl/bin/kesl-setup.pl --autoinstall {{ temp_dir }}/autoinstall.ini
+  register: kesl_setup
+  failed_when: kesl_setup.rc != 0
+
+- name: 6. Запустить и включить службу KESL
+  ansible.builtin.systemd:
+    name: kesl
+    state: started
+    enabled: yes
+```
+
+🔧 Необходимые переменные
+
+Не забудьте определить переменные, которые используются в задачах.
+
+```yaml
+# vars/main.yml
+kesl_version: "12.4.0-1342"
+kesl_download_url: "https://nexus.company.com/repository/kaspersky/kesl-{{ kesl_version }}.sh"
+temp_dir: "/tmp/kaspersky_install"
+```
+
+⚠️ Важные замечания
+
+· Параметр --autoinstall: Он позволяет скрипту kesl-12.4.0-1342.sh работать в тихом режиме, не задавая вопросов.
+· Файл autoinstall.ini: Это ключевой элемент для настройки. В примере выше приведен минимальный набор параметров, но вы можете добавлять другие, например INSTALL_LICENSE для активации ключом или PROXY_SERVER.
+· Компиляция модуля ядра: Параметр KERNEL_SRCS_INSTALL=yes может потребовать установки пакетов kernel-devel и gcc, которые уже добавлены в шаг с зависимостями.
+· KSN: Параметр USE_KSN=no отключает участие в Kaspersky Security Network. Включите его (yes), если это разрешено вашей политикой безопасности.
+· Источник обновлений: Если у вас есть локальный сервер администрирования KSC, укажите UPDATER_SOURCE=SCServer.
+
+---
+
+🧪 Запуск плейбука
+
+Запустите плейбук, включающий обновленную роль. Убедитесь, что переменные с паролями для Nexus зашифрованы с помощью ansible-vault.
+
+```bash
+ansible-playbook -i inventory/production install_kaspersky.yml --ask-vault-pass
+```
+
+Если возникнут вопросы по адаптации параметров autoinstall.ini под вашу инфраструктуру, спрашивайте — я помогу разобраться.
