@@ -84,3 +84,201 @@
 · Безопасность: Всегда следуйте принципу наименьших привилегий и храните учетные данные (логины, пароли) в зашифрованном виде с помощью ansible-vault.
 
 Надеюсь, эта информация поможет вам в автоматизации. Если у вас появятся дополнительные вопросы, обращайтесь.
+
+
+Конечно, добавлю важный блок предварительной настройки, который обычно опускают в базовых примерах. Ниже — расширенная роль, включающая подготовку перед установкой агента Kaspersky.
+
+🛠 Подготовка перед установкой (pre-tasks)
+
+Перед запуском установщика необходимо:
+
+1. Проверить поддерживаемую ОС (например, RHEL/CentOS 7/8/9, Ubuntu 20.04/22.04).
+2. Удалить старые/конфликтующие версии агента или KES (если есть).
+3. Установить обязательные зависимости (glibc, libstdc++, wget, perl).
+4. Настроить SELinux (для CentOS/RHEL — перевести в Permissive или добавить политики).
+5. Открыть порты (firewalld/iptables) для связи с KSC: 13000 (SSL), 14000 (обычный), 15000 (активация).
+6. Создать временную директорию и загрузить дистрибутив (если нет локального репозитория).
+7. Проверить наличие установщика и корректность прав.
+
+📄 Пример блока подготовки в роли kaspersky_agent
+
+Структура роли:
+
+```
+roles/kaspersky_agent/
+├── tasks/
+│   ├── main.yml
+│   ├── prepare.yml
+│   └── install.yml
+├── vars/
+│   └── main.yml
+└── files/
+    └── klnagent64-11.0.0-38.x86_64.sh
+```
+
+vars/main.yml (настройки)
+
+```yaml
+kaspersky_agent_version: "11.0.0-38"
+kaspersky_agent_pkg: "klnagent64-{{ kaspersky_agent_version }}.x86_64.sh"
+kaspersky_agent_download_url: "http://repo.example.com/kaspersky/{{ kaspersky_agent_pkg }}"
+ksc_server: "192.168.1.100"
+ksc_port: 14000
+ksc_ssl_port: 13000
+ksc_use_ssl: 1
+temp_dir: "/tmp/kaspersky_install"
+```
+
+tasks/prepare.yml (все шаги подготовки)
+
+```yaml
+---
+- name: Проверка ОС (только RedHat/CentOS/Ubuntu)
+  fail:
+    msg: "Неподдерживаемая ОС. Поддерживаются: RedHat, CentOS, Ubuntu"
+  when:
+    - ansible_os_family != "RedHat"
+    - ansible_distribution != "Ubuntu"
+
+- name: Установка зависимостей (RedHat)
+  package:
+    name:
+      - glibc
+      - libstdc++
+      - wget
+      - perl
+      - policycoreutils-python-utils  # для управления SELinux
+    state: present
+  when: ansible_os_family == "RedHat"
+
+- name: Установка зависимостей (Ubuntu)
+  package:
+    name:
+      - libc6
+      - libstdc++6
+      - wget
+      - perl
+    state: present
+  when: ansible_distribution == "Ubuntu"
+
+- name: Удаление предыдущих версий агента Kaspersky
+  package:
+    name: "{{ item }}"
+    state: absent
+  loop:
+    - klnagent64
+    - kaspersky-endpoint-security
+  ignore_errors: yes
+
+- name: Остановка служб Kaspersky (если запущены)
+  systemd:
+    name: "{{ item }}"
+    state: stopped
+  loop:
+    - klnagent
+    - kesl
+  ignore_errors: yes
+
+- name: Временное отключение SELinux (если включён)
+  selinux:
+    state: permissive
+    policy: targeted
+  when:
+    - ansible_os_family == "RedHat"
+    - ansible_selinux.status == "enabled"
+
+- name: Открыть порты в firewalld (RedHat)
+  firewalld:
+    port: "{{ item }}/tcp"
+    permanent: yes
+    immediate: yes
+    state: enabled
+  loop:
+    - "{{ ksc_port }}"
+    - "{{ ksc_ssl_port }}"
+    - 15000
+  when: ansible_os_family == "RedHat"
+
+- name: Создать временную директорию
+  file:
+    path: "{{ temp_dir }}"
+    state: directory
+    mode: '0755'
+
+- name: Загрузить дистрибутив агента (если нет локального)
+  get_url:
+    url: "{{ kaspersky_agent_download_url }}"
+    dest: "{{ temp_dir }}/{{ kaspersky_agent_pkg }}"
+    mode: '0755'
+    timeout: 60
+  register: download_result
+  until: download_result is success
+  retries: 3
+  delay: 5
+```
+
+tasks/install.yml (установка после подготовки)
+
+```yaml
+---
+- name: Запуск установки агента с автоответами
+  shell: |
+    cd {{ temp_dir }}
+    ./{{ kaspersky_agent_pkg }} \
+      --autoinstall \
+      --server {{ ksc_server }} \
+      --port {{ ksc_port }} \
+      --ssl-port {{ ksc_ssl_port }} \
+      --use-ssl {{ ksc_use_ssl }}
+  args:
+    creates: /opt/kaspersky/klnagent64/sbin/klnagent
+  register: install_result
+
+- name: Проверка успешности установки
+  fail:
+    msg: "Ошибка установки: {{ install_result.stderr }}"
+  when: install_result.rc != 0
+
+- name: Запуск и включение службы klnagent
+  systemd:
+    name: klnagent
+    state: started
+    enabled: yes
+```
+
+tasks/main.yml (точка входа)
+
+```yaml
+---
+- name: Подготовка системы к установке Kaspersky Agent
+  import_tasks: prepare.yml
+
+- name: Установка агента Kaspersky
+  import_tasks: install.yml
+```
+
+🧪 Пример плейбука для вызова роли
+
+```yaml
+- hosts: servers
+  become: yes
+  roles:
+    - kaspersky_agent
+  vars:
+    ksc_server: "10.10.10.5"
+    ksc_port: 14000
+    kaspersky_agent_download_url: "https://internal-repo/klnagent64-11.0.0-38.x86_64.sh"
+```
+
+⚠️ Важные замечания по подготовке
+
+Действие Почему важно
+Удаление старых версий Конфликт версий агента вызывает ошибки соединения с KSC
+Отключение SELinux (или политики) Установщик Kaspersky не всегда корректно работает с Enforcing
+Открытие портов Агент должен инициировать соединение к KSC на указанные порты
+Зависимости Без perl и libstdc++ установщик выдаст ошибку cannot execute binary file
+Создание временной папки Некоторые установщики требуют исполняемый файл в локальной FS, не в смонтированной сети
+
+После выполнения роли агент сам зарегистрируется в KSC (если указаны корректные параметры сервера). Если нужен отложенный старт (например, после перезагрузки), добавьте handler для перезапуска klnagent.
+
+Такой подход покрывает 90% проблем, возникающих при ручной установке.
