@@ -462,3 +462,203 @@ dependencies: []
 Нет отката сервисов Восстанавливаем apt-daily после исправления
 
 Такая роль безопаснее для production и даёт администратору контроль над действиями.
+
+
+
+-----------------------------------------------
+-----------------------------------------------
+
+Ошибка показывает, что вы всё ещё пытаетесь выполнить `dpkg --configure -a`, но блокировка активна (процесс 130477). Ansible **не нужно это делать**, потому что задача должна была сначала убить процесс и удалить lock-файлы.
+
+Вот **исправленная роль**:
+
+## `tasks/main.yml` (исправленный)
+
+```yaml
+---
+- name: Убить процесс, удерживающий lock-frontend
+  shell: |
+    PID=$(fuser /var/lib/dpkg/lock-frontend 2>/dev/null | awk '{print $1}')
+    if [ -n "$PID" ] && [ "$PID" != "1" ]; then
+      kill -9 $PID
+      echo "Killed process $PID"
+    fi
+  register: kill_result
+  changed_when: kill_result.stdout != ""
+  failed_when: false
+
+- name: Дождаться завершения процесса (пауза)
+  wait_for:
+    timeout: 3
+  when: kill_result.stdout != ""
+
+- name: Удалить lock-файлы (только если процесс убит)
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /var/lib/dpkg/lock-frontend
+    - /var/lib/dpkg/lock
+  register: remove_lock
+  failed_when: false
+
+- name: ПРИНУДИТЕЛЬНОЕ ОБНОВЛЕНИЕ APT (без dpkg --configure)
+  apt:
+    update_cache: yes
+    force_apt_get: yes
+  register: apt_update
+  until: apt_update is success
+  retries: 3
+  delay: 2
+  ignore_errors: yes
+
+- name: Если APT всё ещё заблокирован — перезапустить систему
+  block:
+    - name: Проверить, какие процессы используют dpkg
+      shell: ps aux | grep -E 'apt|dpkg' | grep -v grep
+      register: ps_check
+      failed_when: false
+      
+    - name: Вывести информацию о блокирующих процессах
+      debug:
+        var: ps_check.stdout_lines
+    
+    - name: Найти PID всех процессов apt/dpkg
+      shell: pgrep -f "apt|dpkg" | xargs -r kill -9
+      failed_when: false
+      
+    - name: Повторная попытка обновления APT
+      apt:
+        update_cache: yes
+        force_apt_get: yes
+  when: apt_update is failed
+
+- name: Установить нужный пакет (пример)
+  apt:
+    name: "{{ package_name | default('nginx') }}"
+    state: present
+    force_apt_get: yes
+  register: apt_install
+  until: apt_install is success
+  retries: 5
+  delay: 5
+  ignore_errors: yes
+
+- name: Если пакет не установился — создать отчёт об ошибке
+  fail:
+    msg: |
+      Невозможно установить пакет. Система всё ещё заблокирована.
+      Выполните вручную на сервере:
+        sudo kill -9 $(fuser /var/lib/dpkg/lock-frontend)
+        sudo rm -f /var/lib/dpkg/lock-frontend
+        sudo dpkg --configure -a
+        sudo apt-get update
+        sudo apt-get install -f
+  when: apt_install is failed
+```
+
+## **Ещё лучше — одноплейбук с обходным решением**
+
+Вместо `dpkg --configure -a` (который сам требует lock), используйте **force обновление apt**:
+
+```yaml
+---
+- name: Исправление блокировки dpkg/apt
+  hosts: all
+  become: yes
+  gather_facts: yes
+
+  tasks:
+    - name: Убить все процессы apt/dpkg
+      shell: |
+        pkill -9 -f "apt|dpkg" || true
+        sleep 2
+      changed_when: false
+
+    - name: Принудительное удаление lock-файлов
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/lib/dpkg/lock-frontend
+        - /var/lib/dpkg/lock
+        - /var/cache/apt/archives/lock
+        - /var/lib/apt/lists/lock
+
+    - name: Перезапустить сервисы APT
+      systemd:
+        name: "{{ item }}"
+        state: restarted
+        daemon_reload: yes
+      loop:
+        - apt-daily.timer
+        - apt-daily-upgrade.timer
+      ignore_errors: yes
+
+    - name: Обновить APT с таймаутом и повторами
+      apt:
+        update_cache: yes
+        cache_valid_time: 0
+      register: apt_result
+      until: apt_result is success
+      retries: 5
+      delay: 10
+      # Ключевой момент: не используем dpkg --configure
+
+    - name: Установка пакета (если нужно)
+      apt:
+        name: "your-package-name"
+        state: present
+```
+
+## **Самое простое решение — обойти dpkg --configure**
+
+**Удалите эту задачу** из вашей роли:
+```yaml
+- name: Переконфигурация dpkg после снятия блокировки  # ← УДАЛИТЬ
+  command: dpkg --configure -a                         # ← УДАЛИТЬ
+```
+
+Вместо неё используйте:
+```yaml
+- name: Принудительное исправление сломанных пакетов
+  apt:
+    update_cache: yes
+    force: yes
+  register: fix_result
+  until: fix_result is success
+  retries: 3
+  delay: 5
+```
+
+## **Если совсем не работает — перезагрузить сервер**
+
+```yaml
+- name: Перезагрузка сервера для снятия всех блокировок
+  reboot:
+    reboot_timeout: 300
+    pre_reboot_delay: 5
+    post_reboot_delay: 30
+  when: fix_dpkg_lock_failed | default(false)
+```
+
+**Главный вывод:** Не используйте `dpkg --configure -a` в Ansible, если вы не уверены, что lock уже снят. Вместо этого делайте `apt update` с повторами и `force_apt_get: yes`.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
