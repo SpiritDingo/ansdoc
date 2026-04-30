@@ -891,7 +891,195 @@ tasks/main.yml (основная логика)
 
 
 
+--------------------------------
+-------------------------------------------
 
+Ошибка возникает из-за того, что в вашей роли используется переменная `dpkg_lock_files`, которая не определена.
+
+Вот **исправленная роль**:
+
+## Вариант 1: Использовать статический список (рекомендуется)
+
+### `tasks/main.yml`
+
+```yaml
+---
+- name: Убить процессы apt/dpkg
+  shell: |
+    pkill -9 -f "apt|dpkg" || true
+    sleep 2
+  changed_when: false
+  ignore_errors: yes
+
+- name: Принудительное удаление lock-файлов
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /var/lib/dpkg/lock-frontend
+    - /var/lib/dpkg/lock
+    - /var/cache/apt/archives/lock
+    - /var/lib/apt/lists/lock
+  ignore_errors: yes
+
+- name: Перезапустить сервисы APT
+  systemd:
+    name: "{{ item }}"
+    state: restarted
+    daemon_reload: yes
+  loop:
+    - apt-daily.timer
+    - apt-daily-upgrade.timer
+  ignore_errors: yes
+
+- name: Обновить кэш APT
+  apt:
+    update_cache: yes
+    cache_valid_time: 0
+    force_apt_get: yes
+  register: apt_update
+  until: apt_update is success
+  retries: 3
+  delay: 5
+  ignore_errors: yes
+
+- name: Исправить сломанные зависимости
+  apt:
+    upgrade: dist
+    force_apt_get: yes
+  when: apt_update is success
+  ignore_errors: yes
+```
+
+## Вариант 2: Определить переменную (если хотите использовать список)
+
+### `defaults/main.yml`
+
+```yaml
+---
+# Список lock-файлов dpkg/apt для удаления
+dpkg_lock_files:
+  - /var/lib/dpkg/lock-frontend
+  - /var/lib/dpkg/lock
+  - /var/cache/apt/archives/lock
+  - /var/lib/apt/lists/lock
+```
+
+### `tasks/main.yml`
+
+```yaml
+---
+- name: Убить процессы apt/dpkg
+  shell: |
+    pkill -9 -f "apt|dpkg" || true
+    sleep 2
+  changed_when: false
+  ignore_errors: yes
+
+- name: Принудительное удаление lock-файлов
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ dpkg_lock_files }}"
+  ignore_errors: yes
+
+- name: Перезапустить сервисы APT
+  systemd:
+    name: "{{ item }}"
+    state: restarted
+    daemon_reload: yes
+  loop:
+    - apt-daily.timer
+    - apt-daily-upgrade.timer
+  ignore_errors: yes
+
+- name: Обновить кэш APT
+  apt:
+    update_cache: yes
+    cache_valid_time: 0
+    force_apt_get: yes
+  register: apt_update
+  until: apt_update is success
+  retries: 3
+  delay: 5
+  ignore_errors: yes
+```
+
+## Вариант 3: Упрощённый (минимальный)
+
+### `tasks/main.yml`
+
+```yaml
+---
+- name: Удалить lock-файлы dpkg
+  shell: |
+    rm -f /var/lib/dpkg/lock-frontend
+    rm -f /var/lib/dpkg/lock
+    rm -f /var/cache/apt/archives/lock
+    rm -f /var/lib/apt/lists/lock
+  ignore_errors: yes
+
+- name: Обновить APT
+  apt:
+    update_cache: yes
+  ignore_errors: yes
+
+- name: Установить пакет (если нужно)
+  apt:
+    name: "{{ package_name | default(omit) }}"
+    state: present
+  when: package_name is defined
+```
+
+## Полная структура роли с переменными
+
+```
+roles/fix_dpkg_lock/
+├── defaults/
+│   └── main.yml          # ← здесь определить dpkg_lock_files
+├── tasks/
+│   └── main.yml          # ← здесь использовать {{ dpkg_lock_files }}
+└── meta/
+    └── main.yml
+```
+
+### `defaults/main.yml`
+
+```yaml
+---
+# Список lock-файлов для удаления
+dpkg_lock_files:
+  - /var/lib/dpkg/lock-frontend
+  - /var/lib/dpkg/lock
+  - /var/cache/apt/archives/lock
+  - /var/lib/apt/lists/lock
+
+# Таймаут в секундах перед повторными попытками
+dpkg_retry_delay: 5
+
+# Количество повторных попыток
+dpkg_retries: 3
+```
+
+## Быстрое исправление текущей ошибки
+
+Если не хотите создавать `defaults/main.yml`, просто замените в вашем `tasks/main.yml` строку:
+
+**Было (с ошибкой):**
+```yaml
+loop: "{{ dpkg_lock_files }}"
+```
+
+**Стало (с явным списком):**
+```yaml
+loop:
+  - /var/lib/dpkg/lock-frontend
+  - /var/lib/dpkg/lock
+  - /var/cache/apt/archives/lock
+  - /var/lib/apt/lists/lock
+```
+
+Это самое простое и надёжное решение.
 
 
 
