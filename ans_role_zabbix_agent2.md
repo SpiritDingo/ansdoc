@@ -218,3 +218,110 @@ dependencies: []
 ```
 
 Роль предполагает, что репозиторий уже настроен. При необходимости можно добавить дополнительные конфигурации плагинов в `zabbix_agent2.d/`.
+
+Ошибка возникает из-за того, что переменная `zabbix_agent_timeout` не определена в области видимости. Вот исправленная версия шаблона с защитой от неопределенных переменных:
+
+## templates/zabbix_agent2.conf.j2 (исправленный)
+
+```ini
+# {{ ansible_managed }}
+PidFile={{ zabbix_agent_pid_file | default('/var/run/zabbix/zabbix_agent2.pid') }}
+LogFile={{ zabbix_agent_log_file | default('/var/log/zabbix/zabbix_agent2.log') }}
+LogFileSize=10
+
+# DebugLevel=3 - для отладки
+DebugLevel=3
+
+Server={{ zabbix_agent_server | default('127.0.0.1') }}
+ServerActive={{ zabbix_agent_server_active | default('127.0.0.1') }}
+
+Hostname={{ zabbix_agent_hostname | default(ansible_hostname) }}
+HostnameItem=system.hostname
+HostMetadata={{ zabbix_agent_hostname | default(ansible_hostname) }}
+
+Include={{ zabbix_agent_include_dir | default('/etc/zabbix/zabbix_agent2.d') }}/*.conf
+
+{% if zabbix_agent_timeout is defined %}
+Timeout={{ zabbix_agent_timeout }}
+{% else %}
+Timeout=3
+{% endif %}
+
+{% if zabbix_agent_listen_port is defined and zabbix_agent_listen_port %}
+ListenPort={{ zabbix_agent_listen_port }}
+{% endif %}
+
+{% if zabbix_agent_allow_key is defined and zabbix_agent_allow_key | length > 0 %}
+AllowKey={% for key in zabbix_agent_allow_key %}{{ key }}{% if not loop.last %},{% endif %}{% endfor %}
+{% endif %}
+
+{% if zabbix_agent_deny_key is defined and zabbix_agent_deny_key | length > 0 %}
+DenyKey={% for key in zabbix_agent_deny_key %}{{ key }}{% if not loop.last %},{% endif %}{% endfor %}
+{% endif %}
+
+# Пользовательские параметры
+{% if zabbix_agent_user_params is defined %}
+{% for param in zabbix_agent_user_params %}
+UserParameter={{ param }}
+{% endfor %}
+{% endif %}
+
+# Плагины (примеры)
+Plugins.SystemRun.LogRemoteCommands=0
+Plugins.MQTT.Timeout=global
+
+# TLS настройки (опционально)
+{% if zabbix_agent_tls_connect is defined %}
+TLSConnect={{ zabbix_agent_tls_connect }}
+TLSAccept={{ zabbix_agent_tls_accept | default('cert') }}
+TLSCAFile={{ zabbix_agent_tls_ca_file | default('/etc/zabbix/ssl/ca.crt') }}
+TLSCertFile={{ zabbix_agent_tls_cert_file | default('/etc/zabbix/ssl/zabbix_agent2.crt') }}
+TLSKeyFile={{ zabbix_agent_tls_key_file | default('/etc/zabbix/ssl/zabbix_agent2.key') }}
+{% endif %}
+```
+
+## Ключевые изменения:
+
+1. **Timeout** - обернут в проверку `is defined` с fallback-значением `3`
+2. **ListenPort** - добавлена проверка и на существование и на непустое значение
+3. **All остальные переменные** - защищены через `| default()` или проверку `is defined`
+4. **Исправлен Hostname** - теперь использует `ansible_hostname` вместо `hostname`
+
+## Альтернативно, можно гарантированно определить все переменные в defaults/main.yml:
+
+```yaml
+---
+# Обязательные переменные
+zabbix_agent_server: "127.0.0.1"
+zabbix_agent_server_active: "127.0.0.1"
+zabbix_agent_hostname: "{{ ansible_hostname }}"
+zabbix_agent_listen_port: 10050
+
+# Параметры агента
+zabbix_agent_timeout: 3
+zabbix_agent_allow_key: []
+zabbix_agent_deny_key: []
+zabbix_agent_user_params: []
+
+# Директории и файлы
+zabbix_agent_include_dir: "/etc/zabbix/zabbix_agent2.d"
+zabbix_agent_pid_file: "/var/run/zabbix/zabbix_agent2.pid"
+zabbix_agent_log_file: "/var/log/zabbix/zabbix_agent2.log"
+
+# Пакеты
+zabbix_agent2_package: "zabbix-agent2"
+zabbix_agent_service: "zabbix-agent2"
+zabbix_agent_plugins: []
+```
+
+Теперь ошибка должна исчезнуть. Если переменные есть в `defaults/main.yml` - шаблон будет работать без проверок, если нет - с проверками `is defined`.
+
+
+
+
+
+
+
+
+
+
