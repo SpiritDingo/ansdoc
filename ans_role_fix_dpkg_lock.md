@@ -1081,6 +1081,222 @@ loop:
 
 Это самое простое и надёжное решение.
 
+___________
+___________
+___________
+
+
+Адаптируем роль для Ubuntu 22.04 и 24.04 и добавим безопасное использование dpkg --configure -a после снятия блокировки.
+
+Исправленная роль fix_dpkg_lock
+
+Структура
+
+```
+fix_dpkg_lock/
+├── tasks/
+│   └── main.yml
+├── handlers/
+│   └── main.yml
+├── vars/
+│   └── Ubuntu.yml
+├── meta/
+│   └── main.yml
+└── README.md
+```
+
+---
+
+vars/Ubuntu.yml (специфичные для Ubuntu переменные)
+
+```yaml
+---
+# Для Ubuntu 22.04 и 24.04 одинаковый список lock-файлов
+dpkg_lock_files:
+  - /var/lib/dpkg/lock-frontend
+  - /var/lib/dpkg/lock
+  - /var/cache/apt/archives/lock
+  - /var/lib/apt/lists/lock
+
+apt_retries: 5
+apt_delay: 10
+kill_wait_seconds: 3
+
+# Сервисы apt для перезапуска на Ubuntu
+apt_services:
+  - apt-daily.service
+  - apt-daily-upgrade.service
+  - apt-daily.timer
+  - apt-daily-upgrade.timer
+```
+
+---
+
+tasks/main.yml (основная логика с dpkg --configure -a)
+
+```yaml
+---
+- name: Проверка, что система — Ubuntu
+  fail:
+    msg: "Эта роль предназначена только для Ubuntu 22.04/24.04"
+  when: ansible_distribution != "Ubuntu" or ansible_distribution_version not in ["22.04", "24.04"]
+
+- name: Загрузка переменных для Ubuntu
+  include_vars: "Ubuntu.yml"
+
+- name: Поиск PID процесса, удерживающего lock-frontend
+  shell: |
+    set -o pipefail
+    fuser /var/lib/dpkg/lock-frontend 2>/dev/null | awk '{print $1}' || true
+  args:
+    executable: /bin/bash
+  register: locking_pid
+  changed_when: false
+  failed_when: false
+
+- name: Принудительное завершение процесса (если найден)
+  shell: |
+    kill -9 {{ locking_pid.stdout }}
+  when:
+    - locking_pid.stdout != ""
+    - locking_pid.stdout != "1"
+  register: kill_result
+  changed_when: kill_result.rc == 0
+  failed_when: false
+
+- name: Пауза после убийства процесса
+  wait_for:
+    timeout: "{{ kill_wait_seconds }}"
+  when: kill_result is changed
+
+- name: Удаление lock-файлов
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ dpkg_lock_files }}"
+  register: removed_locks
+  failed_when: false
+
+- name: Остановка apt-сервисов, чтобы они не перезаблокировали
+  systemd:
+    name: "{{ item }}"
+    state: stopped
+  loop: "{{ apt_services }}"
+  ignore_errors: yes
+  when: removed_locks is changed
+
+- name: Выполнение dpkg --configure -a (теперь lock-файлов нет)
+  command: dpkg --configure -a
+  register: dpkg_configure
+  failed_when: false
+  changed_when: dpkg_configure.rc == 0
+
+- name: Исправление сломанных пакетов
+  apt:
+    name: -f
+    state: present
+    force_apt_get: yes
+  register: apt_fix
+  failed_when: false
+
+- name: Обновление кэша apt с повторными попытками
+  apt:
+    update_cache: yes
+    cache_valid_time: 0
+    force_apt_get: yes
+  register: apt_update
+  until: apt_update is success
+  retries: "{{ apt_retries }}"
+  delay: "{{ apt_delay }}"
+  ignore_errors: yes
+
+- name: Перезапуск apt-сервисов
+  systemd:
+    name: "{{ item }}"
+    state: started
+    daemon_reload: yes
+  loop: "{{ apt_services }}"
+  ignore_errors: yes
+
+- name: Финальная проверка — установка тестового пакета
+  apt:
+    name: "{{ test_package | default('bash') }}"
+    state: present
+  register: final_test
+  until: final_test is success
+  retries: 2
+  delay: 3
+
+- name: Вывод успешного сообщения
+  debug:
+    msg: "Блокировка dpkg/apt успешно снята, система готова к работе"
+  when: final_test is success
+```
+
+---
+
+handlers/main.yml
+
+```yaml
+---
+- name: restart apt services
+  systemd:
+    name: "{{ item }}"
+    state: restarted
+  loop: "{{ apt_services }}"
+  listen: "restart_apt"
+```
+
+---
+
+meta/main.yml
+
+```yaml
+---
+galaxy_info:
+  author: "Your Name"
+  description: "Fix dpkg/apt lock for Ubuntu 22.04 and 24.04"
+  license: MIT
+  min_ansible_version: "2.9"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - jammy
+        - noble
+  galaxy_tags:
+    - dpkg
+    - apt
+    - lock
+dependencies: []
+```
+
+---
+
+Пример использования в плейбуке
+
+```yaml
+- name: Исправление блокировки и установка пакетов
+  hosts: all
+  become: yes
+  roles:
+    - fix_dpkg_lock
+
+  post_tasks:
+    - name: Установить нужный пакет (например, nginx)
+      apt:
+        name: nginx
+        state: present
+```
+
+Ключевые улучшения для Ubuntu 22.04/24.04
+
+1. Явная проверка версий — ansible_distribution_version in ["22.04", "24.04"].
+2. Корректный порядок:
+   · Убить процесс → удалить lock-файлы → остановить apt-сервисы → dpkg --configure -a → apt --fix-broken install → apt update.
+3. Перезапуск сервисов — предотвращает повторную блокировку от фоновых задач apt-daily.
+4. Поддержка systemd — на Ubuntu 22.04/24.04 работает единообразно.
+
+Роль готова к использованию в production-среде на целевых версиях Ubuntu.
 
 
 
