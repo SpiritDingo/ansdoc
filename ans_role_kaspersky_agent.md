@@ -417,3 +417,82 @@ ansible-playbook -i inventory/production install_kaspersky.yml --ask-vault-pass
 ```
 
 Если возникнут вопросы по адаптации параметров autoinstall.ini под вашу инфраструктуру, спрашивайте — я помогу разобраться.
+
+Добавьте в вашу роль задачи перед установкой новых версий. Ниже представлен универсальный код для удаления старого агента (klnagent64) и KESL (kesl), который работает на RedHat (rpm) и Debian/Ubuntu (dpkg).
+
+🔧 Блок удаления старых версий (добавить в prepare.yml или отдельный uninstall.yml)
+
+```yaml
+- name: Удалить старый пакет klnagent (Debian/Ubuntu)
+  ansible.builtin.apt:
+    name: klnagent64
+    state: absent
+    purge: yes
+  when: ansible_os_family == "Debian"
+
+- name: Удалить старый пакет klnagent (RedHat)
+  ansible.builtin.yum:
+    name: klnagent64
+    state: removed
+  when: ansible_os_family == "RedHat"
+
+- name: Удалить старый пакет kesl (Debian/Ubuntu)
+  ansible.builtin.apt:
+    name: kesl
+    state: absent
+    purge: yes
+  when: ansible_os_family == "Debian"
+
+- name: Удалить старый пакет kesl (RedHat)
+  ansible.builtin.yum:
+    name: kesl
+    state: removed
+  when: ansible_os_family == "RedHat"
+
+- name: Принудительно остановить и отключить службы (если остались)
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: no
+  loop:
+    - klnagent
+    - kesl
+  ignore_errors: yes
+```
+
+🧹 Полная очистка (остаточные файлы)
+
+Если после удаления пакетов остаются конфигурационные файлы или каталоги, можно удалить их вручную:
+
+```yaml
+- name: Удалить остаточные каталоги Kaspersky
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /opt/kaspersky
+    - /var/opt/kaspersky
+    - /etc/opt/kaspersky
+  ignore_errors: yes
+```
+
+⚠️ Важные замечания
+
+· Модули apt/yum корректно завершатся, даже если пакет не был установлен (не вызовут ошибку).
+· Параметр purge: yes в apt удаляет и конфигурационные файлы.
+· Остановка служб через systemd с ignore_errors гарантирует продолжение работы, даже если службы не существовали.
+· Удаление старых версий особенно важно при переходе на новую мажорную версию (например, с 11.x на 16.x), так как старые пакеты могут конфликтовать.
+
+🧪 Пример интеграции в основной плейбук
+
+```yaml
+- hosts: all
+  become: yes
+  tasks:
+    - import_tasks: tasks/uninstall_old.yml   # сначала удаляем
+    - import_tasks: tasks/prepare.yml
+    - import_tasks: tasks/install_agent.yml
+    - import_tasks: tasks/install_kesl.yml
+```
+
+Теперь перед установкой новых версий система будет очищена от старых компонентов Kaspersky. Если нужно сохранить какие-то настройки — не используйте purge и ручное удаление каталогов.
