@@ -79,3 +79,46 @@ ansible-playbook -i inventory playbook.yml
 ```bash
 ansible-playbook ... -e report_dest=/home/user/report.csv
 ```
+
+
+Ошибка возникает, когда Ansible пытается обратиться к hostvars[host].ansible_facts['hostname'], но для одного или нескольких хостов переменная ansible_facts не определена или не содержит ключа hostname.
+Это типично для хостов, которые были недоступны во время сбора фактов, или для которых сбор фактов отключён.
+
+Решение
+
+Нужно обезопасить шаблон проверками и значениями по умолчанию.
+
+Исправленный templates/report.csv.j2
+
+```jinja2
+Server Name,IP Address,OS Type,Kernel Version
+{% for host in ansible_play_hosts_all %}
+{% if hostvars[host].ansible_facts is defined %}
+{{ hostvars[host].ansible_facts.hostname | default(host) }},{{ hostvars[host].ansible_default_ipv4.address | default('N/A') }},{{ hostvars[host].ansible_facts.distribution | default('Unknown') }} {{ hostvars[host].ansible_facts.distribution_version | default('') }},{{ hostvars[host].ansible_facts.kernel | default('N/A') }}
+{% else %}
+{{ host }},N/A,No facts collected,N/A
+{% endif %}
+{% endfor %}
+```
+
+Что изменилось
+
+· Добавлена проверка {% if hostvars[host].ansible_facts is defined %} – если факты не собраны, выводится строка с пометкой «No facts collected».
+· Для всех полей используются фильтры | default(...), чтобы избежать ошибки при отсутствии конкретных ключей.
+· Вместо ansible_play_hosts_all можно использовать ansible_play_hosts (только хосты, для которых выполнялась текущая задача). Но в случае run_once на localhost это не всегда помогает, поэтому лучше оставить ansible_play_hosts_all с проверками.
+
+Дополнительная рекомендация
+
+Убедитесь, что в плейбуке включён gather_facts: yes (по умолчанию он включен).
+Если какие-то хосты недоступны, выполните предварительный ping или используйте стратегию ignore_unreachable: yes на уровне плейбука, чтобы избежать остановки выполнения:
+
+```yaml
+- name: Сбор информации о ядре
+  hosts: all
+  gather_facts: yes
+  ignore_unreachable: yes
+  roles:
+    - kernel_report
+```
+
+После исправления шаблона отчёт будет успешно сформирован даже при отсутствии данных по некоторым хостам.
