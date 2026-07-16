@@ -157,3 +157,98 @@ tasks/main.yml
 · Роль требует become: yes для чтения файлов в /etc/apt/.
 · Проверка доступности выполняется через HTTP/HTTPS. Если репозиторий использует протокол file:// или ftp://, проверка не сработает – в таких случаях поле accessible будет false. При необходимости можно расширить логику, добавив проверку через ansible.builtin.stat для локальных каталогов.
 · Таймауты и игнорирование ошибок SSL можно настроить под свою среду.
+
+
+_____
+
+
+Ошибка возникла из‑за того, что в задаче Извлечь строки репозиториев... использовалась переменная line, которая не была определена. Цикл шёл по файлам, но внутри шаблона set_fact требовалась итерация по строкам каждого файла, а вложенного цикла предусмотрено не было.
+
+Ниже приведён исправленный tasks/main.yml. Для каждого файла сначала формируется список словарей с полями file, line и url, а затем все списки объединяются в общий перечень. После этого проверяется доступность уникальных URL и собирается итоговый отчёт.
+
+```yaml
+---
+- name: Найти все файлы .list в директориях apt
+  ansible.builtin.find:
+    paths:
+      - /etc/apt/sources.list
+      - /etc/apt/sources.list.d
+    patterns: "*.list"
+    file_type: file
+  register: repo_files
+  become: yes
+
+- name: Прочитать содержимое найденных файлов
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
+  loop: "{{ repo_files.files }}"
+  register: repo_contents
+  become: yes
+
+- name: Извлечь строки репозиториев и URL для каждого файла
+  ansible.builtin.set_fact:
+    file_repos: >-
+      {{
+        file_repos | default({}) |
+        combine({item.item.path: parsed_lines})
+      }}
+  loop: "{{ repo_contents.results }}"
+  loop_control:
+    loop_var: item
+  vars:
+    content_str: "{{ item.content | b64decode }}"
+    raw_lines: "{{ content_str.splitlines() | map('trim') | select('match', '^\\s*deb(-src)?\\s+.*$') | list }}"
+    parsed_lines: >-
+      {%- set result = [] -%}
+      {%- for line in raw_lines -%}
+        {%- set url = line | regex_replace('^\\s*deb(-src)?\\s+', '') | regex_replace('\\s+.*$', '') -%}
+        {%- set _ = result.append({'file': item.item.path, 'line': line, 'url': url}) -%}
+      {%- endfor -%}
+      {{ result }}
+  when: content_str is defined
+
+- name: Объединить все записи репозиториев в единый список
+  ansible.builtin.set_fact:
+    repo_entries: "{{ file_repos.values() | sum(start=[]) }}"
+  when: file_repos is defined
+
+- name: Оставить только уникальные URL для проверки доступности
+  ansible.builtin.set_fact:
+    unique_urls: "{{ repo_entries | map(attribute='url') | unique | list }}"
+  when: repo_entries is defined
+
+- name: Проверить доступность каждого уникального URL репозитория
+  ansible.builtin.uri:
+    url: "{{ item }}"
+    method: HEAD
+    follow_redirects: safe
+    timeout: 10
+    validate_certs: no  # при необходимости измените на yes
+  register: url_checks
+  loop: "{{ unique_urls }}"
+  ignore_errors: yes
+  when: unique_urls is defined
+
+- name: Собрать итоговый список с признаком доступности
+  ansible.builtin.set_fact:
+    repo_info: "{{ repo_info | default([]) + [entry | combine({'accessible': is_accessible})] }}"
+  loop: "{{ repo_entries }}"
+  loop_control:
+    loop_var: entry
+  vars:
+    url_status: "{{ url_checks.results | selectattr('item', 'equalto', entry.url) | map(attribute='status') | first | default(-1) }}"
+    is_accessible: "{{ url_status in [200, 301, 302, 304, 401, 403] }}"
+  when: repo_entries is defined
+
+- name: Вывести результат в консоль
+  ansible.builtin.debug:
+    var: repo_info
+```
+
+Что было исправлено
+
+· Устранена неопределённая переменная line – теперь для каждого файла отдельно перебираются строки, соответствующие шаблону deb/deb-src.
+· Добавлена задача Объединить все записи репозиториев в единый список, чтобы получить плоский перечень всех найденных репозиториев.
+· Итоговый список repo_info формируется через цикл по repo_entries с проверкой статуса из url_checks, что гарантирует корректную работу в любых версиях Jinja2.
+
+Роль готова к использованию. При необходимости можно добавить задачу для сохранения отчёта в файл.
