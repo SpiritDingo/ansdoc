@@ -700,3 +700,49 @@ _______
 · Нужное число берётся как stdout_lines[-1] (последняя строка списка).
 
 После этой правки ошибка df: invalid option -- '1' исчезнет, и проверки будут отрабатывать корректно в любом режиме (в том числе в --check). Остальные проверки роли (блокировки, пакеты, сеть и т.д.) не используют конвейеры и работают без изменений.
+
+_____
+_____
+____
+
+
+Проблема в том, что pgrep -f unattended-upgrade ищет процесс с именем unattended-upgrade (без s на конце), а настоящий демон в Ubuntu называется unattended-upgrades (с s) и управляется через systemd. Когда сервис остановлен, процесса с таким именем нет, поэтому pgrep ничего не находит, и сообщение выводится как «ОК». Однако, если сервис был запущен, но pgrep всё равно может не найти процесс (например, он завершился, а статус остался активным в systemd), то проверка даёт неверный результат.
+
+Надёжнее всего проверять состояние systemd‑юнита unattended-upgrades.service.
+
+Исправленный блок (замените в tasks/main.yml):
+
+```yaml
+- name: Проверка, не запущен ли unattended-upgrades
+  when: precheck_unattended_upgrades
+  block:
+    - name: Проверить статус systemd юнита unattended-upgrades
+      ansible.builtin.command: systemctl is-active unattended-upgrades.service
+      register: uu_status
+      changed_when: false
+      failed_when: false   # команда вернёт "inactive" с кодом 3, это не ошибка выполнения
+
+    - name: Предупреждение о работающем unattended-upgrades
+      ansible.builtin.debug:
+        msg: "⚠️  Служба unattended-upgrades активна. Дождитесь её завершения (статус: {{ uu_status.stdout }})."
+      when: uu_status.stdout == "active"
+
+    - name: OK unattended-upgrades
+      ansible.builtin.debug:
+        msg: "✔️  unattended-upgrades не запущен (статус: {{ uu_status.stdout }})."
+      when: uu_status.stdout != "active"
+  tags: [packages]
+```
+
+Пояснения:
+
+· systemctl is-active возвращает active или inactive (и код возврата 0 или 3). Мы используем failed_when: false, чтобы задача не считалась проваленной при inactive.
+· Проверка по stdout == "active" чётко определяет, запущен ли демон.
+· Сообщения выводят актуальный статус для наглядности.
+
+Если по каким‑то причинам нужно оставить pgrep, исправьте шаблон на unattended-upgrades, но помните, что процесс может отсутствовать при работающем сервисе (например, если используется таймер, а не постоянная служба). Systemd‑проверка надёжнее.
+
+После замены роль продолжит выполнение в любом случае, и статус будет отображаться корректно.
+
+
+
