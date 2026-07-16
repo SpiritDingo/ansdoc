@@ -615,3 +615,88 @@ ansible-playbook -i inventory playbook.yml
 Если понадобится временно вернуть строгий режим (чтобы при ошибках плейбук падал), можно добавить в начало роли условие с fail, управляемое переменной precheck_fatal: true. По умолчанию оставим false.
 
 Если хотите такую опцию, напишите – дополню. А пока эта версия гарантированно продолжит выполнение при любых обнаруженных проблемах.
+
+
+_______
+
+Ошибка возникла из‑за того, что модуль command передаёт строку «как есть», и символ | был воспринят как аргумент для df, а не как конвейер оболочки. Из‑за этого df получил непонятный ключ -1 и упал.
+
+Чтобы надёжно получить только цифру без заголовка, не используя shell‑конвейер, можно подать команду без пайпа, а затем взять последнюю строку вывода через stdout_lines. Модуль command возвращает список строк в stdout_lines, поэтому нужное число окажется в df_result.stdout_lines[-1].
+
+Ниже исправленные блоки для /boot, / и /var/cache/apt — вставляйте их в tasks/main.yml вместо старых:
+
+```yaml
+- name: Проверка свободного места на /boot
+  block:
+    - name: Получить свободное место /boot (КБ)
+      ansible.builtin.command: df --output=avail /boot
+      register: boot_df
+      changed_when: false
+      check_mode: false
+
+    - name: Предупреждение о малом месте на /boot
+      ansible.builtin.debug:
+        msg: >
+          ⚠️  Мало места на /boot!
+          Доступно {{ ((boot_df.stdout_lines[-1] | trim | int) / 1024) | round(2) }} МБ,
+          требуется минимум {{ precheck_disk_boot_min_mb }} МБ.
+      when: (boot_df.stdout_lines[-1] | trim | int) < (precheck_disk_boot_min_mb * 1024)
+
+    - name: OK /boot
+      ansible.builtin.debug:
+        msg: "✔️  Место на /boot в норме."
+      when: (boot_df.stdout_lines[-1] | trim | int) >= (precheck_disk_boot_min_mb * 1024)
+  tags: [disk]
+
+- name: Проверка свободного места на /
+  block:
+    - name: Получить свободное место / (КБ)
+      ansible.builtin.command: df --output=avail /
+      register: root_df
+      changed_when: false
+      check_mode: false
+
+    - name: Предупреждение о малом месте на /
+      ansible.builtin.debug:
+        msg: >
+          ⚠️  Мало места на корневом разделе!
+          Доступно {{ ((root_df.stdout_lines[-1] | trim | int) / 1024) | round(2) }} МБ,
+          требуется минимум {{ precheck_disk_root_min_mb }} МБ.
+      when: (root_df.stdout_lines[-1] | trim | int) < (precheck_disk_root_min_mb * 1024)
+
+    - name: OK /
+      ansible.builtin.debug:
+        msg: "✔️  Место на / в норме."
+      when: (root_df.stdout_lines[-1] | trim | int) >= (precheck_disk_root_min_mb * 1024)
+  tags: [disk]
+
+- name: Проверка свободного места в /var/cache/apt
+  block:
+    - name: Получить свободное место /var/cache/apt (КБ)
+      ansible.builtin.command: df --output=avail /var/cache/apt
+      register: apt_cache_df
+      changed_when: false
+      check_mode: false
+
+    - name: Предупреждение о малом месте в кэше apt
+      ansible.builtin.debug:
+        msg: >
+          ⚠️  Недостаточно места в /var/cache/apt!
+          Доступно {{ ((apt_cache_df.stdout_lines[-1] | trim | int) / 1024) | round(2) }} МБ,
+          требуется минимум {{ precheck_disk_apt_cache_min_mb }} МБ.
+      when: (apt_cache_df.stdout_lines[-1] | trim | int) < (precheck_disk_apt_cache_min_mb * 1024)
+
+    - name: OK /var/cache/apt
+      ansible.builtin.debug:
+        msg: "✔️  Место в /var/cache/apt в норме."
+      when: (apt_cache_df.stdout_lines[-1] | trim | int) >= (precheck_disk_apt_cache_min_mb * 1024)
+  tags: [disk]
+```
+
+Что изменилось:
+
+· Вместо конвейера | tail -1 используется df --output=avail <путь> без пайпов.
+· Результат сохраняется в переменную *_df.
+· Нужное число берётся как stdout_lines[-1] (последняя строка списка).
+
+После этой правки ошибка df: invalid option -- '1' исчезнет, и проверки будут отрабатывать корректно в любом режиме (в том числе в --check). Остальные проверки роли (блокировки, пакеты, сеть и т.д.) не используют конвейеры и работают без изменений.
