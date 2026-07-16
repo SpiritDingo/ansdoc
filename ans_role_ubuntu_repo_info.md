@@ -252,3 +252,137 @@ _____
 · Итоговый список repo_info формируется через цикл по repo_entries с проверкой статуса из url_checks, что гарантирует корректную работу в любых версиях Jinja2.
 
 Роль готова к использованию. При необходимости можно добавить задачу для сохранения отчёта в файл.
+
+____
+
+
+Чтобы получить единый JSON-отчёт со всех серверов, роль должна сначала собрать информацию на каждом хосте, а затем одной задачей (с run_once) объединить данные из hostvars и сохранить в файл на управляющей машине.
+
+Ниже итоговый tasks/main.yml, который делает именно это. Результатом будет файл /tmp/all_hosts_repo_info.json на локальной машине (где запущен Ansible), содержащий словарь { "hostname": [ записи репозиториев ], ... }.
+
+```yaml
+---
+- name: Найти все файлы .list в директориях apt
+  ansible.builtin.find:
+    paths:
+      - /etc/apt/sources.list
+      - /etc/apt/sources.list.d
+    patterns: "*.list"
+    file_type: file
+  register: repo_files
+  become: yes
+
+- name: Прочитать содержимое найденных файлов
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
+  loop: "{{ repo_files.files }}"
+  register: repo_contents
+  become: yes
+
+- name: Извлечь строки репозиториев и URL для каждого файла
+  ansible.builtin.set_fact:
+    file_repos: >-
+      {{
+        file_repos | default({}) |
+        combine({item.item.path: parsed_lines})
+      }}
+  loop: "{{ repo_contents.results }}"
+  loop_control:
+    loop_var: item
+  vars:
+    content_str: "{{ item.content | b64decode }}"
+    raw_lines: "{{ content_str.splitlines() | map('trim') | select('match', '^\\s*deb(-src)?\\s+.*$') | list }}"
+    parsed_lines: >-
+      {%- set result = [] -%}
+      {%- for line in raw_lines -%}
+        {%- set url = line | regex_replace('^\\s*deb(-src)?\\s+', '') | regex_replace('\\s+.*$', '') -%}
+        {%- set _ = result.append({'file': item.item.path, 'line': line, 'url': url}) -%}
+      {%- endfor -%}
+      {{ result }}
+  when: content_str is defined
+
+- name: Объединить все записи репозиториев в единый список
+  ansible.builtin.set_fact:
+    repo_entries: "{{ file_repos.values() | sum(start=[]) }}"
+  when: file_repos is defined
+
+- name: Оставить только уникальные URL для проверки доступности
+  ansible.builtin.set_fact:
+    unique_urls: "{{ repo_entries | map(attribute='url') | unique | list }}"
+  when: repo_entries is defined
+
+- name: Проверить доступность каждого уникального URL репозитория
+  ansible.builtin.uri:
+    url: "{{ item }}"
+    method: HEAD
+    follow_redirects: safe
+    timeout: 10
+    validate_certs: no
+  register: url_checks
+  loop: "{{ unique_urls }}"
+  ignore_errors: yes
+  when: unique_urls is defined
+
+- name: Собрать итоговый список с признаком доступности
+  ansible.builtin.set_fact:
+    repo_info: "{{ repo_info | default([]) + [entry | combine({'accessible': is_accessible})] }}"
+  loop: "{{ repo_entries }}"
+  loop_control:
+    loop_var: entry
+  vars:
+    url_status: "{{ url_checks.results | selectattr('item', 'equalto', entry.url) | map(attribute='status') | first | default(-1) }}"
+    is_accessible: "{{ url_status in [200, 301, 302, 304, 401, 403] }}"
+  when: repo_entries is defined
+
+# --- Единый отчёт со всех хостов ---
+- name: Агрегировать данные со всех серверов и сохранить единый JSON
+  ansible.builtin.copy:
+    content: "{{ all_hosts_data | to_nice_json }}"
+    dest: "/tmp/all_hosts_repo_info.json"
+  delegate_to: localhost
+  run_once: true
+  vars:
+    all_hosts_data: >-
+      {%- set result = {} -%}
+      {%- for host in ansible_play_hosts_all -%}
+        {%- if hostvars[host].repo_info is defined -%}
+          {%- set _ = result.update({host: hostvars[host].repo_info}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ result }}
+```
+
+Как это работает
+
+1. Каждый хост обрабатывает свои APT-файлы, извлекает строки репозиториев, проверяет доступность URL и сохраняет результат в факт repo_info.
+2. Задача с run_once: true и delegate_to: localhost выполняется единожды на управляющей машине. Она перебирает весь список хостов из текущего плейбука (ansible_play_hosts_all), собирает их repo_info и формирует общий объект.
+3. Этот объект записывается в /tmp/all_hosts_repo_info.json на локальной машине.
+
+Формат итогового JSON
+
+```json
+{
+  "server01": [
+    {
+      "file": "/etc/apt/sources.list",
+      "line": "deb http://archive.ubuntu.com/ubuntu jammy main",
+      "url": "http://archive.ubuntu.com/ubuntu/",
+      "accessible": true
+    }
+  ],
+  "server02": [
+    ...
+  ]
+}
+```
+
+Использование в плейбуке
+
+```yaml
+- hosts: all_ubuntu
+  become: yes
+  roles:
+    - ubuntu_repo_info
+```
+
+После выполнения в /tmp/all_hosts_repo_info.json будет готовый сводный отчёт.
