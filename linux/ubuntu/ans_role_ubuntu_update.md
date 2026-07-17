@@ -352,3 +352,253 @@ templates/report.j2
 ```
 
 И всё же рекомендую первый вариант – он стандартный, идемпотентный и не зависит от формата вывода утилит.
+
+_______
+
+
+Я доработал роль, добавив возможность сохранять сформированный отчёт не только на целевом хосте, но и на локальной машине управления Ansible. Теперь отчёты автоматически копируются в указанную локальную директорию с уникальным именем, включающим хост и временную метку.
+
+Что изменилось
+
+defaults/main.yml — новые переменные
+
+```yaml
+# Сохранение отчёта локально (на control node)
+update_local_report: true                # включить/отключить
+update_local_report_dir: "./ansible_update_reports"  # локальный каталог (можно абсолютный путь)
+```
+
+tasks/main.yml — добавлены две таски в конец файла
+
+Фрагмент, который нужно вставить после задачи «Создать отчёт об обновлении»:
+
+```yaml
+- name: Убедиться, что локальная директория для отчётов существует
+  file:
+    path: "{{ update_local_report_dir }}"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  run_once: true
+  when:
+    - update_generate_report | bool
+    - update_local_report | bool
+
+- name: Скопировать отчёт на локальный сервер
+  fetch:
+    src: "{{ update_report_dir }}/update_report_{{ ansible_date_time.iso8601_basic_short }}.txt"
+    dest: "{{ update_local_report_dir }}/{{ inventory_hostname }}_{{ ansible_date_time.iso8601_basic_short }}.txt"
+    flat: yes
+  when:
+    - update_generate_report | bool
+    - update_local_report | bool
+```
+
+Пояснение работы
+
+1. Создание локальной папки – file с delegate_to: localhost гарантирует существование каталога на машине управления.
+2. Копирование файла – модуль fetch забирает отчёт с удалённого хоста и сохраняет под именем hostname_время.txt в локальной папке. Параметр flat: yes убирает вложенность с путём источника.
+3. Обе таски управляются флагами update_generate_report и update_local_report, что позволяет гибко отключать локальное сохранение.
+
+Полный листинг роли с учётом исправления ошибки дискового пространства и локального отчёта
+
+Ниже представлены итоговые файлы роли system_update, включая предыдущее исправление проверки свободного места через факты ansible_mounts.
+
+defaults/main.yml
+
+```yaml
+---
+# Тип обновления: safe, full, dist
+update_upgrade_type: safe
+
+# Автоматическое удаление старых пакетов и очистка кэша
+update_autoremove: true
+update_autoclean: true
+
+# Разрешить перезагрузку, если требуется (по умолчанию нет)
+update_reboot_allowed: false
+
+# Генерировать отчёт
+update_generate_report: true
+update_report_dir: /var/log/ansible-update
+
+# Локальное сохранение отчёта
+update_local_report: true
+update_local_report_dir: "./ansible_update_reports"
+
+# Таймауты и повторы
+update_lock_timeout: 300
+update_retries: 3
+update_delay: 10
+```
+
+tasks/main.yml
+
+```yaml
+---
+- name: Проверка совместимости
+  assert:
+    that:
+      - ansible_distribution == 'Ubuntu'
+      - ansible_distribution_version in ['22.04', '24.04']
+    fail_msg: "Роль поддерживает только Ubuntu 22.04 / 24.04. Текущая ОС: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+- name: Убедиться, что директория для отчётов существует
+  file:
+    path: "{{ update_report_dir }}"
+    state: directory
+    mode: '0755'
+  when: update_generate_report | bool
+
+- name: Ожидание снятия блокировок APT/DPKG
+  shell: |
+    for lock in /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock; do
+      while fuser "$lock" >/dev/null 2>&1; do
+        echo "Ожидание освобождения $lock..."
+        sleep 5
+      done
+    done
+  changed_when: false
+  register: wait_lock
+  timeout: "{{ update_lock_timeout }}"
+  args:
+    executable: /bin/bash
+
+- name: Проверка свободного места и предупреждение (через ansible_mounts)
+  vars:
+    check_mounts: ["/", "/boot"]
+    min_free_bytes: "{{ 1 * 1024**3 }}"   # 1 ГБ
+  debug:
+    msg: >
+      ⚠️ Внимание: на разделе {{ item.mount }} свободно
+      {{ (item.size_available / 1024**3) | round(2) }} ГБ,
+      что меньше {{ min_free_bytes / 1024**3 }} ГБ!
+  loop: "{{ ansible_mounts | selectattr('mount', 'in', check_mounts) | list }}"
+  when:
+    - item.size_available < min_free_bytes
+    - item.mount in check_mounts
+  loop_control:
+    label: "{{ item.mount }}"
+
+- name: Получить список пакетов до обновления
+  shell: dpkg-query -W -f='${Package} ${Version}\n' | sort > /tmp/pre-update-packages.txt
+  changed_when: false
+
+- name: Обновление кэша APT
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+  register: apt_update
+  retries: "{{ update_retries }}"
+  delay: "{{ update_delay }}"
+  until: apt_update is success
+
+- name: Безопасное обновление пакетов
+  block:
+    - name: Выполнение upgrade
+      apt:
+        upgrade: "{{ update_upgrade_type }}"
+        dpkg_options: 'force-confold,force-confdef'
+      register: apt_upgrade
+      retries: "{{ update_retries }}"
+      delay: "{{ update_delay }}"
+      until: apt_upgrade is success
+
+  rescue:
+    - name: Попытка исправить сломанные зависимости
+      apt:
+        name: '--fix-broken'
+        state: present
+      register: fix_broken
+
+    - name: Повторное обновление после исправления
+      apt:
+        upgrade: "{{ update_upgrade_type }}"
+        dpkg_options: 'force-confold,force-confdef'
+      register: apt_upgrade
+      retries: "{{ update_retries }}"
+      delay: "{{ update_delay }}"
+      until: apt_upgrade is success
+
+- name: Автоудаление и очистка кэша
+  apt:
+    autoremove: "{{ update_autoremove }}"
+    autoclean: "{{ update_autoclean }}"
+
+- name: Получить список пакетов после обновления
+  shell: dpkg-query -W -f='${Package} ${Version}\n' | sort > /tmp/post-update-packages.txt
+  changed_when: false
+
+- name: Сравнить версии пакетов
+  shell: diff /tmp/pre-update-packages.txt /tmp/post-update-packages.txt || true
+  register: diff_output
+  changed_when: false
+
+- name: Проверить необходимость перезагрузки
+  stat:
+    path: /var/run/reboot-required
+  register: reboot_required
+
+- name: Перезагрузить систему (если разрешено и требуется)
+  reboot:
+    reboot_timeout: 600
+    pre_reboot_delay: 10
+    post_reboot_delay: 20
+    test_command: uptime
+  when:
+    - reboot_required.stat.exists
+    - update_reboot_allowed | bool
+  notify: log reboot event
+
+- name: Создать отчёт об обновлении
+  template:
+    src: report.j2
+    dest: "{{ update_report_dir }}/update_report_{{ ansible_date_time.iso8601_basic_short }}.txt"
+    mode: '0644'
+  when: update_generate_report | bool
+
+- name: Убедиться, что локальная директория для отчётов существует
+  file:
+    path: "{{ update_local_report_dir }}"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  run_once: true
+  when:
+    - update_generate_report | bool
+    - update_local_report | bool
+
+- name: Скопировать отчёт на локальный сервер
+  fetch:
+    src: "{{ update_report_dir }}/update_report_{{ ansible_date_time.iso8601_basic_short }}.txt"
+    dest: "{{ update_local_report_dir }}/{{ inventory_hostname }}_{{ ansible_date_time.iso8601_basic_short }}.txt"
+    flat: yes
+  when:
+    - update_generate_report | bool
+    - update_local_report | bool
+
+- name: Удалить временные файлы
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /tmp/pre-update-packages.txt
+    - /tmp/post-update-packages.txt
+  changed_when: false
+```
+
+Остальные файлы (handlers/main.yml и templates/report.j2) не изменились.
+
+Пример использования с локальным сохранением
+
+```yaml
+- name: Обновление Ubuntu с сохранением отчёта локально
+  hosts: ubuntu_servers
+  become: yes
+  roles:
+    - role: system_update
+      vars:
+        update_local_report_dir: "/home/ansible/reports/{{ ansible_date_time.date }}"
+```
+
+После выполнения playbook в указанной локальной директории появятся файлы вида ya-testgd-001-d_20260717T150000.txt. Это позволяет централизованно хранить историю обновлений и использовать её для аудита.
