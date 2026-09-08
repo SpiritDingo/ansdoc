@@ -182,3 +182,44 @@ copy_method: "shell"            # или "synchronize"
 · Если Nexus требует аутентификации, укажите nexus_user и nexus_password.
 
 Роль может быть легко расширена (например, добавление уведомлений, перезапуск сервисов после деплоя через handlers).
+
+_____________
+_____________
+
+
+Роль полностью поддерживает архивы формата zip. Модуль unarchive в Ansible автоматически определяет тип архива по расширению файла и использует соответствующий инструмент для распаковки (для zip — unzip). Убедитесь, что на целевой машине установлен пакет unzip (обычно входит в стандартные репозитории).
+
+Пример настройки для zip-архива
+
+```yaml
+- name: Deploy zip artifact from Nexus
+  hosts: app_servers
+  roles:
+    - role: deploy_artifact
+      vars:
+        nexus_url: "http://nexus.local"
+        nexus_repository: "releases"
+        artifact_path: "com/example/app/1.0/app-1.0.zip"
+        archive_name: "app-1.0.zip"          # имя локального файла
+        target_dir: "/opt/application"
+        target_clean: true                   # очистить целевую директорию перед копированием
+        cleanup_temp: true
+        # Опционально: контрольная сумма и аутентификация
+        checksum: "sha256:abc123..."
+        nexus_user: "deployer"
+        nexus_password: "secret"
+```
+
+Если unzip не установлен
+
+Добавьте в роль отдельную задачу (например, в tasks/main.yml перед распаковкой), чтобы гарантировать наличие unzip на управляемом хосте:
+
+```yaml
+- name: Ensure unzip is installed (for zip archives)
+  package:
+    name: unzip
+    state: present
+  when: archive_name.endswith('.zip')
+```
+
+Это делает роль более самодостаточной для zip-артефактов, не требуя ручной установки на каждом сервере.
