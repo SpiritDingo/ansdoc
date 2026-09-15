@@ -694,3 +694,213 @@ temp_dir: "/tmp/kaspersky_install"
 3. **Для DEB** `apt` через параметр `deb:` сам разрешает зависимости и ставит пакет.
 4. **Проверьте имена файлов в Nexus.** Kaspersky использует разные схемы именования: `klnagent64_16.1.0-6517_amd64.deb` и `klnagent64-16.1.0-6517.x86_64.rpm`. Если у вас другие — просто поправьте переменные `klnagent_deb`/`klnagent_rpm`.
 5. **Версии `.sh` установщиков** оставлены в стороне — здесь используются нативные пакеты, что надёжнее на Ubuntu (решает вашу предыдущую ошибку с `dpkg`).
+_____________________________________________-
+
+
+Исправляю роль: вместо нативных `.rpm`/`.deb` пакетов используются установочные `.sh` скрипты, но выбор конкретного скрипта всё ещё зависит от дистрибутива.
+
+## 📁 `vars/main.yml`
+
+```yaml
+# Версии
+klnagent_version: "16.1.0-6517"
+kesl_version: "12.4.0-1342"
+
+# Базовый URL Nexus-репозитория
+nexus_base_url: "https://nexus.company.com/repository/kaspersky"
+
+# Установочные скрипты для KLNAgent
+klnagent_sh_rpm: "klnagent64-{{ klnagent_version }}.x86_64.sh"     # для RedHat
+klnagent_sh_deb: "klnagent64-{{ klnagent_version }}.amd64.sh"      # для Debian/Ubuntu
+
+# Установочные скрипты для KESL
+kesl_sh_rpm: "kesl-{{ kesl_version }}.x86_64.sh"                   # для RedHat
+kesl_sh_deb: "kesl-{{ kesl_version }}.amd64.sh"                    # для Debian/Ubuntu
+
+# Автовыбор скрипта в зависимости от ОС
+klnagent_sh: >-
+  {{ (ansible_os_family == 'RedHat') | ternary(klnagent_sh_rpm, klnagent_sh_deb) }}
+kesl_sh: >-
+  {{ (ansible_os_family == 'RedHat') | ternary(kesl_sh_rpm, kesl_sh_deb) }}
+
+# URL для скачивания
+klnagent_download_url: "{{ nexus_base_url }}/{{ klnagent_sh }}"
+kesl_download_url: "{{ nexus_base_url }}/{{ kesl_sh }}"
+
+# Временная директория
+temp_dir: "/tmp/kaspersky_install"
+```
+
+> ⚠️ Уточните точные имена скриптов в вашем Nexus. Kaspersky обычно публикует, например: `klnagent64-16.1.0-6517.x86_64.sh` и `kesl-12.4.0-1342.x86_64.sh`. Если имена одинаковые для обоих дистрибутивов — просто задайте одну переменную.
+
+## 📥 `tasks/download.yml`
+
+```yaml
+---
+- name: Создать временную директорию
+  ansible.builtin.file:
+    path: "{{ temp_dir }}"
+    state: directory
+    mode: '0755'
+
+- name: Определить скрипт для дистрибутива
+  ansible.builtin.debug:
+    msg: "ОС: {{ ansible_distribution }} | KLNAgent: {{ klnagent_sh }} | KESL: {{ kesl_sh }}"
+
+- name: Скачать установочный скрипт KLNAgent из Nexus
+  ansible.builtin.get_url:
+    url: "{{ klnagent_download_url }}"
+    dest: "{{ temp_dir }}/{{ klnagent_sh }}"
+    url_username: "{{ nexus_username }}"
+    url_password: "{{ nexus_password }}"
+    force_basic_auth: yes
+    mode: '0755'
+
+- name: Скачать установочный скрипт KESL из Nexus
+  ansible.builtin.get_url:
+    url: "{{ kesl_download_url }}"
+    dest: "{{ temp_dir }}/{{ kesl_sh }}"
+    url_username: "{{ nexus_username }}"
+    url_password: "{{ nexus_password }}"
+    force_basic_auth: yes
+    mode: '0755'
+```
+
+## 📦 `tasks/install_agent.yml`
+
+```yaml
+---
+- name: Установить KLNAgent (Debian/Ubuntu)
+  ansible.builtin.shell: |
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    cd {{ temp_dir }}
+    ./{{ klnagent_sh }} --autoinstall
+  args:
+    creates: /opt/kaspersky/klnagent64/sbin/klnagent
+  register: klnagent_install_deb
+  failed_when: klnagent_install_deb.rc != 0
+  when: ansible_os_family == "Debian"
+
+- name: Установить KLNAgent (RedHat)
+  ansible.builtin.shell: |
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    cd {{ temp_dir }}
+    ./{{ klnagent_sh }} --autoinstall
+  args:
+    creates: /opt/kaspersky/klnagent64/sbin/klnagent
+  register: klnagent_install_rpm
+  failed_when: klnagent_install_rpm.rc != 0
+  when: ansible_os_family == "RedHat"
+
+- name: Запустить и включить службу klnagent
+  ansible.builtin.systemd:
+    name: klnagent
+    state: started
+    enabled: yes
+```
+
+## 📦 `tasks/install_kesl.yml`
+
+```yaml
+---
+- name: Установить KESL (Debian/Ubuntu)
+  ansible.builtin.shell: |
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    cd {{ temp_dir }}
+    ./{{ kesl_sh }} --autoinstall
+  args:
+    creates: /opt/kaspersky/kesl/bin/kesl-control
+  register: kesl_install_deb
+  failed_when: kesl_install_deb.rc != 0
+  when: ansible_os_family == "Debian"
+
+- name: Установить KESL (RedHat)
+  ansible.builtin.shell: |
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    cd {{ temp_dir }}
+    ./{{ kesl_sh }} --autoinstall
+  args:
+    creates: /opt/kaspersky/kesl/bin/kesl-control
+  register: kesl_install_rpm
+  failed_when: kesl_install_rpm.rc != 0
+  when: ansible_os_family == "RedHat"
+```
+
+## 🗑 `tasks/uninstall_old.yml` (без изменений)
+
+```yaml
+---
+- name: Удалить старый KLNAgent (Debian/Ubuntu)
+  ansible.builtin.apt:
+    name: klnagent64
+    state: absent
+    purge: yes
+  when: ansible_os_family == "Debian"
+
+- name: Удалить старый KLNAgent (RedHat)
+  ansible.builtin.yum:
+    name: klnagent64
+    state: removed
+  when: ansible_os_family == "RedHat"
+
+- name: Удалить старый KESL (Debian/Ubuntu)
+  ansible.builtin.apt:
+    name: kesl
+    state: absent
+    purge: yes
+  when: ansible_os_family == "Debian"
+
+- name: Удалить старый KESL (RedHat)
+  ansible.builtin.yum:
+    name: kesl
+    state: removed
+  when: ansible_os_family == "RedHat"
+
+- name: Остановить и отключить службы (если остались)
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: no
+  loop:
+    - klnagent
+    - kesl
+  ignore_errors: yes
+```
+
+## 🧩 `tasks/main.yml`
+
+```yaml
+---
+- name: Удалить старые версии Kaspersky
+  ansible.builtin.import_tasks: uninstall_old.yml
+
+- name: Подготовка системы
+  ansible.builtin.import_tasks: prepare.yml
+
+- name: Скачать установочные скрипты из Nexus
+  ansible.builtin.import_tasks: download.yml
+
+- name: Установить KLNAgent
+  ansible.builtin.import_tasks: install_agent.yml
+
+- name: Установить KESL
+  ansible.builtin.import_tasks: install_kesl.yml
+```
+
+## 🔑 Ключевые изменения
+
+| Было | Стало |
+|------|-------|
+| `.rpm` / `.deb` пакеты | `.sh` установочные скрипты |
+| `apt: deb:` / `yum:` | `shell: ./script.sh --autoinstall` |
+| — | `export PATH=...` перед запуском (фикс вашей ошибки с `dpkg`) |
+| — | `args.creates:` — защита от повторной установки |
+| — | Отдельные задачи по `ansible_os_family` для разных скриптов |
+
+## ⚠️ Замечания
+
+1. **Имена скриптов** — обязательно проверьте фактические имена файлов в Nexus. Если Kaspersky отдаёт один универсальный `.sh` для всех ОС (как `kesl-12.4.0-1342.sh`), уберите разделение и оставьте одну переменную.
+2. **`export PATH`** — критично для Ubuntu, иначе скрипт не найдёт `dpkg` (ваша предыдущая ошибка).
+3. **`--autoinstall`** — автоматический режим, без запросов.
+4. **`creates:`** — если файл уже существует, задача пропускается (идемпотентность).
+5. **`become: yes`** — обязательно для установки в `/opt`.
