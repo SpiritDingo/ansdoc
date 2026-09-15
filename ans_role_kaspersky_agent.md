@@ -496,3 +496,201 @@ ansible-playbook -i inventory/production install_kaspersky.yml --ask-vault-pass
 ```
 
 Теперь перед установкой новых версий система будет очищена от старых компонентов Kaspersky. Если нужно сохранить какие-то настройки — не используйте purge и ручное удаление каталогов.
+
+____________________________________________
+_____________________________________________
+___________________________________________
+
+
+Внесу изменения в роль: в `vars/main.yml` добавлю переменные с путями для RPM и DEB, а в задачах — выбор нужного пакета в зависимости от дистрибутива.
+
+## 📁 `vars/main.yml`
+
+```yaml
+# Версии
+klnagent_version: "16.1.0-6517"
+kesl_version: "12.4.0-1342"
+
+# Базовый URL Nexus-репозитория
+nexus_base_url: "https://nexus.company.com/repository/kaspersky"
+
+# Дистрибутивы для KLNAgent
+klnagent_rpm: "klnagent64-{{ klnagent_version }}.x86_64.rpm"
+klnagent_deb: "klnagent64_{{ klnagent_version }}_amd64.deb"
+
+# Дистрибутивы для KESL
+kesl_rpm: "kesl-{{ kesl_version }}.x86_64.rpm"
+kesl_deb: "kesl_{{ kesl_version }}_amd64.deb"
+
+# Выбор пакета в зависимости от ОС (определяется автоматически)
+klnagent_pkg: >-
+  {{ (ansible_os_family == 'RedHat') | ternary(klnagent_rpm, klnagent_deb) }}
+kesl_pkg: >-
+  {{ (ansible_os_family == 'RedHat') | ternary(kesl_rpm, kesl_deb) }}
+
+# Тип пакета
+pkg_type: "{{ (ansible_os_family == 'RedHat') | ternary('rpm', 'deb') }}"
+
+# URL для скачивания
+klnagent_download_url: "{{ nexus_base_url }}/{{ klnagent_pkg }}"
+kesl_download_url: "{{ nexus_base_url }}/{{ kesl_pkg }}"
+
+# Временная директория
+temp_dir: "/tmp/kaspersky_install"
+```
+
+## 📥 `tasks/download.yml` (скачивание нужного пакета)
+
+```yaml
+---
+- name: Создать временную директорию
+  ansible.builtin.file:
+    path: "{{ temp_dir }}"
+    state: directory
+    mode: '0755'
+
+- name: Определить тип пакета для дистрибутива
+  ansible.builtin.debug:
+    msg: "Дистрибутив: {{ ansible_distribution }} | Будет скачан: {{ klnagent_pkg }} и {{ kesl_pkg }}"
+
+- name: Скачать пакет KLNAgent из Nexus
+  ansible.builtin.get_url:
+    url: "{{ klnagent_download_url }}"
+    dest: "{{ temp_dir }}/{{ klnagent_pkg }}"
+    url_username: "{{ nexus_username }}"
+    url_password: "{{ nexus_password }}"
+    force_basic_auth: yes
+    mode: '0644'
+
+- name: Скачать пакет KESL из Nexus
+  ansible.builtin.get_url:
+    url: "{{ kesl_download_url }}"
+    dest: "{{ temp_dir }}/{{ kesl_pkg }}"
+    url_username: "{{ nexus_username }}"
+    url_password: "{{ nexus_password }}"
+    force_basic_auth: yes
+    mode: '0644'
+```
+
+## 🗑 `tasks/uninstall_old.yml` (удаление старых версий)
+
+```yaml
+---
+- name: Удалить старый KLNAgent (Debian/Ubuntu)
+  ansible.builtin.apt:
+    name: klnagent64
+    state: absent
+    purge: yes
+  when: ansible_os_family == "Debian"
+
+- name: Удалить старый KLNAgent (RedHat)
+  ansible.builtin.yum:
+    name: klnagent64
+    state: removed
+  when: ansible_os_family == "RedHat"
+
+- name: Удалить старый KESL (Debian/Ubuntu)
+  ansible.builtin.apt:
+    name: kesl
+    state: absent
+    purge: yes
+  when: ansible_os_family == "Debian"
+
+- name: Удалить старый KESL (RedHat)
+  ansible.builtin.yum:
+    name: kesl
+    state: removed
+  when: ansible_os_family == "RedHat"
+
+- name: Остановить и отключить службы (если остались)
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: no
+  loop:
+    - klnagent
+    - kesl
+  ignore_errors: yes
+```
+
+## 📦 `tasks/install_agent.yml`
+
+```yaml
+---
+- name: Установить KLNAgent (Debian/Ubuntu)
+  ansible.builtin.apt:
+    deb: "{{ temp_dir }}/{{ klnagent_pkg }}"
+    state: present
+  when: ansible_os_family == "Debian"
+
+- name: Установить KLNAgent (RedHat)
+  ansible.builtin.yum:
+    name: "{{ temp_dir }}/{{ klnagent_pkg }}"
+    state: present
+    disable_gpg_check: yes
+  when: ansible_os_family == "RedHat"
+
+- name: Запустить и включить службу klnagent
+  ansible.builtin.systemd:
+    name: klnagent
+    state: started
+    enabled: yes
+```
+
+## 📦 `tasks/install_kesl.yml`
+
+```yaml
+---
+- name: Установить KESL (Debian/Ubuntu)
+  ansible.builtin.apt:
+    deb: "{{ temp_dir }}/{{ kesl_pkg }}"
+    state: present
+  when: ansible_os_family == "Debian"
+
+- name: Установить KESL (RedHat)
+  ansible.builtin.yum:
+    name: "{{ temp_dir }}/{{ kesl_pkg }}"
+    state: present
+    disable_gpg_check: yes
+  when: ansible_os_family == "RedHat"
+```
+
+## 🧩 `tasks/main.yml`
+
+```yaml
+---
+- name: Удалить старые версии Kaspersky
+  ansible.builtin.import_tasks: uninstall_old.yml
+
+- name: Подготовка системы
+  ansible.builtin.import_tasks: prepare.yml
+
+- name: Скачать пакеты из Nexus
+  ansible.builtin.import_tasks: download.yml
+
+- name: Установить KLNAgent
+  ansible.builtin.import_tasks: install_agent.yml
+
+- name: Установить KESL
+  ansible.builtin.import_tasks: install_kesl.yml
+```
+
+## 🧪 Пример плейбука
+
+```yaml
+- hosts: all
+  become: yes
+  vars_files:
+    - vars/main.yml
+    - vars/vault.yml   # nexus_username / nexus_password через ansible-vault
+  roles:
+    - kaspersky_agent
+```
+
+## ⚠️ Важные замечания
+
+1. **Тернарный оператор `ternary`** позволяет выбрать пакет на основе `ansible_os_family`. Работает через Jinja2, поддерживается во всех версиях Ansible 2.9+.
+2. **`disable_gpg_check: yes`** для RPM нужен, если пакеты Kaspersky не подписаны ключом в вашей системе. Если подписаны — можно убрать и импортировать ключ.
+3. **Для DEB** `apt` через параметр `deb:` сам разрешает зависимости и ставит пакет.
+4. **Проверьте имена файлов в Nexus.** Kaspersky использует разные схемы именования: `klnagent64_16.1.0-6517_amd64.deb` и `klnagent64-16.1.0-6517.x86_64.rpm`. Если у вас другие — просто поправьте переменные `klnagent_deb`/`klnagent_rpm`.
+5. **Версии `.sh` установщиков** оставлены в стороне — здесь используются нативные пакеты, что надёжнее на Ubuntu (решает вашу предыдущую ошибку с `dpkg`).
