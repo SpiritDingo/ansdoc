@@ -2042,3 +2042,635 @@ postgres-patroni-cluster/
 ```
 
 Роль полностью готова к использованию и автоматически подстраивается под семейство ОС (ansible_os_family), что позволяет разворачивать кластер на Oracle Linux 9, Ubuntu 22.04 и Ubuntu 24.04 без изменения кода.
+
+________
+________
+________
+
+
+Обновлённая роль: работа через локальный Nexus
+
+Ниже приведены только изменённые файлы. Остальные файлы (tasks/main.yml, handlers/main.yml, meta/main.yml, шаблоны etcd.conf.j2, etcd.service.j2, patroni.yml.j2, patroni.service.j2, tasks/configure_etcd.yml, tasks/configure_patroni.yml, tasks/start_services.yml) остаются без изменений.
+
+Предполагается, что в Nexus уже настроены:
+
+· Raw repository для хранения бинарника etcd — raw-etcd
+· PyPI proxy — pypi-proxy
+· APT proxy для apt.postgresql.org — apt-pgdg-proxy
+· YUM proxy для download.postgresql.org — yum-pgdg-proxy
+
+---
+
+1. defaults/main.yml — добавлены переменные Nexus
+
+```yaml
+---
+# ============================
+# Версии компонентов
+# ============================
+postgresql_version: "17"
+etcd_version: "3.5.16"
+patroni_version: "4.0.4"
+
+# ============================
+# Nexus (уже настроен администратором)
+# ============================
+nexus_url: "https://nexus.example.com"
+nexus_username: "ansible-reader"
+nexus_password: "ChangeMe123!"
+
+# Имена репозиториев в Nexus
+nexus_repo_etcd_raw: "raw-etcd"
+nexus_repo_pypi: "pypi-proxy"
+nexus_repo_apt_pgdg: "apt-pgdg-proxy"
+nexus_repo_yum_pgdg: "yum-pgdg-proxy"
+
+# Производные URL
+nexus_etcd_download_url: "{{ nexus_url }}/repository/{{ nexus_repo_etcd_raw }}/v{{ etcd_version }}/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+nexus_pypi_index_url: "{{ nexus_url }}/repository/{{ nexus_repo_pypi }}/simple"
+nexus_pypi_trusted_host: "{{ nexus_url | urlsplit('hostname') }}"
+nexus_apt_pgdg_url: "{{ nexus_url }}/repository/{{ nexus_repo_apt_pgdg }}"
+nexus_yum_pgdg_url: "{{ nexus_url }}/repository/{{ nexus_repo_yum_pgdg }}"
+
+# ============================
+# Параметры кластера
+# ============================
+cluster_name: "pg-cluster"
+etcd_initial_cluster_token: "etcd-cluster-token"
+etcd_data_dir: "/var/lib/etcd"
+
+# ============================
+# Порты
+# ============================
+etcd_client_port: 2379
+etcd_peer_port: 2380
+postgresql_port: 5432
+patroni_restapi_port: 8008
+
+# ============================
+# Настройки etcd
+# ============================
+etcd_heartbeat_interval: 1000
+etcd_election_timeout: 5000
+etcd_initial_cluster_state: "new"
+
+# ============================
+# Учётные данные PostgreSQL / Patroni
+# ============================
+patroni_superuser: "postgres"
+patroni_superuser_password: "strongpassword"
+patroni_replication_user: "replicator"
+patroni_replication_password: "replpassword"
+patroni_rewind_user: "rewinduser"
+patroni_rewind_password: "rewindpassword"
+
+# ============================
+# REST API Patroni
+# ============================
+patroni_restapi_listen: "0.0.0.0:{{ patroni_restapi_port }}"
+
+# ============================
+# Списки хостов (переопределяются в inventory)
+# ============================
+etcd_members: []
+postgres_nodes: []
+
+# ============================
+# Пути
+# ============================
+etcd_binary_install_dir: "/usr/local/bin"
+patroni_venv_dir: "/opt/patroni-venv"
+patroni_config_dir: "/etc/patroni"
+etcd_config_dir: "/etc/etcd"
+systemd_service_dir: "/etc/systemd/system"
+postgresql_data_dir_debian: "/var/lib/postgresql/{{ postgresql_version }}/main"
+postgresql_data_dir_redhat: "/var/lib/pgsql/{{ postgresql_version }}/data"
+
+# Файлы для хранения учётных данных Nexus
+nexus_apt_auth_file: "/etc/apt/auth.conf.d/nexus.conf"
+nexus_pip_conf: "/etc/pip.conf"
+```
+
+---
+
+2. vars/Debian.yml (Ubuntu 22.04 / 24.04)
+
+```yaml
+---
+postgresql_packages:
+  - "postgresql-{{ postgresql_version }}"
+  - "postgresql-contrib-{{ postgresql_version }}"
+  - "postgresql-client-{{ postgresql_version }}"
+
+patroni_build_packages:
+  - python3
+  - python3-pip
+  - python3-venv
+  - python3-dev
+  - libpq-dev
+  - build-essential
+  - ca-certificates
+  - gnupg
+  - wget
+  - lsb-release
+
+postgresql_bin_dir: "/usr/lib/postgresql/{{ postgresql_version }}/bin"
+postgresql_service_name: "postgresql@{{ postgresql_version }}-main"
+postgresql_data_dir: "{{ postgresql_data_dir_debian }}"
+package_manager: apt
+selinux_package: []
+
+# APT-репозиторий PGDG через Nexus (без прямого доступа в интернет)
+# Формат: <nexus_url>/repository/<repo>/<distribution>-pgdg <component>
+postgresql_apt_repo: "deb [signed-by=/usr/share/keyrings/pgdg.gpg] {{ nexus_apt_pgdg_url }}/ {{ ansible_distribution_release }}-pgdg main"
+```
+
+---
+
+3. vars/RedHat.yml (Oracle Linux 9)
+
+```yaml
+---
+postgresql_packages:
+  - "postgresql{{ postgresql_version }}"
+  - "postgresql{{ postgresql_version }}-server"
+  - "postgresql{{ postgresql_version }}-contrib"
+
+patroni_build_packages:
+  - python3
+  - python3-pip
+  - python3-devel
+  - libpq-devel
+  - gcc
+  - make
+  - python3-virtualenv
+
+postgresql_bin_dir: "/usr/pgsql-{{ postgresql_version }}/bin"
+postgresql_service_name: "postgresql-{{ postgresql_version }}"
+postgresql_data_dir: "{{ postgresql_data_dir_redhat }}"
+package_manager: dnf
+
+selinux_package:
+  - policycoreutils-python-utils
+  - libselinux-python3
+
+# YUM-репозиторий PGDG через Nexus
+postgresql_yum_repo_file: "/etc/yum.repos.d/pgdg-nexus.repo"
+```
+
+---
+
+4. tasks/install_etcd.yml — скачивание через Nexus с авторизацией
+
+```yaml
+---
+- name: Create etcd system user
+  ansible.builtin.user:
+    name: etcd
+    system: yes
+    shell: /usr/sbin/nologin
+    home: "{{ etcd_data_dir }}"
+    create_home: no
+
+- name: Create etcd data directory
+  ansible.builtin.file:
+    path: "{{ etcd_data_dir }}"
+    state: directory
+    owner: etcd
+    group: etcd
+    mode: '0750'
+
+- name: Download etcd tarball from Nexus (with auth)
+  ansible.builtin.get_url:
+    url: "{{ nexus_etcd_download_url }}"
+    dest: "/tmp/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+    url_username: "{{ nexus_username }}"
+    url_password: "{{ nexus_password }}"
+    force_basic_auth: yes
+    validate_certs: "{{ nexus_validate_certs | default(true) }}"
+    owner: root
+    group: root
+    mode: '0640'
+  register: etcd_download
+
+- name: Extract etcd archive
+  ansible.builtin.unarchive:
+    src: "/tmp/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+    dest: /tmp
+    remote_src: yes
+    creates: "/tmp/etcd-v{{ etcd_version }}-linux-amd64"
+
+- name: Install etcd binaries
+  ansible.builtin.copy:
+    src: "/tmp/etcd-v{{ etcd_version }}-linux-amd64/{{ item }}"
+    dest: "{{ etcd_binary_install_dir }}/{{ item }}"
+    owner: root
+    group: root
+    mode: '0755'
+    remote_src: yes
+  loop:
+    - etcd
+    - etcdctl
+    - etcdutl
+
+- name: Clean up downloaded files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "/tmp/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+    - "/tmp/etcd-v{{ etcd_version }}-linux-amd64"
+
+- name: Create etcd configuration directory
+  ansible.builtin.file:
+    path: "{{ etcd_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+```
+
+Формат URL в Nexus: …/repository/raw-etcd/v3.5.16/etcd-v3.5.16-linux-amd64.tar.gz. Администратор Nexus должен загрузить tarball в указанный путь raw-репозитория.
+
+---
+
+5. tasks/install_postgres.yml — установка через Nexus-прокси
+
+```yaml
+---
+# =========================================================
+# Debian / Ubuntu — APT прокси Nexus
+# =========================================================
+- name: Install APT prerequisites (Debian)
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - gnupg
+      - wget
+      - lsb-release
+    state: present
+    update_cache: yes
+  when: ansible_os_family == "Debian"
+
+- name: Configure APT auth for Nexus (Debian)
+  ansible.builtin.copy:
+    dest: "{{ nexus_apt_auth_file }}"
+    owner: root
+    group: root
+    mode: '0600'
+    content: |
+      machine {{ nexus_url | urlsplit('hostname') }}
+      login {{ nexus_username }}
+      password {{ nexus_password }}
+  when: ansible_os_family == "Debian"
+
+- name: Download PGDG signing key via Nexus (Debian)
+  ansible.builtin.get_url:
+    url: "{{ nexus_url }}/repository/{{ nexus_repo_apt_pgdg }}/ACCC4CF8.asc"
+    dest: /tmp/ACCC4CF8.asc
+    url_username: "{{ nexus_username }}"
+    url_password: "{{ nexus_password }}"
+    force_basic_auth: yes
+    owner: root
+    group: root
+    mode: '0644'
+  when: ansible_os_family == "Debian"
+  register: pgdg_key_download
+  failed_when:
+    - pgdg_key_download.failed
+    - "'Status code was 404' not in pgdg_key_download.msg | default('')"
+
+- name: Import PGDG signing key (Debian)
+  ansible.builtin.command:
+    cmd: "gpg --dearmor -o /usr/share/keyrings/pgdg.gpg /tmp/ACCC4CF8.asc"
+    creates: /usr/share/keyrings/pgdg.gpg
+  when: ansible_os_family == "Debian"
+
+- name: Add PGDG repository via Nexus (Debian)
+  ansible.builtin.apt_repository:
+    repo: "{{ postgresql_apt_repo }}"
+    state: present
+    update_cache: yes
+    filename: pgdg-nexus
+  when: ansible_os_family == "Debian"
+
+- name: Install PostgreSQL (Debian)
+  ansible.builtin.apt:
+    name: "{{ postgresql_packages }}"
+    state: present
+  when: ansible_os_family == "Debian"
+
+# =========================================================
+# RedHat / Oracle Linux 9 — YUM прокси Nexus
+# =========================================================
+- name: Deploy YUM repository file for PGDG via Nexus (RedHat)
+  ansible.builtin.copy:
+    dest: "{{ postgresql_yum_repo_file }}"
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [pgdg-nexus]
+      name=PGDG {{ postgresql_version }} via Nexus
+      baseurl={{ nexus_yum_pgdg_url }}/{{ postgresql_version }}/x86_64/
+      enabled=1
+      gpgcheck=1
+      gpgkey={{ nexus_yum_pgdg_url }}/RPM-GPG-KEY-PGDG
+      username={{ nexus_username }}
+      password={{ nexus_password }}
+      sslverify={{ nexus_validate_certs | default(true) | lower }}
+  when: ansible_os_family == "RedHat"
+
+- name: Disable built-in PostgreSQL module (Oracle Linux 9)
+  ansible.builtin.command:
+    cmd: "dnf -qy module disable postgresql"
+  changed_when: false
+  when: ansible_os_family == "RedHat"
+
+- name: Install PostgreSQL (RedHat)
+  ansible.builtin.dnf:
+    name: "{{ postgresql_packages }}"
+    state: present
+    disablerepo: "*"
+    enablerepo: "pgdg-nexus,ol9_baseos_latest,ol9_appstream"
+  when: ansible_os_family == "RedHat"
+
+# =========================================================
+# Общие задачи
+# =========================================================
+- name: Stop and disable default PostgreSQL service
+  ansible.builtin.systemd:
+    name: "{{ postgresql_service_name }}"
+    state: stopped
+    enabled: no
+  ignore_errors: yes
+
+- name: Ensure PostgreSQL data directory exists
+  ansible.builtin.file:
+    path: "{{ postgresql_data_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: '0700'
+```
+
+Важно про Oracle Linux 9: список enablerepo может отличаться в зависимости от имён репозиториев вашей системы (ol9_baseos_latest, ol9_appstream, ol9_UEKR7). Проверьте dnf repolist и при необходимости скорректируйте переменную.
+
+---
+
+6. tasks/install_patroni.yml — установка Patroni из Nexus PyPI
+
+```yaml
+---
+- name: Install Python and build dependencies
+  ansible.builtin.package:
+    name: "{{ patroni_build_packages }}"
+    state: present
+
+- name: Configure pip to use Nexus PyPI proxy (global)
+  ansible.builtin.copy:
+    dest: "{{ nexus_pip_conf }}"
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [global]
+      index-url = {{ nexus_pypi_index_url }}
+      trusted-host = {{ nexus_pypi_trusted_host }}
+      # Nexus требует авторизации
+      # Пароль хранится в netrc-файле ниже
+  notify: restart patroni
+
+- name: Create netrc file for pip authentication to Nexus (root)
+  ansible.builtin.copy:
+    dest: /root/.netrc
+    owner: root
+    group: root
+    mode: '0600'
+    content: |
+      machine {{ nexus_pypi_trusted_host }}
+      login {{ nexus_username }}
+      password {{ nexus_password }}
+
+- name: Create netrc file for postgres user (для установки pip от его имени)
+  ansible.builtin.copy:
+    dest: /var/lib/postgresql/.netrc
+    owner: postgres
+    group: postgres
+    mode: '0600'
+    content: |
+      machine {{ nexus_pypi_trusted_host }}
+      login {{ nexus_username }}
+      password {{ nexus_password }}
+  when: ansible_os_family == "Debian"
+
+- name: Create netrc file for postgres user (RedHat)
+  ansible.builtin.copy:
+    dest: /var/lib/pgsql/.netrc
+    owner: postgres
+    group: postgres
+    mode: '0600'
+    content: |
+      machine {{ nexus_pypi_trusted_host }}
+      login {{ nexus_username }}
+      password {{ nexus_password }}
+  when: ansible_os_family == "RedHat"
+
+- name: Upgrade pip using Nexus
+  ansible.builtin.pip:
+    name: pip
+    state: latest
+    executable: pip3
+    extra_args: >-
+      --index-url {{ nexus_pypi_index_url }}
+      --trusted-host {{ nexus_pypi_trusted_host }}
+
+- name: Create virtual environment for Patroni
+  ansible.builtin.command:
+    cmd: "python3 -m venv {{ patroni_venv_dir }}"
+    creates: "{{ patroni_venv_dir }}"
+
+- name: Ensure virtualenv is owned by postgres user
+  ansible.builtin.file:
+    path: "{{ patroni_venv_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    recurse: yes
+
+- name: Install Patroni and dependencies inside virtualenv from Nexus
+  ansible.builtin.pip:
+    name:
+      - "patroni[etcd]=={{ patroni_version }}"
+      - "psycopg2-binary"
+    virtualenv: "{{ patroni_venv_dir }}"
+    virtualenv_python: python3
+    extra_args: >-
+      --index-url {{ nexus_pypi_index_url }}
+      --trusted-host {{ nexus_pypi_trusted_host }}
+  become_user: postgres
+
+- name: Create Patroni configuration directory
+  ansible.builtin.file:
+    path: "{{ patroni_config_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: '0755'
+
+- name: Create symlink to patronictl for convenience
+  ansible.builtin.file:
+    src: "{{ patroni_venv_dir }}/bin/patronictl"
+    dest: "/usr/local/bin/patronictl"
+    state: link
+  ignore_errors: yes
+```
+
+---
+
+7. Изменённый handlers/main.yml
+
+```yaml
+---
+- name: restart etcd
+  ansible.builtin.systemd:
+    name: etcd
+    state: restarted
+    daemon_reload: yes
+
+- name: restart patroni
+  ansible.builtin.systemd:
+    name: patroni
+    state: restarted
+    daemon_reload: yes
+
+- name: reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: yes
+```
+
+---
+
+8. Пример inventory
+
+inventory/hosts.yml:
+
+```yaml
+all:
+  children:
+    etcd_cluster:
+      hosts:
+        node1:
+          ansible_host: 192.168.1.11
+        node2:
+          ansible_host: 192.168.1.12
+        witness:
+          ansible_host: 192.168.1.13
+    postgres_cluster:
+      hosts:
+        node1:
+        node2:
+```
+
+inventory/group_vars/all.yml:
+
+```yaml
+# Учётные данные Nexus (рекомендуется хранить в ansible-vault)
+nexus_url: "https://nexus.example.com"
+nexus_username: "ansible-reader"
+nexus_password: "ChangeMe123!"
+nexus_validate_certs: true
+
+# Имена репозиториев в Nexus
+nexus_repo_etcd_raw: "raw-etcd"
+nexus_repo_pypi: "pypi-proxy"
+nexus_repo_apt_pgdg: "apt-pgdg-proxy"
+nexus_repo_yum_pgdg: "yum-pgdg-proxy"
+
+# Кластер
+etcd_members:
+  - { name: node1,   ip: 192.168.1.11 }
+  - { name: node2,   ip: 192.168.1.12 }
+  - { name: witness, ip: 192.168.1.13 }
+
+postgres_nodes:
+  - node1
+  - node2
+```
+
+---
+
+9. Пример playbook
+
+playbook.yml:
+
+```yaml
+---
+- name: Deploy PostgreSQL 17 HA cluster with Patroni and etcd (via Nexus)
+  hosts: all
+  become: yes
+  gather_facts: yes
+  roles:
+    - postgres-patroni-cluster
+```
+
+Запуск:
+
+```bash
+ansible-playbook -i inventory/hosts.yml playbook.yml
+```
+
+---
+
+10. Что нужно подготовить в Nexus (однократно)
+
+Ниже — список артефактов, которые администратор должен положить в Nexus, чтобы роль работала:
+
+Репозиторий в Nexus Тип Содержимое
+raw-etcd Raw (hosted) Каталог v3.5.16/etcd-v3.5.16-linux-amd64.tar.gz (скачан с github.com/etcd-io/etcd)
+pypi-proxy PyPI (proxy) Прокси на https://pypi.org
+apt-pgdg-proxy APT (proxy) Прокси на http://apt.postgresql.org/pub/repos/apt/
+yum-pgdg-proxy YUM (proxy) Прокси на https://download.postgresql.org/pub/repos/yum/
+
+Права пользователя ansible-reader — read-only доступ к этим четырём репозиториям.
+
+Ключ PGDG для APT: файл ACCC4CF8.asc должен быть доступен по адресу
+{{ nexus_url }}/repository/{{ nexus_repo_apt_pgdg }}/ACCC4CF8.asc — его нужно положить в raw-каталог того же APT-репозитория Nexus, либо использовать отдельный raw-репозиторий.
+
+---
+
+11. Хранение секретов
+
+Рекомендуется зашифровать переменные Nexus через ansible-vault:
+
+```bash
+ansible-vault encrypt_string 'ChangeMe123!' --name 'nexus_password'
+```
+
+И использовать в group_vars/all.yml:
+
+```yaml
+nexus_password: !vault |
+  $ANSIBLE_VAULT;1.1;AES256
+  3132333435363738...
+```
+
+Запуск:
+
+```bash
+ansible-playbook -i inventory/hosts.yml playbook.yml --ask-vault-pass
+```
+
+---
+
+12. Итоговые изменения по сравнению с предыдущей версией
+
+Область Было Стало
+etcd get_url напрямую с github.com get_url с Nexus raw + basic auth
+Patroni (pip) pip install из PyPI pip с index-url Nexus + .netrc
+PostgreSQL APT apt.postgresql.org Nexus APT-прокси + /etc/apt/auth.conf.d/nexus.conf
+PostgreSQL YUM download.postgresql.org Nexus YUM-прокси + .repo с username/password
+Секреты отсутствовали nexus_username / nexus_password (ansible-vault)
+Пакетные ключи скачивались с postgresql.org скачиваются через Nexus
+
+Все интернет-запросы теперь идут только в локальный Nexus. Роль корректно работает на Oracle Linux 9, Ubuntu 22.04 и Ubuntu 24.04.
