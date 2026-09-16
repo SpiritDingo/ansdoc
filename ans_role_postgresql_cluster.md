@@ -659,3 +659,502 @@ playbook.yml:
 · Для witness-ноды не выполняется установка и настройка PostgreSQL/Patroni, так как она не входит в группу postgres_cluster.
 
 Данная роль полностью автоматизирует развёртывание отказоустойчивого кластера PostgreSQL 17 с Patroni и etcd.
+
+Вот обновлённая Ansible-роль с поддержкой Oracle Linux 9, Ubuntu 22.04 и Ubuntu 24.04. Основные изменения коснулись структуры переменных (по семействам ОС) и задач установки.
+
+📁 Обновлённая структура роли
+
+```
+postgres-patroni-cluster/
+├── defaults/
+│   └── main.yml
+├── vars/
+│   ├── main.yml
+│   ├── Debian.yml          # Ubuntu 22.04 / 24.04
+│   └── RedHat.yml          # Oracle Linux 9
+├── tasks/
+│   ├── main.yml
+│   ├── install_postgres.yml
+│   ├── install_etcd.yml
+│   ├── install_patroni.yml
+│   ├── configure_etcd.yml
+│   ├── configure_patroni.yml
+│   └── start_services.yml
+├── templates/
+│   ├── etcd.conf.j2
+│   ├── etcd.service.j2
+│   ├── patroni.yml.j2
+│   └── patroni.service.j2
+├── handlers/
+│   └── main.yml
+└── meta/
+    └── main.yml
+```
+
+---
+
+1. vars/main.yml — загрузчик ОС-переменных
+
+```yaml
+---
+# Загружаем переменные, специфичные для семейства ОС
+- name: Load OS-specific variables
+  ansible.builtin.include_vars: "{{ ansible_os_family }}.yml"
+```
+
+Этот файл вызывается в tasks/main.yml первой задачей, чтобы все последующие задачи уже имели доступ к нужным путям и именам пакетов.
+
+---
+
+2. vars/Debian.yml (Ubuntu 22.04 / 24.04)
+
+```yaml
+---
+# Пакеты для установки PostgreSQL
+postgresql_packages:
+  - "postgresql-{{ postgresql_version }}"
+  - "postgresql-contrib-{{ postgresql_version }}"
+  - "postgresql-client-{{ postgresql_version }}"
+
+# Пакеты для сборки/установки Patroni
+patroni_build_packages:
+  - python3
+  - python3-pip
+  - python3-venv
+  - python3-dev
+  - libpq-dev
+  - build-essential
+
+# Путь к бинарникам PostgreSQL
+postgresql_bin_dir: "/usr/lib/postgresql/{{ postgresql_version }}/bin"
+
+# Имя systemd-сервиса PostgreSQL (для остановки/отключения)
+postgresql_service_name: "postgresql@{{ postgresql_version }}-main"
+
+# Пакетный менеджер
+package_manager: apt
+
+# Зависимости для etcd (бинарная установка — не требуются)
+etcd_dependencies: []
+```
+
+---
+
+3. vars/RedHat.yml (Oracle Linux 9)
+
+```yaml
+---
+# Пакеты для установки PostgreSQL (PGDG RHEL-репозиторий)
+postgresql_packages:
+  - "postgresql{{ postgresql_version }}"
+  - "postgresql{{ postgresql_version }}-server"
+  - "postgresql{{ postgresql_version }}-contrib"
+
+# Пакеты для сборки/установки Patroni
+patroni_build_packages:
+  - python3
+  - python3-pip
+  - python3-devel
+  - libpq-devel
+  - gcc
+  - make
+
+# Путь к бинарникам PostgreSQL
+postgresql_bin_dir: "/usr/pgsql-{{ postgresql_version }}/bin"
+
+# Имя systemd-сервиса PostgreSQL
+postgresql_service_name: "postgresql-{{ postgresql_version }}"
+
+# Пакетный менеджер
+package_manager: dnf
+
+# Зависимости для etcd (бинарная установка — не требуются)
+etcd_dependencies: []
+```
+
+---
+
+4. Обновлённый tasks/main.yml
+
+```yaml
+---
+- name: Load OS-specific variables
+  ansible.builtin.include_vars: "{{ ansible_os_family }}.yml"
+
+- name: Install etcd on all nodes
+  include_tasks: install_etcd.yml
+  when: inventory_hostname in groups['etcd_cluster']
+
+- name: Install PostgreSQL on database nodes
+  include_tasks: install_postgres.yml
+  when: inventory_hostname in groups['postgres_cluster']
+
+- name: Install Patroni on database nodes
+  include_tasks: install_patroni.yml
+  when: inventory_hostname in groups['postgres_cluster']
+
+- name: Configure etcd on all nodes
+  include_tasks: configure_etcd.yml
+  when: inventory_hostname in groups['etcd_cluster']
+
+- name: Configure Patroni on database nodes
+  include_tasks: configure_patroni.yml
+  when: inventory_hostname in groups['postgres_cluster']
+
+- name: Start services
+  include_tasks: start_services.yml
+```
+
+---
+
+5. Обновлённый tasks/install_postgres.yml (кросс-платформенный)
+
+```yaml
+---
+# ===== Debian / Ubuntu =====
+- name: Add PostgreSQL repository key (Debian family)
+  ansible.builtin.apt_key:
+    url: "https://www.postgresql.org/media/keys/ACCC4CF8.asc"
+    state: present
+  when: ansible_os_family == "Debian"
+
+- name: Add PostgreSQL repository (Debian family)
+  ansible.builtin.apt_repository:
+    repo: "deb http://apt.postgresql.org/pub/repos/apt {{ ansible_distribution_release }}-pgdg main"
+    state: present
+    update_cache: yes
+  when: ansible_os_family == "Debian"
+
+- name: Install PostgreSQL (Debian family)
+  ansible.builtin.apt:
+    name: "{{ postgresql_packages }}"
+    state: present
+  when: ansible_os_family == "Debian"
+
+# ===== RedHat / Oracle Linux =====
+- name: Install PGDG repository RPM (RedHat family)
+  ansible.builtin.dnf:
+    name: "https://download.postgresql.org/pub/repos/yum/reporpms/EL-{{ ansible_distribution_major_version }}-x86_64/pgdg-redhat-repo-latest.noarch.rpm"
+    state: present
+    disable_gpg_check: yes
+  when: ansible_os_family == "RedHat"
+
+- name: Disable built-in PostgreSQL module (Oracle Linux 9)
+  ansible.builtin.command:
+    cmd: "dnf -qy module disable postgresql"
+  changed_when: false
+  when: ansible_os_family == "RedHat"
+
+- name: Install PostgreSQL (RedHat family)
+  ansible.builtin.dnf:
+    name: "{{ postgresql_packages }}"
+    state: present
+  when: ansible_os_family == "RedHat"
+
+# ===== Общие задачи =====
+- name: Stop and disable default PostgreSQL service (Patroni will manage it)
+  ansible.builtin.systemd:
+    name: "{{ postgresql_service_name }}"
+    state: stopped
+    enabled: no
+  ignore_errors: yes
+
+- name: Ensure PostgreSQL data directory exists and is owned by postgres
+  ansible.builtin.file:
+    path: "{{ postgresql_data_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: '0700'
+```
+
+---
+
+6. Обновлённый tasks/install_patroni.yml
+
+```yaml
+---
+- name: Install Python and build dependencies
+  ansible.builtin.package:
+    name: "{{ patroni_build_packages }}"
+    state: present
+
+- name: Ensure pip is up to date
+  ansible.builtin.pip:
+    name: pip
+    state: latest
+    executable: pip3
+
+- name: Create virtual environment for Patroni
+  ansible.builtin.command:
+    cmd: "python3 -m venv {{ patroni_venv_dir }}"
+    creates: "{{ patroni_venv_dir }}"
+
+- name: Ensure virtualenv is owned by postgres user
+  ansible.builtin.file:
+    path: "{{ patroni_venv_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    recurse: yes
+
+- name: Install Patroni and dependencies inside virtualenv
+  ansible.builtin.pip:
+    name:
+      - "patroni[etcd]=={{ patroni_version }}"
+      - "psycopg2-binary"
+    virtualenv: "{{ patroni_venv_dir }}"
+    virtualenv_python: python3
+  become_user: postgres
+
+- name: Create Patroni configuration directory
+  ansible.builtin.file:
+    path: "{{ patroni_config_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: '0755'
+```
+
+Важно: ansible.builtin.pip требует наличия pip на целевом хосте. Для Oracle Linux 9 может потребоваться пакет python3-pip (он уже включён в patroni_build_packages).
+
+---
+
+7. Обновлённый tasks/install_etcd.yml (бинарная установка — одинаково для всех ОС)
+
+```yaml
+---
+- name: Create etcd system user
+  ansible.builtin.user:
+    name: etcd
+    system: yes
+    shell: /usr/sbin/nologin
+    home: "{{ etcd_data_dir }}"
+    create_home: no
+
+- name: Create etcd data directory
+  ansible.builtin.file:
+    path: "{{ etcd_data_dir }}"
+    state: directory
+    owner: etcd
+    group: etcd
+    mode: '0750'
+
+- name: Download etcd binary
+  ansible.builtin.get_url:
+    url: "https://github.com/etcd-io/etcd/releases/download/v{{ etcd_version }}/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+    dest: "/tmp/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+    mode: '0644'
+
+- name: Extract etcd archive
+  ansible.builtin.unarchive:
+    src: "/tmp/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+    dest: /tmp
+    remote_src: yes
+    creates: "/tmp/etcd-v{{ etcd_version }}-linux-amd64"
+
+- name: Install etcd binaries
+  ansible.builtin.copy:
+    src: "/tmp/etcd-v{{ etcd_version }}-linux-amd64/{{ item }}"
+    dest: "{{ etcd_binary_install_dir }}/{{ item }}"
+    owner: root
+    group: root
+    mode: '0755'
+    remote_src: yes
+  loop:
+    - etcd
+    - etcdctl
+    - etcdutl
+
+- name: Clean up downloaded files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "/tmp/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+    - "/tmp/etcd-v{{ etcd_version }}-linux-amd64"
+
+- name: Create etcd configuration directory
+  ansible.builtin.file:
+    path: "{{ etcd_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+```
+
+---
+
+8. Обновлённый tasks/start_services.yml
+
+```yaml
+---
+- name: Start etcd service on all etcd nodes
+  ansible.builtin.systemd:
+    name: etcd
+    state: started
+    enabled: yes
+  when: inventory_hostname in groups['etcd_cluster']
+
+- name: Wait for etcd cluster to be healthy
+  ansible.builtin.command:
+    cmd: "etcdctl --endpoints={% for m in etcd_members %}http://{{ m.ip }}:{{ etcd_client_port }}{% if not loop.last %},{% endif %}{% endfor %} endpoint health"
+  register: etcd_health
+  until: etcd_health.rc == 0
+  retries: 30
+  delay: 5
+  changed_when: false
+  when: inventory_hostname in groups['etcd_cluster'] and inventory_hostname == groups['etcd_cluster'][0]
+
+- name: Start Patroni service on database nodes
+  ansible.builtin.systemd:
+    name: patroni
+    state: started
+    enabled: yes
+  when: inventory_hostname in groups['postgres_cluster']
+
+- name: Wait for Patroni to initialise PostgreSQL cluster
+  ansible.builtin.command:
+    cmd: "{{ patroni_venv_dir }}/bin/patronictl -c {{ patroni_config_dir }}/patroni.yml list"
+  register: patroni_status
+  until: patroni_status.rc == 0
+  retries: 30
+  delay: 5
+  changed_when: false
+  when: inventory_hostname in groups['postgres_cluster'] and inventory_hostname == groups['postgres_cluster'][0]
+```
+
+---
+
+9. Обновлённый шаблон templates/patroni.yml.j2
+
+Единственное изменение — путь к бинарникам PostgreSQL теперь берётся из переменной postgresql_bin_dir:
+
+```yaml
+postgresql:
+  listen: 0.0.0.0:{{ postgresql_port }}
+  connect_address: {{ ansible_default_ipv4.address }}:{{ postgresql_port }}
+  data_dir: {{ postgresql_data_dir }}
+  bin_dir: {{ postgresql_bin_dir }}
+  pgpass: /tmp/pgpass
+  # ... остальное без изменений
+```
+
+---
+
+10. Обновлённый templates/etcd.service.j2
+
+Для Oracle Linux 9 (SELinux) может потребоваться добавить контекст. Рекомендуется добавить строку SELinuxContext или использовать restorecon после установки. В остальном unit-файл универсален:
+
+```ini
+[Unit]
+Description=etcd key-value store
+Documentation=https://etcd.io/docs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=etcd
+Group=etcd
+EnvironmentFile=-{{ etcd_config_dir }}/etcd.conf
+ExecStart={{ etcd_binary_install_dir }}/etcd
+Restart=always
+RestartSec=5s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+```
+
+---
+
+11. Обновлённый meta/main.yml
+
+```yaml
+---
+galaxy_info:
+  author: "Your Name"
+  description: "Deploy PostgreSQL 17 HA cluster with Patroni and etcd (2 DB nodes + witness) on Oracle Linux 9, Ubuntu 22.04/24.04"
+  license: "MIT"
+  min_ansible_version: "2.12"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - jammy
+        - noble
+    - name: EL
+      versions:
+        - "9"
+  galaxy_tags:
+    - postgresql
+    - patroni
+    - etcd
+    - highavailability
+    - cluster
+dependencies: []
+```
+
+---
+
+12. Пример inventory
+
+```yaml
+all:
+  children:
+    etcd_cluster:
+      hosts:
+        node1:
+          ansible_host: 192.168.1.11
+        node2:
+          ansible_host: 192.168.1.12
+        witness:
+          ansible_host: 192.168.1.13
+    postgres_cluster:
+      hosts:
+        node1:
+        node2:
+```
+
+group_vars/all.yml:
+
+```yaml
+etcd_members:
+  - { name: node1, ip: 192.168.1.11 }
+  - { name: node2, ip: 192.168.1.12 }
+  - { name: witness, ip: 192.168.1.13 }
+
+postgres_nodes:
+  - node1
+  - node2
+```
+
+---
+
+13. Ключевые различия для Oracle Linux 9
+
+Параметр Ubuntu 22.04 / 24.04 Oracle Linux 9
+Пакетный менеджер apt dnf
+Репозиторий PGDG apt.postgresql.org pgdg-redhat-repo-latest.noarch.rpm (EL-9)
+Пакеты PostgreSQL postgresql-17, postgresql-contrib-17 postgresql17, postgresql17-server, postgresql17-contrib
+Путь к бинарникам /usr/lib/postgresql/17/bin /usr/pgsql-17/bin
+systemd-сервис PG postgresql@17-main postgresql-17
+Отключение встроенного модуля Не требуется dnf -qy module disable postgresql
+
+Примечание: на Oracle Linux 9 SELinux может блокировать работу etcd/Patroni. Роль не отключает SELinux. При необходимости добавьте задачу с ansible.posix.selinux: state=permissive или настройте политики.
+
+---
+
+14. Запуск плейбука
+
+```bash
+ansible-playbook -i inventory/hosts.yml playbook.yml
+```
+
+Проверка выполняется так же, как описано ранее: etcdctl endpoint health и patronictl list.
+
+Теперь роль автоматически определяет семейство ОС (ansible_os_family) и применяет соответствующие переменные и задачи, что позволяет использовать её на Oracle Linux 9 и Ubuntu 22.04/24.04 без изменений.
+
+______________
+______________
+
