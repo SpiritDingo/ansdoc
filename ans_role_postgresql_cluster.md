@@ -3866,3 +3866,306 @@ etcdctl --endpoints=http://node1:2379,http://node2:2379,http://witness:2379 endp
 · quota-backend-bytes=8 GiB — дефолт etcd. Увеличивайте только при обоснованной необходимости (максимум 8 GiB рекомендован etcd-сообществом для стабильной работы).
 · Не ставьте retention слишком большим (например, 720h / 30 дней) — БД etcd быстро вырастет и приблизится к квоте, что вызовет перевод кластера в read-only режим (NOSPACE alarm).
 
+____________
+____________
+
+
+Изменения в роли: установка Patroni из .tar.gz архива, скачанного с Nexus
+
+Ниже — только изменённые файлы. Остальные файлы роли (tasks/main.yml, tasks/detect_pgdg_repo.yml, tasks/install_etcd.yml, tasks/install_postgres.yml, tasks/configure_etcd.yml, tasks/configure_patroni.yml, tasks/start_services.yml, все шаблоны, handlers/main.yml, meta/main.yml, vars/*.yml) остаются без изменений.
+
+Идея
+
+1. В Nexus raw-репозитории raw-python-wheels лежат:
+   · patroni/patroni-{{ patroni_version }}.tar.gz — исходный архив Patroni (с PyPI или GitHub).
+   · patroni/deps/ — каталог с wheels зависимостей (psycopg2-binary и транзитивные).
+2. Роль скачивает архив через get_url с basic auth.
+3. Распаковывает в /tmp.
+4. Создаёт venv.
+5. Ставит Patroni из распакованной директории (pip install .[etcd]), а зависимости подтягиваются из Nexus wheels (--find-links).
+
+---
+
+1. defaults/main.yml — изменённые переменные
+
+Замените блок с URL-производными для Patroni:
+
+```yaml
+# ============================================================
+# URL-производные
+# ============================================================
+nexus_hostname: "{{ nexus_url | urlsplit('hostname') }}"
+
+nexus_etcd_download_url: >-
+  {{ nexus_url }}/repository/{{ nexus_repo_etcd_raw }}/v{{ etcd_version }}/etcd-v{{ etcd_version }}-linux-amd64.tar.gz
+
+# --- Patroni: архив .tar.gz + отдельная папка с wheels для зависимостей ---
+nexus_patroni_archive_url: >-
+  {{ nexus_url }}/repository/{{ nexus_repo_python_raw }}/patroni/patroni-{{ patroni_version }}.tar.gz
+
+nexus_patroni_deps_find_links: >-
+  {{ nexus_url }}/repository/{{ nexus_repo_python_raw }}/patroni/deps/
+
+# Временный каталог для распаковки
+patroni_build_tmp_dir: "/tmp/patroni-build"
+```
+
+Остальные переменные (nexus_*, версии, пути и т.п.) не меняются. Обратите внимание: nexus_patroni_find_links_url из прошлой версии больше не используется — её можно удалить.
+
+---
+
+2. tasks/install_patroni.yml — полностью заменяем
+
+```yaml
+---
+# ============================================================
+# Установка Patroni из .tar.gz архива, скачанного с Nexus
+# 1) Устанавливаем системные пакеты для сборки Python-модулей
+# 2) Настраиваем авторизацию (.netrc) для pip и get_url
+# 3) Скачиваем patroni-{{ patroni_version }}.tar.gz из Nexus
+# 4) Распаковываем архив
+# 5) Создаём venv
+# 6) Устанавливаем Patroni из распакованного каталога
+#    (зависимости подтягиваются из Nexus wheels через --find-links)
+# ============================================================
+
+- name: Install Python and build dependencies
+  ansible.builtin.package:
+    name: "{{ patroni_build_packages }}"
+    state: present
+
+# ---------- Авторизация pip и get_url в Nexus через .netrc ----------
+- name: Create netrc file for root (Nexus auth)
+  ansible.builtin.copy:
+    dest: /root/.netrc
+    owner: root
+    group: root
+    mode: '0600'
+    content: |
+      machine {{ nexus_hostname }}
+      login {{ nexus_username }}
+      password {{ nexus_password }}
+
+- name: Create netrc file for postgres user (Nexus auth)
+  ansible.builtin.copy:
+    dest: "{{ postgres_home }}/.netrc"
+    owner: postgres
+    group: postgres
+    mode: '0600'
+    content: |
+      machine {{ nexus_hostname }}
+      login {{ nexus_username }}
+      password {{ nexus_password }}
+
+# ---------- Скачивание архива Patroni из Nexus ----------
+- name: Ensure build tmp directory exists
+  ansible.builtin.file:
+    path: "{{ patroni_build_tmp_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Download Patroni tarball from Nexus (with auth)
+  ansible.builtin.get_url:
+    url: "{{ nexus_patroni_archive_url }}"
+    dest: "{{ patroni_build_tmp_dir }}/patroni-{{ patroni_version }}.tar.gz"
+    url_username: "{{ nexus_username }}"
+    url_password: "{{ nexus_password }}"
+    force_basic_auth: yes
+    validate_certs: "{{ nexus_validate_certs }}"
+    owner: root
+    group: root
+    mode: '0640'
+
+- name: Extract Patroni tarball
+  ansible.builtin.unarchive:
+    src: "{{ patroni_build_tmp_dir }}/patroni-{{ patroni_version }}.tar.gz"
+    dest: "{{ patroni_build_tmp_dir }}"
+    remote_src: yes
+    creates: "{{ patroni_build_tmp_dir }}/patroni-{{ patroni_version }}"
+
+- name: Ensure extracted sources owned by postgres
+  ansible.builtin.file:
+    path: "{{ patroni_build_tmp_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    recurse: yes
+
+# ---------- Создание venv ----------
+- name: Create virtual environment for Patroni
+  ansible.builtin.command:
+    cmd: "python3 -m venv {{ patroni_venv_dir }}"
+    creates: "{{ patroni_venv_dir }}"
+
+- name: Ensure virtualenv is owned by postgres user
+  ansible.builtin.file:
+    path: "{{ patroni_venv_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    recurse: yes
+
+# ---------- Установка Patroni из распакованного каталога ----------
+# Зависимости (psycopg2-binary и др.) берутся из Nexus wheels.
+# Если Nexus PyPI proxy доступен — можно опустить --no-index.
+- name: Install Patroni from extracted source (offline, deps from Nexus wheels)
+  ansible.builtin.pip:
+    name: ".[etcd]"
+    chdir: "{{ patroni_build_tmp_dir }}/patroni-{{ patroni_version }}"
+    virtualenv: "{{ patroni_venv_dir }}"
+    virtualenv_python: python3
+    extra_args: >-
+      --no-index
+      --find-links={{ nexus_patroni_deps_find_links }}
+      --trusted-host {{ nexus_hostname }}
+  become_user: postgres
+  register: patroni_install_result
+
+- name: Show pip install output (debug)
+  ansible.builtin.debug:
+    msg: "{{ patroni_install_result.stdout_lines | default([]) }}"
+  when: patroni_install_result is defined
+
+# ---------- Проверка установки ----------
+- name: Verify Patroni installed
+  ansible.builtin.command:
+    cmd: "{{ patroni_venv_dir }}/bin/patroni --version"
+  register: patroni_version_check
+  changed_when: false
+  become_user: postgres
+
+- name: Show installed Patroni version
+  ansible.builtin.debug:
+    msg: "Installed Patroni: {{ patroni_version_check.stdout }}"
+
+# ---------- Конфигурация ----------
+- name: Ensure Patroni config directory exists
+  ansible.builtin.file:
+    path: "{{ patroni_config_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: '0755'
+
+- name: Create symlink to patronictl for convenience
+  ansible.builtin.file:
+    src: "{{ patroni_venv_dir }}/bin/patronictl"
+    dest: "/usr/local/bin/patronictl"
+    state: link
+  ignore_errors: yes
+
+# ---------- Очистка временных файлов ----------
+- name: Clean up Patroni build tmp directory
+  ansible.builtin.file:
+    path: "{{ patroni_build_tmp_dir }}"
+    state: absent
+```
+
+---
+
+3. Что должно лежать в Nexus
+
+В raw-репозитории raw-python-wheels:
+
+```
+raw-python-wheels/
+└── patroni/
+    ├── patroni-4.0.4.tar.gz              ← исходный архив Patroni
+    └── deps/
+        ├── psycopg2_binary-2.9.9-*.whl
+        ├── PyYAML-*.whl
+        ├── urllib3-*.whl
+        ├── requests-*.whl
+        ├── click-*.whl
+        ├── prettytable-*.whl
+        ├── ydiff-*.whl
+        ├── pysyncobj-*.whl
+        ├── python_dateutil-*.whl
+        ├── six-*.whl
+        └── ... (все транзитивные зависимости Patroni)
+```
+
+Как подготовить архив и wheels (однократно, на машине с интернетом)
+
+```bash
+# 1. Скачиваем исходник Patroni с PyPI (sdist = .tar.gz)
+pip download patroni==4.0.4 --no-deps --no-binary :all: -d ./patroni-src
+
+# 2. Скачиваем все зависимости (wheels, бинарные)
+mkdir -p ./patroni-deps
+pip download "patroni[etcd]==4.0.4" \
+    --dest ./patroni-deps \
+    --only-binary=:all: \
+    --python-version 3.10 \
+    --platform manylinux2014_x86_64
+
+# 3. Проверяем, что получилось
+ls ./patroni-src     # patroni-4.0.4.tar.gz
+ls ./patroni-deps    # все .whl транзитивных зависимостей
+```
+
+Затем в Nexus:
+
+· patroni-src/patroni-4.0.4.tar.gz → raw-python-wheels/patroni/patroni-4.0.4.tar.gz
+· всё содержимое patroni-deps/* → raw-python-wheels/patroni/deps/
+
+---
+
+4. Что изменилось по сравнению с предыдущей версией
+
+Аспект Было Стало
+Источник Patroni wheels через pip --no-index --find-links .tar.gz архив с Nexus raw + распаковка
+Установка pip install patroni[etcd]=={{ version }} pip install .[etcd] из распакованной директории
+Зависимости те же wheels из …/patroni/{{ version }}/ те же wheels из …/patroni/deps/
+Способ скачивания неявный (через pip) явный get_url с basic auth
+Возможность --check ограничена явные шаги (download → extract → install)
+
+---
+
+5. Запуск
+
+```bash
+# Полный деплой
+ansible-playbook playbooks/site.yml
+
+# Только PostgreSQL + Patroni (если etcd уже развёрнут)
+ansible-playbook playbooks/postgres-only.yml
+
+# Проверка после установки
+ansible-playbook playbooks/verify.yml
+```
+
+Ожидаемый вывод по завершении задачи Show installed Patroni version:
+
+```
+ok: [node1] => {
+    "msg": "Installed Patroni: patroni 4.0.4"
+}
+```
+
+И в patronictl list:
+
+```
++ Cluster: pg-cluster (7xxxxxxxxxxxxx) ----+----+-----------+
+| Member | Host          | Role    | State   | TL | Lag in MB |
++--------+---------------+---------+---------+----+-----------+
+| node1  | 192.168.1.11  | Leader  | running |  1 |           |
+| node2  | 192.168.1.12  | Replica | running |  1 |         0 |
++--------+---------------+---------+---------+----+-----------+
+```
+
+---
+
+6. Примечания
+
+· Если в Nexus настроен PyPI proxy, можно упростить задачу — убрать --no-index и --find-links, оставив --index-url {{ nexus_url }}/repository/<pypi-proxy>/simple. Тогда зависимости будут подтягиваться из прокси, а сам Patroni — из архива.
+· Если --trusted-host не нужен (Nexus с валидным TLS-сертификатом) — уберите его.
+· При обновлении версии Patroni нужно:
+  1. Положить новый patroni-<X.Y.Z>.tar.gz в Nexus.
+  2. Проверить, что зависимости новой версии также присутствуют в deps/.
+  3. Запустить playbook с -e patroni_version=<X.Y.Z>.
+
+Роль готова к использованию с установкой Patroni из локального Nexus-архива.
+
