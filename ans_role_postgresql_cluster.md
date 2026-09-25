@@ -3721,3 +3721,148 @@ _______________________________
 _______________________________
 
 
+Добавление auto-compaction параметров в etcd
+
+Параметры --auto-compaction-mode=period и --auto-compaction-retention=72h в etcd задаются через конфигурационный файл или аргументы командной строки. Ниже — изменения в трёх файлах роли.
+
+---
+
+1. defaults/main.yml — добавить переменные
+
+Добавьте в секцию «Настройки etcd»:
+
+```yaml
+# ============================================================
+# Настройки etcd
+# ============================================================
+etcd_heartbeat_interval: 1000
+etcd_election_timeout: 5000
+etcd_initial_cluster_state: "new"
+
+# Автокомпакция истории etcd (защита от роста БД)
+etcd_auto_compaction_mode: "period"       # period | revision
+etcd_auto_compaction_retention: "72h"     # для period: "72h" / "1h"; для revision: число (например, "10000")
+
+# Прочие опциональные параметры etcd
+etcd_quota_backend_bytes: "8589934592"    # 8 GiB — размер БД etcd
+etcd_log_level: "info"                    # debug | info | warn | error
+```
+
+---
+
+2. templates/etcd.conf.j2 — добавить параметры
+
+```ini
+# {{ ansible_managed }}
+name: {{ inventory_hostname }}
+data-dir: {{ etcd_data_dir }}
+listen-client-urls: http://{{ ansible_default_ipv4.address }}:{{ etcd_client_port }}
+advertise-client-urls: http://{{ ansible_default_ipv4.address }}:{{ etcd_client_port }}
+listen-peer-urls: http://{{ ansible_default_ipv4.address }}:{{ etcd_peer_port }}
+initial-advertise-peer-urls: http://{{ ansible_default_ipv4.address }}:{{ etcd_peer_port }}
+initial-cluster: {% for member in etcd_members %}{{ member.name }}=http://{{ member.ip }}:{{ etcd_peer_port }}{% if not loop.last %},{% endif %}{% endfor %}
+initial-cluster-state: {{ etcd_initial_cluster_state }}
+initial-cluster-token: {{ etcd_initial_cluster_token }}
+heartbeat-interval: {{ etcd_heartbeat_interval }}
+election-timeout: {{ etcd_election_timeout }}
+
+# --- Auto-compaction ---
+auto-compaction-mode: {{ etcd_auto_compaction_mode }}
+auto-compaction-retention: {{ etcd_auto_compaction_retention }}
+
+# --- Прочее ---
+quota-backend-bytes: {{ etcd_quota_backend_bytes }}
+log-level: {{ etcd_log_level }}
+```
+
+Формат в config-файле: без префикса -- и через двоеточие (не =). etcd сам преобразует CLI-флаги в такой формат.
+
+---
+
+3. templates/etcd.service.j2 — альтернативный вариант (флаги CLI)
+
+Если вы предпочитаете передавать параметры аргументами командной строки (а не через EnvironmentFile), unit можно оформить так:
+
+```ini
+[Unit]
+Description=etcd key-value store
+Documentation=https://etcd.io/docs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=etcd
+Group=etcd
+EnvironmentFile=-{{ etcd_config_dir }}/etcd.conf
+ExecStart={{ etcd_binary_install_dir }}/etcd \
+    --auto-compaction-mode={{ etcd_auto_compaction_mode }} \
+    --auto-compaction-retention={{ etcd_auto_compaction_retention }} \
+    --quota-backend-bytes={{ etcd_quota_backend_bytes }}
+Restart=always
+RestartSec=5s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+```
+
+⚠️ Не используйте одновременно оба способа — параметры из ExecStart имеют приоритет над EnvironmentFile, но дублирование усложняет отладку. Рекомендуется один способ: либо config-файл, либо CLI-флаги.
+
+---
+
+Какой способ выбрать
+
+Способ Плюсы Минусы
+Config-файл (etcd.conf.j2) Единый источник настроек, легко читать, поддерживает комментарии Требует перезапуска etcd при изменении
+CLI-флаги (etcd.service.j2) Видны в systemctl cat etcd Сложнее читать при большом количестве параметров
+
+Я рекомендую config-файл — именно этот вариант показан в пункте 2.
+
+---
+
+Применение изменений
+
+После правок запустите роль повторно. Handler restart etcd перезапустит сервис, поскольку файл etcd.conf изменился:
+
+```bash
+ansible-playbook -i inventory/hosts.yml playbook.yml --limit etcd_cluster --tags etcd
+```
+
+Либо принудительно:
+
+```bash
+ansible-playbook -i inventory/hosts.yml playbook.yml --limit etcd_cluster
+```
+
+---
+
+Проверка после применения
+
+На любой ноде etcd:
+
+```bash
+# 1. Проверить, что параметры применились
+ETCDCTL_API=3 etcdctl --endpoints=http://node1:2379 endpoint status --write-out=table
+
+# 2. Посмотреть фактические настройки через systemd
+systemctl show etcd | grep -i compaction
+# или
+grep -E 'compaction' /etc/etcd/etcd.conf
+
+# 3. Проверить, что сервис запущен и здоров
+systemctl status etcd
+etcdctl --endpoints=http://node1:2379,http://node2:2379,http://witness:2379 endpoint health
+```
+
+Ожидаемый вывод endpoint status — размер БД etcd (DB SIZE) должен стабилизироваться и не расти бесконечно благодаря автокомпакции.
+
+---
+
+Дополнительно: рекомендации по значениям
+
+· auto-compaction-mode=period, retention=72h — оптимально для продакшена с умеренной нагрузкой на etcd (сохраняет 3 суток истории). Стандартное значение по умолчанию — 5h.
+· Если нагрузка на запись в etcd очень высокая, уменьшите до 24h или 12h.
+· quota-backend-bytes=8 GiB — дефолт etcd. Увеличивайте только при обоснованной необходимости (максимум 8 GiB рекомендован etcd-сообществом для стабильной работы).
+· Не ставьте retention слишком большим (например, 720h / 30 дней) — БД etcd быстро вырастет и приблизится к квоте, что вызовет перевод кластера в read-only режим (NOSPACE alarm).
+
