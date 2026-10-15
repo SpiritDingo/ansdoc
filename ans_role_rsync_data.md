@@ -998,3 +998,70 @@ ansible-playbook -i inventory.ini playbooks/sync.yml --check --diff
 · sync_log_to_syslog: true пишет в journald/syslog на целевом хосте, что удобно для централизованного сбора (rsyslog → SIEM).
 · sync_log_verbosity: verbose печатает всю структуру sync_log_record в консоль Ansible — полезно при отладке плейбука.
 · failed_when: sync_result is failed оставлено явно, чтобы отловить ошибки rsync и прервать роль до записи «ложноположительного» лога. При необходимости можно добавить отдельную ветку block/rescue для логирования сбоев.
+
+________
+________
+
+Ошибка возникает из-за того, что модуль ansible.posix.synchronize не принимает параметры ssh_args и timeout. В поддерживаемых параметрах, которые перечислены в ошибке, есть _ssh_args и rsync_timeout. Нужно заменить их в задаче синхронизации.
+
+Что исправить в tasks/main.yml
+
+Найдите блок Синхронизировать данные между серверами и замените в нём:
+
+· ssh_args: "{{ sync_ssh_args }}" → _ssh_args: "{{ sync_ssh_args }}"
+· timeout: "{{ sync_timeout }}" → rsync_timeout: "{{ sync_timeout }}"
+
+Вот исправленный фрагмент задачи:
+
+```yaml
+- name: Синхронизировать данные между серверами
+  ansible.posix.synchronize:
+    src: "{{ sync_src }}"
+    dest: "{{ sync_dest }}"
+    mode: "{{ sync_mode }}"
+    delete: "{{ sync_delete }}"
+    recursive: yes
+    archive: yes
+    compress: yes
+    rsync_opts: >-
+      {{
+        sync_rsync_opts
+        + (['--bwlimit=' ~ (sync_active_bwlimit | string)] if (sync_active_bwlimit | int) > 0 else [])
+        + (['--stats'] if sync_enable_stats | bool else [])
+      }}
+    _ssh_args: "{{ sync_ssh_args }}"
+    rsync_timeout: "{{ sync_timeout }}"
+  delegate_to: "{{ sync_source_host }}"
+  run_once: true
+  register: sync_result
+  changed_when: sync_result is changed
+  failed_when: sync_result is failed
+```
+
+Альтернативный, более правильный способ для SSH-опций
+
+Параметр _ssh_args помечен в документации как «Internal use only» (только для внутреннего использования). Хотя он присутствует в списке поддерживаемых параметров, полагаться на внутренний параметр не рекомендуется.
+
+Лучший способ — использовать use_ssh_args: true и задать нужные SSH-опции через переменные Ansible. Для этого в defaults/main.yml можно добавить:
+
+```yaml
+# SSH-опции для rsync (передаются через use_ssh_args)
+ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o Compression=no"
+```
+
+А в задаче синхронизации заменить _ssh_args на:
+
+```yaml
+    use_ssh_args: true
+```
+
+Тогда модуль сам подставит ansible_ssh_common_args (и другие SSH-настройки) при вызове rsync. Это официально поддерживаемый путь.
+
+Итог
+
+Минимальное исправление — заменить в задаче два параметра:
+
+· ssh_args → _ssh_args
+· timeout → rsync_timeout
+
+Если хотите сделать «по-правильному» — уберите ssh_args/_ssh_args и используйте use_ssh_args: true вместе с ansible_ssh_common_args.
