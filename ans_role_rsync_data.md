@@ -1065,3 +1065,153 @@ ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev
 · timeout → rsync_timeout
 
 Если хотите сделать «по-правильному» — уберите ssh_args/_ssh_args и используйте use_ssh_args: true вместе с ansible_ssh_common_args.
+
+____
+____
+____
+
+Причина ошибки
+
+Смотрим на команду, которую построил rsync:
+
+```
+rsync user01@localhost:/tmp/test-src/  /tmp/test-dest/
+```
+
+rsync пытается тянуть данные с localhost на localhost — то есть с самого себя, поэтому и наступает io timeout after 301 seconds.
+
+Так происходит, потому что в роли стоит:
+
+· sync_mode: pull — в этом режиме rsync считает src удалённым источником и подключается к «удалённому» хосту, которым в контексте задачи является хост из delegate_to;
+· delegate_to: sync_source_host — задача выполняется на источнике, значит «удалённый» = сам источник = localhost.
+
+Получается замкнутый круг: задача на источнике тянет с источника же.
+
+Плюс всплывают две второстепенные проблемы:
+
+· дублирование SSH-опций (-o StrictHostKeyChecking=no ... повторяется дважды) — _ssh_args наложился на ansible_ssh_common_args;
+· предупреждение Identity file /home/user01/.ssh/id_ed25519 not accessible — rsync пытается использовать ключ, которого нет.
+
+Исправления
+
+1. roles/sync_data/defaults/main.yml
+
+Меняем режим по умолчанию на push (это как раз то, что нужно: «толкать данные с источника на приёмник») и убираем дублирование SSH-опций:
+
+```yaml
+# Направление: push — задача на источнике, src локальный, dest удалённый.
+# pull — имеет смысл только при delegate_to: sync_dest_host.
+sync_mode: "push"
+
+# SSH-опции, которые будут переданы rsync (не дублируются,
+# т.к. _ssh_args мы больше не задаём в задаче).
+sync_ssh_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+# Ключ, который реально существует на источнике
+sync_ssh_private_key: ""
+
+# Таймаут rsync
+sync_timeout: 300
+```
+
+2. roles/sync_data/tasks/main.yml
+
+Заменяем задачу синхронизации на такую версию (только этот блок меняется):
+
+```yaml
+- name: Синхронизировать данные между серверами
+  ansible.posix.synchronize:
+    src: "{{ sync_src }}"
+    dest: "{{ sync_dest }}"
+    mode: "{{ sync_mode }}"            # push
+    delete: "{{ sync_delete }}"
+    recursive: yes
+    archive: yes
+    compress: yes
+    rsync_opts: >-
+      {{
+        sync_rsync_opts
+        + (['--bwlimit=' ~ (sync_active_bwlimit | string)] if (sync_active_bwlimit | int) > 0 else [])
+        + (['--stats'] if sync_enable_stats | bool else [])
+      }}
+    rsync_timeout: "{{ sync_timeout }}"
+    private_key: "{{ sync_ssh_private_key | default(omit, true) }}"
+  delegate_to: "{{ sync_source_host }}"
+  run_once: true
+  register: sync_result
+  changed_when: sync_result is changed
+  failed_when: sync_result is failed
+```
+
+Что изменилось:
+
+· убран _ssh_args — SSH-опции теперь задаются либо через ansible_ssh_common_args в inventory/group_vars, либо через private_key. Так не будет дублирования;
+· убран несуществующий ssh_args;
+· параметр timeout заменён на корректный rsync_timeout;
+· добавлен private_key — передаётся, только если sync_ssh_private_key задан (иначе omit).
+
+3. Задать SSH-опции через переменные Ansible
+
+Раз мы убрали _ssh_args, теперь SSH-опции задаются штатно. В inventory или group_vars/all.yml:
+
+```yaml
+ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+```
+
+И в задаче синхронизации добавьте use_ssh_args: true:
+
+```yaml
+- name: Синхронизировать данные между серверами
+  ansible.posix.synchronize:
+    src: "{{ sync_src }}"
+    dest: "{{ sync_dest }}"
+    mode: "{{ sync_mode }}"
+    delete: "{{ sync_delete }}"
+    recursive: yes
+    archive: yes
+    compress: yes
+    rsync_opts: >-
+      {{
+        sync_rsync_opts
+        + (['--bwlimit=' ~ (sync_active_bwlimit | string)] if (sync_active_bwlimit | int) > 0 else [])
+        + (['--stats'] if sync_enable_stats | bool else [])
+      }}
+    rsync_timeout: "{{ sync_timeout }}"
+    use_ssh_args: true
+  delegate_to: "{{ sync_source_host }}"
+  run_once: true
+  register: sync_result
+  changed_when: sync_result is changed
+  failed_when: sync_result is failed
+```
+
+Про ключ /home/user01/.ssh/id_ed25519
+
+Предупреждение говорит, что файла нет. Варианты:
+
+1. Ключ лежит в другом месте — задайте явно в плейбуке:
+   ```yaml
+   sync_ssh_private_key: "/home/user01/.ssh/id_rsa"
+   ```
+2. Ключ есть, но не у того пользователя — rsync запускается от user01, проверьте ls -la /home/user01/.ssh/.
+3. Используете ssh-agent — тогда private_key не задавайте, но убедитесь, что агент доступен на хосте-источнике при запуске (например, через ForwardAgent yes или ssh-agent на источнике).
+
+Пока ключ невалиден, rsync будет валиться уже по другой причине (Permission denied вместо timeout).
+
+Как проверить после исправлений
+
+```bash
+# Убедиться, что режим push
+grep sync_mode roles/sync_data/defaults/main.yml
+
+# Сухой прогон
+ansible-playbook -i inventory.ini playbooks/sync.yml --check -vvv
+```
+
+В выводе -vvv команда rsync должна выглядеть так:
+
+```
+rsync --archive --compress --delete ... /tmp/test-src/  user01@<dest>:...:/tmp/test-dest/
+```
+
+src без префикса user@host: (локальный), dest — с префиксом user@<dest>:… (удалённый). Если видите обратное — режим всё ещё pull, поменяйте на push.
