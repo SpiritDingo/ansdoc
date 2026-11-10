@@ -246,3 +246,135 @@ tar -tzf /central-logs/web01_2026-10-27.tar.gz
 · Очистка /tmp/logs-collect — удаляется только после успешной доставки. Если доставка упала — архив останется для отладки.
 · delegate_to для synchronize — rsync выполняется на самом log-server.internal, pull тянет данные с управляемого хоста. Соответственно, log-server должен иметь SSH-доступ к остальным хостам.
 · run_once: true для создания collect_dest — каталог создаётся один раз, а не N раз параллельно.
+
+_________
+_________
+
+Добавим в роль collect_logs опцию сохранения собранных архивов в локальный Nexus (raw-репозиторий) через REST API. Загрузка будет выполняться с control-node (или с хоста, указанного в delegate_to) после того, как архивы уже собраны и скачаны.
+
+---
+
+📄 Обновлённый defaults/main.yml
+
+```yaml
+# ... (остальные переменные без изменений)
+
+# --- Настройки загрузки в Nexus ---
+# Включить/выключить загрузку
+nexus_upload: false
+
+# Базовый URL Nexus (без завершающего слэша)
+nexus_url: "https://nexus.example.com"
+
+# Имя raw-репозитория, куда складывать архивы
+nexus_repository: "logs-raw"
+
+# Учётные данные (лучше хранить в Ansible Vault)
+nexus_username: "admin"
+nexus_password: "admin123"
+
+# Путь внутри репозитория (опционально). Если задан, файлы будут лежать в подкаталоге.
+# Пример: "collected/{{ ansible_date_time.date }}"
+nexus_path_prefix: ""
+```
+
+---
+
+📄 Обновлённый tasks/main.yml
+
+```yaml
+---
+# ... (все предыдущие задачи сбора и скачивания без изменений)
+
+- name: Upload archive to Nexus (raw repository)
+  ansible.builtin.uri:
+    url: "{{ nexus_url }}/repository/{{ nexus_repository }}/{{ nexus_path_prefix | default('') }}{{ nexus_path_prefix | default('') | ternary('/', '') }}{{ collect_archive_name }}"
+    method: PUT
+    src: "{{ collect_dest }}/{{ collect_archive_name }}"
+    user: "{{ nexus_username }}"
+    password: "{{ nexus_password }}"
+    force_basic_auth: yes
+    headers:
+      Content-Type: application/octet-stream
+    status_code: 201
+  when:
+    - nexus_upload | bool
+    - collect_method == 'fetch'          # если архивы на control-node
+  delegate_to: localhost
+  run_once: false
+
+- name: Upload archive to Nexus from dedicated log-server (if synchronize)
+  ansible.builtin.uri:
+    url: "{{ nexus_url }}/repository/{{ nexus_repository }}/{{ nexus_path_prefix | default('') }}{{ nexus_path_prefix | default('') | ternary('/', '') }}{{ collect_archive_name }}"
+    method: PUT
+    src: "{{ collect_dest }}/{{ collect_archive_name }}"
+    user: "{{ nexus_username }}"
+    password: "{{ nexus_password }}"
+    force_basic_auth: yes
+    headers:
+      Content-Type: application/octet-stream
+    status_code: 201
+  when:
+    - nexus_upload | bool
+    - collect_method == 'synchronize'
+  delegate_to: "{{ collect_delegate_host }}"
+```
+
+Пояснение по URL: при nexus_path_prefix = "collected/2026-10-27" файл попадёт в .../repository/logs-raw/collected/2026-10-27/web01_2026-10-27.tar.gz. Если префикс не нужен — оставьте его пустым, и архив ляжет в корень репозитория.
+
+---
+
+⚙️ Пример плейбука с загрузкой в Nexus
+
+```yaml
+- name: Collect logs and upload archives to local Nexus
+  hosts: all
+  become: true
+  gather_facts: true
+  roles:
+    - collect_logs
+  vars:
+    collect_dest: "/central-logs"
+    collect_method: synchronize
+    collect_delegate_host: "log-server.internal"
+
+    # Включаем загрузку в Nexus
+    nexus_upload: true
+    nexus_url: "https://nexus.internal.company"
+    nexus_repository: "logs-raw"
+    nexus_path_prefix: "collected/{{ ansible_date_time.date }}"
+    nexus_username: "svc-ansible"
+    # пароль лучше вынести в Ansible Vault:
+    # nexus_password: !vault |
+    #   $ANSIBLE_VAULT;1.1;AES256
+    #   ...
+```
+
+---
+
+🧠 Что учтено
+
+· Два сценария доставки. Если архивы скачиваются через fetch (на control-node), загрузка в Nexus идёт с localhost. Если через synchronize (на выделенный log-server), загрузка выполняется с этого же сервера (delegate_to: collect_delegate_host), чтобы не перекачивать архивы повторно на control-node.
+· Метод PUT для raw-репозитория. Nexus 3 поддерживает прямую загрузку в raw-репозитории через PUT /repository/<repo>/<path> — это самый простой и надёжный способ. Модуль uri с src полностью заменяет curl --upload-file.
+· force_basic_auth: yes — обязательный параметр для корректной аутентификации в Nexus через uri (частая причина ошибок 403).
+· Content-Type: application/octet-stream — гарантирует, что Nexus не попытается интерпретировать .tar.gz как форму или JSON.
+· Статус-код 201 — ожидаемый ответ Nexus при успешной загрузке нового файла. Если файл уже существует, Nexus вернёт 400/409; при необходимости можно добавить --keep или обрабатывать перезапись отдельно (по умолчанию raw-репозиторий может запрещать перезапись — см. поведение Nexus).
+· nexus_path_prefix — позволяет автоматически раскладывать архивы по датам внутри репозитория, что удобно для последующего поиска.
+· Пароль рекомендуется хранить в Ansible Vault или передавать через переменные окружения (например, NEXUS_PASSWORD), а не в открытом виде в defaults.
+
+---
+
+📁 Итоговая структура роли
+
+```text
+roles/collect_logs/
+├── defaults/
+│   └── main.yml          # добавлены nexus_upload, nexus_url, nexus_repository, nexus_path_prefix и учётные данные
+├── tasks/
+│   └── main.yml          # добавлены две задачи Upload archive to Nexus (для fetch и synchronize)
+├── meta/
+│   └── main.yml
+└── README.md             # можно дополнить разделом «Загрузка в Nexus»
+```
+
+Теперь роль умеет не только собирать логи в один архив с именем <hostname>_<date>.tar.gz и складывать его на центральный сервер, но и автоматически публиковать эти архивы в локальный Nexus — достаточно установить nexus_upload: true и заполнить параметры подключения.
