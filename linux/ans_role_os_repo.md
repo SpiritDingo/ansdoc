@@ -302,3 +302,206 @@ password={{ repo.password }}
 · Пароль vault_repo_pass должен быть определён в зашифрованном виде (Ansible Vault).
 · Для самоподписанных HTTPS-сертификатов используйте validate_certs: false и при необходимости добавьте корневой CA в доверенные на целевых хостах.
 · Роль автоматически обновляет кэш пакетов (apt или dnf) только при изменении конфигурации репозиториев.
+
+________
+________
+
+Ниже — изменения, которые нужно внести, чтобы для Ubuntu 22.04 (jammy) и Ubuntu 24.04 (noble) использовались свои независимые наборы репозиториев.
+
+Идея: ubuntu_repositories превращается в словарь, где ключи — это кодовые имена (jammy, noble), а значения — списки репозиториев. В задачах нужный набор выбирается по ansible_distribution_release.
+
+1. Обновлённый defaults/main.yml (секция Ubuntu)
+
+```yaml
+---
+# ===========================================
+# Настройки для Ubuntu (Jammy / Noble)
+# Свой набор репозиториев для каждой версии
+# ===========================================
+ubuntu_repositories:
+  jammy:
+    - filename: "local-ubuntu-jammy.sources"
+      types: "deb"
+      uris: "https://mirror.local"
+      suites:
+        - "jammy"
+        - "jammy-updates"
+        - "jammy-backports"
+        - "jammy-security"
+      components:
+        - "main"
+        - "restricted"
+        - "universe"
+        - "multiverse"
+      gpg_url: "https://mirror.local/jammy/repo-key.asc"
+      signed_by: "/etc/apt/keyrings/local-ubuntu-jammy.asc"
+      validate_certs: false
+      username: "repo_user"
+      password: "{{ vault_repo_pass }}"
+
+  noble:
+    - filename: "local-ubuntu-noble.sources"
+      types: "deb"
+      uris: "https://mirror.local"
+      suites:
+        - "noble"
+        - "noble-updates"
+        - "noble-backports"
+        - "noble-security"
+      components:
+        - "main"
+        - "restricted"
+        - "universe"
+        - "multiverse"
+      gpg_url: "https://mirror.local/noble/repo-key.asc"
+      signed_by: "/etc/apt/keyrings/local-ubuntu-noble.asc"
+      validate_certs: false
+      username: "repo_user"
+      password: "{{ vault_repo_pass }}"
+
+# ===========================================
+# Настройки для Oracle Linux (8 / 9)
+# ===========================================
+oraclelinux_repositories:
+  # ... без изменений ...
+```
+
+2. Обновлённый tasks/main.yml
+
+Меняется только условие запуска блока Ubuntu — теперь проверяется наличие непустого списка для текущего релиза:
+
+```yaml
+---
+- name: Validate supported OS
+  ansible.builtin.assert:
+    that:
+      - (ansible_distribution == "Ubuntu" and ansible_distribution_release in ["jammy", "noble"]) or
+        (ansible_distribution == "OracleLinux" and ansible_distribution_major_version in ["8", "9"])
+    fail_msg: "Unsupported OS. Supported: Ubuntu (Jammy, Noble) and Oracle Linux (8, 9)."
+
+- name: Configure Ubuntu repositories
+  ansible.builtin.include_tasks:
+    file: ubuntu.yml
+  when:
+    - ansible_distribution == "Ubuntu"
+    - ubuntu_repositories[ansible_distribution_release] | default([]) | length > 0
+
+- name: Configure Oracle Linux repositories
+  ansible.builtin.include_tasks:
+    file: oraclelinux.yml
+  when:
+    - ansible_distribution == "OracleLinux"
+    - oraclelinux_repositories | length > 0
+
+- name: Flush handlers immediately
+  ansible.builtin.meta: flush_handlers
+```
+
+3. Обновлённый tasks/ubuntu.yml
+
+Все loop переключаются на выборку по релизу. when-условия в задачах не меняются, так как item — это по-прежнему элемент выбранного списка.
+
+```yaml
+---
+- name: Ensure /etc/apt/keyrings directory exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Download GPG keys from authenticated local repository
+  ansible.builtin.get_url:
+    url: "{{ item.gpg_url }}"
+    dest: "{{ item.signed_by }}"
+    url_username: "{{ item.username | default(omit) }}"
+    url_password: "{{ item.password | default(omit) }}"
+    force_basic_auth: "{{ true if item.username is defined else omit }}"
+    validate_certs: "{{ item.validate_certs | default(true) }}"
+    force: true
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ ubuntu_repositories[ansible_distribution_release] | default([]) }}"
+  loop_control:
+    label: "{{ item.filename }}"
+  when:
+    - item.gpg_url is defined
+    - item.signed_by is defined
+  no_log: true
+
+- name: Deploy APT authentication files
+  ansible.builtin.template:
+    src: "ubuntu.auth.conf.j2"
+    dest: "/etc/apt/auth.conf.d/{{ item.filename | regex_replace('\\.sources$', '.conf') }}"
+    owner: root
+    group: root
+    mode: "0600"
+  loop: "{{ ubuntu_repositories[ansible_distribution_release] | default([]) }}"
+  loop_control:
+    label: "{{ item.filename }}"
+  when:
+    - item.username is defined
+    - item.password is defined
+  no_log: true
+
+- name: Deploy Ubuntu DEB822 repository templates
+  ansible.builtin.template:
+    src: "ubuntu.sources.j2"
+    dest: "/etc/apt/sources.list.d/{{ item.filename }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ ubuntu_repositories[ansible_distribution_release] | default([]) }}"
+  loop_control:
+    label: "{{ item.filename }}"
+  notify: Update apt cache
+```
+
+4. Что остаётся без изменений
+
+· handlers/main.yml
+· templates/ubuntu.sources.j2
+· templates/ubuntu.auth.conf.j2
+· tasks/oraclelinux.yml
+· templates/oraclelinux.repo.j2
+
+Как это работает
+
+1. На хосте с Ubuntu 22.04 ansible_distribution_release == "jammy" → роль возьмёт ubuntu_repositories['jammy'].
+2. На хосте с Ubuntu 24.04 ansible_distribution_release == "noble" → роль возьмёт ubuntu_repositories['noble'].
+3. Если для какой-то версии список пуст или отсутствует, задача просто не выполнится (благодаря default([]) | length > 0 в main.yml и | default([]) в циклах).
+4. Всё, что касается скачивания ключей, авторизации (auth.conf.d) и рендеринга .sources, автоматически работает с выбранным набором.
+
+Пример переопределения в group_vars
+
+Можно удобно задавать разные зеркала для разных групп серверов:
+
+```yaml
+# group_vars/ubuntu_jammy_servers.yml
+ubuntu_repositories:
+  jammy:
+    - filename: "jammy-mirror.sources"
+      uris: "https://mirror-jammy.local"
+      suites: ["jammy", "jammy-updates", "jammy-security"]
+      components: ["main", "universe"]
+      gpg_url: "https://mirror-jammy.local/key.asc"
+      signed_by: "/etc/apt/keyrings/jammy-mirror.asc"
+      username: "jammy_user"
+      password: "{{ vault_jammy_pass }}"
+
+# group_vars/ubuntu_noble_servers.yml
+ubuntu_repositories:
+  noble:
+    - filename: "noble-mirror.sources"
+      uris: "https://mirror-noble.local"
+      suites: ["noble", "noble-updates", "noble-security"]
+      components: ["main", "universe"]
+      gpg_url: "https://mirror-noble.local/key.asc"
+      signed_by: "/etc/apt/keyrings/noble-mirror.asc"
+      username: "noble_user"
+      password: "{{ vault_noble_pass }}"
+```
+
+При этом роли не нужно знать, какие именно зеркала используются — она просто берёт нужный ключ словаря по факту ansible_distribution_release.
