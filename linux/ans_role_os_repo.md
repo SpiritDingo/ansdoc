@@ -505,3 +505,256 @@ ubuntu_repositories:
 ```
 
 При этом роли не нужно знать, какие именно зеркала используются — она просто берёт нужный ключ словаря по факту ansible_distribution_release.
+_____
+_____
+
+Ниже — изменения по аналогии с Ubuntu: oraclelinux_repositories превращается в словарь, где ключи — мажорные версии ("8", "9"), а значения — независимые списки репозиториев. Выбор нужного набора в задачах делается по ansible_distribution_major_version.
+
+1. Обновлённый defaults/main.yml (секция Oracle Linux)
+
+```yaml
+---
+# ... блок ubuntu_repositories остается без изменений ...
+
+# ===========================================
+# Настройки для Oracle Linux (8 / 9)
+# Свой набор репозиториев для каждой версии
+# ===========================================
+oraclelinux_repositories:
+  "8":
+    # --- oracle-linux-ol8.repo (BaseOS + AppStream) ---
+    - filename: "oracle-linux-ol8.repo"
+      gpg_keys:
+        - url: "https://mirror.local/8/RPM-GPG-KEY-oracle-ol8"
+          dest: "/etc/pki/rpm-gpg/RPM-GPG-KEY-oracle-ol8"
+          validate_certs: false
+      repos:
+        - id: "ol8_baseos_latest"
+          name: "Oracle Linux 8 BaseOS Latest ($basearch)"
+          baseurl: "https://mirror.local/8/baseos/latest/$basearch/"
+          gpgcheck: 1
+          gpgkey: "file:///etc/pki/rpm-gpg/RPM-GPG-KEY-oracle-ol8"
+          enabled: 1
+          username: "repo_user"
+          password: "{{ vault_repo_pass }}"
+        - id: "ol8_appstream"
+          name: "Oracle Linux 8 Application Stream ($basearch)"
+          baseurl: "https://mirror.local/8/appstream/$basearch/"
+          gpgcheck: 1
+          gpgkey: "file:///etc/pki/rpm-gpg/RPM-GPG-KEY-oracle-ol8"
+          enabled: 1
+          username: "repo_user"
+          password: "{{ vault_repo_pass }}"
+
+    # --- uek-ol8.repo (UEK R6) ---
+    - filename: "uek-ol8.repo"
+      gpg_keys:
+        - url: "https://mirror.local/8/RPM-GPG-KEY-uek-ol8"
+          dest: "/etc/pki/rpm-gpg/RPM-GPG-KEY-uek-ol8"
+          validate_certs: false
+      repos:
+        - id: "ol8_UEKR6"
+          name: "Latest Unbreakable Enterprise Kernel Release 6 for Oracle Linux 8 ($basearch)"
+          baseurl: "https://mirror.local/8/UEKR6/$basearch/"
+          gpgcheck: 1
+          gpgkey: "file:///etc/pki/rpm-gpg/RPM-GPG-KEY-uek-ol8"
+          enabled: 1
+          username: "repo_user"
+          password: "{{ vault_repo_pass }}"
+
+    # --- virt-ol8.repo (KVM Utilities) ---
+    - filename: "virt-ol8.repo"
+      gpg_keys:
+        - url: "https://mirror.local/8/RPM-GPG-KEY-virt-ol8"
+          dest: "/etc/pki/rpm-gpg/RPM-GPG-KEY-virt-ol8"
+          validate_certs: false
+      repos:
+        - id: "ol8_kvm_utils"
+          name: "Oracle Linux 8 KVM Utilities ($basearch)"
+          baseurl: "https://mirror.local/8/kvm/utils/$basearch/"
+          gpgcheck: 1
+          gpgkey: "file:///etc/pki/rpm-gpg/RPM-GPG-KEY-virt-ol8"
+          enabled: 0
+
+  "9":
+    # --- oracle-linux-ol9.repo (BaseOS + AppStream) ---
+    - filename: "oracle-linux-ol9.repo"
+      gpg_keys:
+        - url: "https://mirror.local/9/RPM-GPG-KEY-oracle-ol9"
+          dest: "/etc/pki/rpm-gpg/RPM-GPG-KEY-oracle-ol9"
+          validate_certs: false
+      repos:
+        - id: "ol9_baseos_latest"
+          name: "Oracle Linux 9 BaseOS Latest ($basearch)"
+          baseurl: "https://mirror.local/9/baseos/latest/$basearch/"
+          gpgcheck: 1
+          gpgkey: "file:///etc/pki/rpm-gpg/RPM-GPG-KEY-oracle-ol9"
+          enabled: 1
+          username: "repo_user"
+          password: "{{ vault_repo_pass }}"
+        - id: "ol9_appstream"
+          name: "Oracle Linux 9 Application Stream ($basearch)"
+          baseurl: "https://mirror.local/9/appstream/$basearch/"
+          gpgcheck: 1
+          gpgkey: "file:///etc/pki/rpm-gpg/RPM-GPG-KEY-oracle-ol9"
+          enabled: 1
+          username: "repo_user"
+          password: "{{ vault_repo_pass }}"
+
+    # --- uek-ol9.repo (UEK R7) ---
+    - filename: "uek-ol9.repo"
+      gpg_keys:
+        - url: "https://mirror.local/9/RPM-GPG-KEY-uek-ol9"
+          dest: "/etc/pki/rpm-gpg/RPM-GPG-KEY-uek-ol9"
+          validate_certs: false
+      repos:
+        - id: "ol9_UEKR7"
+          name: "Latest Unbreakable Enterprise Kernel Release 7 for Oracle Linux 9 ($basearch)"
+          baseurl: "https://mirror.local/9/UEKR7/$baseard/"
+          gpgcheck: 1
+          gpgkey: "file:///etc/pki/rpm-gpg/RPM-GPG-KEY-uek-ol9"
+          enabled: 1
+          username: "repo_user"
+          password: "{{ vault_repo_pass }}"
+
+    # --- virt-ol9.repo (KVM Utilities) ---
+    - filename: "virt-ol9.repo"
+      gpg_keys:
+        - url: "https://mirror.local/9/RPM-GPG-KEY-virt-ol9"
+          dest: "/etc/pki/rpm-gpg/RPM-GPG-KEY-virt-ol9"
+          validate_certs: false
+      repos:
+        - id: "ol9_kvm_utils"
+          name: "Oracle Linux 9 KVM Utilities ($basearch)"
+          baseurl: "https://mirror.local/9/kvm/utils/$basearch/"
+          gpgcheck: 1
+          gpgkey: "file:///etc/pki/rpm-gpg/RPM-GPG-KEY-virt-ol9"
+          enabled: 0
+```
+
+⚠️ В блоке ol9_UEKR7 выше опечатка $baseard — замените на $basearch.
+
+2. Обновлённый tasks/main.yml
+
+Условие запуска Oracle Linux теперь проверяет наличие непустого списка для текущей мажорной версии:
+
+```yaml
+---
+- name: Validate supported OS
+  ansible.builtin.assert:
+    that:
+      - (ansible_distribution == "Ubuntu" and ansible_distribution_release in ["jammy", "noble"]) or
+        (ansible_distribution == "OracleLinux" and ansible_distribution_major_version in ["8", "9"])
+    fail_msg: "Unsupported OS. Supported: Ubuntu (Jammy, Noble) and Oracle Linux (8, 9)."
+
+- name: Configure Ubuntu repositories
+  ansible.builtin.include_tasks:
+    file: ubuntu.yml
+  when:
+    - ansible_distribution == "Ubuntu"
+    - ubuntu_repositories[ansible_distribution_release] | default([]) | length > 0
+
+- name: Configure Oracle Linux repositories
+  ansible.builtin.include_tasks:
+    file: oraclelinux.yml
+  when:
+    - ansible_distribution == "OracleLinux"
+    - oraclelinux_repositories[ansible_distribution_major_version] | default([]) | length > 0
+
+- name: Flush handlers immediately
+  ansible.builtin.meta: flush_handlers
+```
+
+3. Обновлённый tasks/oraclelinux.yml
+
+Все loop переключаются на выборку по мажорной версии. Обратите внимание на порядок фильтров в subelements — сначала выбор версии, затем subelements:
+
+```yaml
+---
+- name: Download GPG keys from authenticated local repository for Oracle Linux
+  ansible.builtin.get_url:
+    url: "{{ item.1.url }}"
+    dest: "{{ item.1.dest }}"
+    url_username: "{{ item.1.username | default(item.0.username) | default(omit) }}"
+    url_password: "{{ item.1.password | default(item.0.password) | default(omit) }}"
+    force_basic_auth: "{{ true if (item.1.username is defined or item.0.username is defined) else omit }}"
+    validate_certs: "{{ item.1.validate_certs | default(true) }}"
+    force: true
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ oraclelinux_repositories[ansible_distribution_major_version] | default([]) | subelements('gpg_keys', {'skip_missing': true}) }}"
+  loop_control:
+    label: "{{ item.1.dest }}"
+  no_log: true
+
+- name: Import downloaded GPG keys into RPM database
+  ansible.builtin.rpm_key:
+    key: "{{ item.1.dest }}"
+    state: present
+  loop: "{{ oraclelinux_repositories[ansible_distribution_major_version] | default([]) | subelements('gpg_keys', {'skip_missing': true}) }}"
+  loop_control:
+    label: "{{ item.1.dest }}"
+
+- name: Deploy Oracle Linux YUM/DNF repository templates
+  ansible.builtin.template:
+    src: "oraclelinux.repo.j2"
+    dest: "/etc/yum.repos.d/{{ item.filename }}"
+    owner: root
+    group: root
+    mode: "{{ '0600' if (item.repos | selectattr('password', 'defined') | list | length > 0) else '0644' }}"
+  loop: "{{ oraclelinux_repositories[ansible_distribution_major_version] | default([]) }}"
+  loop_control:
+    label: "{{ item.filename }}"
+  no_log: true
+  notify: Update dnf cache
+```
+
+4. Что остаётся без изменений
+
+· handlers/main.yml
+· templates/oraclelinux.repo.j2
+· Все Ubuntu-файлы (tasks/ubuntu.yml, templates/ubuntu.*.j2)
+
+Как это работает
+
+1. На хосте с Oracle Linux 8 ansible_distribution_major_version == "8" → роль берёт oraclelinux_repositories['8'] (UEKR6, свои пути /8/..., свои ключи).
+2. На хосте с Oracle Linux 9 ansible_distribution_major_version == "9" → роль берёт oraclelinux_repositories['9'] (UEKR7, пути /9/..., свои ключи).
+3. Если для какой-то версии список пуст или ключ отсутствует, задача не выполнится благодаря default([]) | length > 0 в main.yml.
+4. subelements('gpg_keys', {'skip_missing': true}) корректно обрабатывает каждый файл .repo со своим набором ключей — у OL8 и OL9 ключи теперь полностью независимы.
+
+Пример переопределения в group_vars
+
+```yaml
+# group_vars/ol8_servers.yml
+oraclelinux_repositories:
+  "8":
+    - filename: "ol8-mirror.repo"
+      gpg_keys:
+        - url: "https://mirror-ol8.local/RPM-GPG-KEY-ol8"
+          dest: "/etc/pki/rpm-gpg/RPM-GPG-KEY-ol8"
+      repos:
+        - id: "ol8_baseos"
+          name: "OL8 BaseOS"
+          baseurl: "https://mirror-ol8.local/baseos/$basearch/"
+          gpgcheck: 1
+          gpgkey: "file:///etc/pki/rpm-gpg/RPM-GPG-KEY-ol8"
+          enabled: 1
+
+# group_vars/ol9_servers.yml
+oraclelinux_repositories:
+  "9":
+    - filename: "ol9-mirror.repo"
+      gpg_keys:
+        - url: "https://mirror-ol9.local/RPM-GPG-KEY-ol9"
+          dest: "/etc/pki/rpm-gpg/RPM-GPG-KEY-ol9"
+      repos:
+        - id: "ol9_baseos"
+          name: "OL9 BaseOS"
+          baseurl: "https://mirror-ol9.local/baseos/$basearch/"
+          gpgcheck: 1
+          gpgkey: "file:///etc/pki/rpm-gpg/RPM-GPG-KEY-ol9"
+          enabled: 1
+```
+
+Роль при этом не меняется — она просто выбирает набор по фактической версии хоста.
