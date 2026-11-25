@@ -380,3 +380,180 @@ Ansible-роль для обновления пакетов в **Ubuntu 22.04/24
 | Переменные были захардкожены в `vars` | Вынесены в `defaults`, внутренние — в `vars` |
 
 Роль готова к использованию, поддерживает `--check` (за исключением обновления пакетов — стандартное поведение модулей `apt`/`dnf`), корректно работает с `become: true` и не требует внешних коллекций.
+
+Чтобы роль не зависала на интерактивном запросе при обновлении PAM (и любых других конфигурационных файлов), нужно автоматически выбирать вариант «оставить текущую версию» (N / keep). Решение отличается для Ubuntu и Oracle Linux, поэтому добавляем соответствующую логику в обе ветки роли.
+
+⚙️ 1. Новые переменные в defaults/main.yml
+
+```yaml
+---
+# ... существующие переменные ...
+
+# Стратегия разрешения конфликтов конфигурационных файлов в dpkg (Ubuntu)
+# force-confold: сохранить текущую версию (N)
+# force-confdef: если файл не изменялся, принять новую версию автоматически
+os_update_dpkg_options: "force-confold,force-confdef"
+
+# Отключать ли плагин rpmconf в DNF (Oracle Linux),
+# который вызывает интерактивные запросы при обновлении
+os_update_disable_rpmconf: true
+```
+
+📄 2. Обновлённый tasks/debian.yml (Ubuntu)
+
+```yaml
+---
+- name: Update apt cache (with lock retries)
+  ansible.builtin.apt:
+    update_cache: yes
+    cache_valid_time: 3600
+    dpkg_options: "{{ os_update_dpkg_options }}"   # <-- ключевое изменение
+  register: apt_cache_result
+  until: apt_cache_result is success
+  retries: "{{ os_update_dpkg_lock_retries }}"
+  delay: "{{ os_update_dpkg_lock_delay }}"
+
+- name: Ensure psmisc is installed (provides fuser)
+  ansible.builtin.apt:
+    name: psmisc
+    state: present
+    dpkg_options: "{{ os_update_dpkg_options }}"
+  register: psmisc_install
+  until: psmisc_install is success
+  retries: "{{ os_update_dpkg_lock_retries }}"
+  delay: "{{ os_update_dpkg_lock_delay }}"
+
+- name: Wait for dpkg locks to be released
+  ansible.builtin.shell: >
+    fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock
+    /var/cache/apt/archives/lock 2>/dev/null
+  register: dpkg_lock_check
+  until: dpkg_lock_check.rc != 0
+  retries: "{{ os_update_dpkg_lock_retries }}"
+  delay: "{{ os_update_dpkg_lock_delay }}"
+  changed_when: false
+  failed_when: false
+
+- name: Get list of held packages
+  ansible.builtin.command: apt-mark showhold
+  register: held_packages
+  changed_when: false
+  failed_when: false
+
+- name: Unhold packages if any are held
+  ansible.builtin.command: >-
+    apt-mark unhold {{ held_packages.stdout_lines | join(' ') }}
+  when: held_packages.stdout | default('') | trim | length > 0
+  register: unhold_result
+  changed_when: true
+
+- name: Update apt cache before upgrade
+  ansible.builtin.apt:
+    update_cache: yes
+    cache_valid_time: 0
+    dpkg_options: "{{ os_update_dpkg_options }}"
+  register: apt_update_result
+  until: apt_update_result is success
+  retries: "{{ os_update_dpkg_lock_retries }}"
+  delay: "{{ os_update_dpkg_lock_delay }}"
+
+- name: Upgrade all packages
+  ansible.builtin.apt:
+    upgrade: "{{ os_update_apt_upgrade_type }}"
+    update_cache: no
+    autoremove: yes
+    dpkg_options: "{{ os_update_dpkg_options }}"   # <-- ключевое изменение
+  register: apt_upgrade_result
+  until: apt_upgrade_result is success
+  retries: 5
+  delay: 30
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+    UCF_FORCE_CONFOLD: "1"          # <-- дополнительная страховка для ucf-файлов
+```
+
+Что делает dpkg_options: "force-confold,force-confdef":
+
+· force-confold — при конфликте всегда оставляет текущую версию файла (выбор N), а новый файл сохраняется с суффиксом .dpkg-dist.
+· force-confdef — позволяет dpkg самостоятельно принимать новую версию, если файл не был изменён локально, и запрашивать только при реальном конфликте. В сочетании с force-confold это исключает любые интерактивные запросы.
+
+📄 3. Обновлённый tasks/redhat.yml (Oracle Linux)
+
+```yaml
+---
+- name: Wait for yum/dnf lock file to disappear
+  ansible.builtin.wait_for:
+    path: /var/run/yum.pid
+    state: absent
+    timeout: "{{ os_update_dnf_lock_timeout }}"
+
+- name: Ensure dnf-plugins-core is installed (provides versionlock)
+  ansible.builtin.dnf:
+    name: dnf-plugins-core
+    state: present
+  register: dnf_plugins_install
+  until: dnf_plugins_install is success
+  retries: 30
+  delay: 10
+
+- name: Try to install dnf-utils (provides needs-restarting)
+  ansible.builtin.dnf:
+    name: dnf-utils
+    state: present
+  register: dnf_utils_install
+  failed_when: false
+  changed_when: dnf_utils_install is success
+
+# --- Отключаем rpmconf, чтобы DNF не задавал вопросы по PAM и другим файлам ---
+- name: Ensure /etc/dnf/plugins directory exists
+  ansible.builtin.file:
+    path: /etc/dnf/plugins
+    state: directory
+    mode: '0755'
+  when: os_update_disable_rpmconf | bool
+
+- name: Disable rpmconf plugin to avoid interactive prompts
+  ansible.builtin.copy:
+    dest: /etc/dnf/plugins/rpmconf.conf
+    content: |
+      [main]
+      enabled = 0
+    mode: '0644'
+  when: os_update_disable_rpmconf | bool
+
+- name: Check for dnf versionlock entries
+  ansible.builtin.command: dnf versionlock list
+  register: versionlock_list
+  changed_when: false
+  failed_when: false
+
+- name: Clear versionlock entries if any are present
+  ansible.builtin.command: dnf versionlock clear
+  when: versionlock_list.stdout | default('') | trim | length > 0
+  register: versionlock_clear_result
+  changed_when: true
+
+- name: Update all installed packages
+  ansible.builtin.dnf:
+    name: '*'
+    state: latest
+    update_cache: yes
+    update_only: yes
+  register: dnf_upgrade_result
+
+# ... остальные задачи (логирование) без изменений ...
+```
+
+Почему это решает проблему:
+
+· В Oracle Linux за интерактивные запросы при обновлении PAM (и других конфигурационных файлов) отвечает плагин rpmconf из пакета dnf-plugins-extras.
+· Отключение плагина через /etc/dnf/plugins/rpmconf.conf (enabled = 0) заставляет DNF работать в штатном неинтерактивном режиме. При этом RPM по умолчанию сохраняет текущую версию конфигурационного файла (аналог выбора N), а новая версия сохраняется как .rpmnew.
+
+✅ Итог
+
+После этих изменений роль:
+
+· На Ubuntu передаёт dpkg_options: "force-confold,force-confdef" во все вызовы apt и дополнительно выставляет UCF_FORCE_CONFOLD=1, поэтому на запрос по PAM автоматически выбирается «оставить текущую версию» (N).
+· На Oracle Linux отключает плагин rpmconf, и DNF больше не показывает интерактивных запросов, сохраняя текущие конфигурационные файлы.
+
+Если вы хотите, чтобы роль всегда принимала новую версию конфигурации (выбор Y), измените os_update_dpkg_options на "force-confnew" для Ubuntu и не отключайте rpmconf для Oracle Linux — но в контексте вашего запроса (выбор отрицательный) текущая настройка является правильной.
