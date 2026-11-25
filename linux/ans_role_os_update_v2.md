@@ -560,3 +560,493 @@ os_update_disable_rpmconf: true
 · На Oracle Linux отключает плагин rpmconf, и DNF больше не показывает интерактивных запросов, сохраняя текущие конфигурационные файлы.
 
 Если вы хотите, чтобы роль всегда принимала новую версию конфигурации (выбор Y), измените os_update_dpkg_options на "force-confnew" для Ubuntu и не отключайте rpmconf для Oracle Linux — но в контексте вашего запроса (выбор отрицательный) текущая настройка является правильной.
+
+
+________
+________
+________
+
+Объединённая роль os_update с управлением KESL
+
+Роль теперь временно останавливает файловый монитор KESL (если он установлен) на время обновления ОС и гарантированно возвращает его в исходное состояние через block/always, даже при ошибке обновления. Если KESL не установлен — обновление выполняется в обычном режиме.
+
+📁 Структура
+
+```text
+os_update/
+├── README.md
+├── defaults/
+│   └── main.yml
+├── handlers/
+│   └── main.yml
+├── meta/
+│   └── main.yml
+├── tasks/
+│   ├── main.yml
+│   ├── debian.yml
+│   └── redhat.yml
+└── vars/
+    └── main.yml
+```
+
+---
+
+📄 defaults/main.yml
+
+```yaml
+---
+# Директория для логов обновления на управляющем узле
+os_update_log_dir: "{{ playbook_dir }}/logs"
+
+# Перезагружать ли хост после обновления при необходимости
+os_update_reboot: true
+os_update_reboot_timeout: 600
+os_update_post_reboot_delay: 30
+
+# Тип обновления APT: dist (полное) или safe (только upgrade)
+os_update_apt_upgrade_type: dist
+
+# Стратегия разрешения конфликтов конфигов dpkg (Ubuntu)
+# force-confold сохраняет текущую версию (N), force-confdef — авто-принятие если файл не менялся
+os_update_dpkg_options: "force-confold,force-confdef"
+
+# Отключать ли плагин rpmconf в DNF (Oracle Linux) — он вызывает интерактивные запросы
+os_update_disable_rpmconf: true
+
+# --- KESL (Kaspersky Endpoint Security for Linux) ---
+# Управлять ли задачами KESL во время обновления
+os_update_kesl_manage: true
+
+# Путь к kesl-control
+os_update_kesl_bin: /usr/bin/kesl-control
+
+# Шаблон имени/типа задачи для поиска ID (File_Threat_Protection или OAS)
+os_update_kesl_task_pattern: "/Name: File_Threat_Protection|Type: OAS/"
+```
+
+📄 vars/main.yml
+
+```yaml
+---
+os_update_dpkg_lock_retries: 60
+os_update_dpkg_lock_delay: 5
+os_update_dnf_lock_timeout: 300
+```
+
+📄 tasks/main.yml
+
+```yaml
+---
+# --- 1. Подготовка ---
+- name: Ensure OS facts are gathered
+  ansible.builtin.setup:
+    gather_subset:
+      - min
+  when: ansible_distribution is not defined
+
+- name: Validate that OS is supported
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution in ['Ubuntu', 'OracleLinux']
+    fail_msg: >-
+      Unsupported OS: {{ ansible_distribution | default('unknown') }}
+      {{ ansible_distribution_version | default('') }}.
+      This role supports only Ubuntu and Oracle Linux.
+
+- name: Warn about untested OS versions
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ ansible_distribution }} {{ ansible_distribution_version }}
+      is not in tested versions (Ubuntu 22.04/24.04, Oracle Linux 8/9).
+      Proceeding with the generic update procedure.
+  when: >
+    (ansible_distribution == 'Ubuntu' and ansible_distribution_major_version not in ['22', '24']) or
+    (ansible_distribution == 'OracleLinux' and ansible_distribution_major_version not in ['8', '9'])
+
+- name: Ensure log directory exists on control node
+  ansible.builtin.file:
+    path: "{{ os_update_log_dir }}"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  run_once: true
+
+# --- 2. Определение KESL ---
+- name: Detect KESL installation
+  ansible.builtin.stat:
+    path: "{{ os_update_kesl_bin }}"
+  register: kesl_bin
+
+# --- 3. Блок обновления с управлением KESL ---
+- name: OS update with KESL file threat protection management
+  block:
+    # --- 3.1. Остановка KESL ---
+    - name: Get KESL OAS task ID
+      ansible.builtin.shell: |
+        set -o pipefail
+        {{ os_update_kesl_bin }} --get-task-list \
+          | awk '{{ os_update_kesl_task_pattern }} {found=1} found && /ID:/ {print $2; exit}'
+      register: kesl_oas_task
+      changed_when: false
+      failed_when: false
+      when:
+        - os_update_kesl_manage | bool
+        - kesl_bin.stat.exists
+
+    - name: Get KESL OAS task state
+      ansible.builtin.shell: >-
+        {{ os_update_kesl_bin }} --get-task-state {{ kesl_oas_task.stdout }}
+      register: kesl_oas_state
+      changed_when: false
+      failed_when: false
+      when:
+        - os_update_kesl_manage | bool
+        - kesl_bin.stat.exists
+        - kesl_oas_task.stdout | default('') | trim | length > 0
+
+    - name: Stop KESL OAS task before OS update
+      ansible.builtin.command:
+        cmd: "{{ os_update_kesl_bin }} --stop-task {{ kesl_oas_task.stdout }}"
+      register: kesl_stopped
+      when:
+        - os_update_kesl_manage | bool
+        - kesl_bin.stat.exists
+        - kesl_oas_task.stdout | default('') | trim | length > 0
+        - (kesl_oas_state.stdout | default('')) is search('Started|Running')
+
+    # --- 3.2. Обновление ОС ---
+    - name: Include OS-specific update tasks
+      ansible.builtin.include_tasks: "{{ ansible_os_family | lower }}.yml"
+
+    # --- 3.3. Проверка необходимости перезагрузки ---
+    - name: Check for reboot-required flag file (Ubuntu)
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_file
+      when: ansible_distribution == 'Ubuntu'
+
+    - name: Check if reboot is required (Oracle Linux)
+      ansible.builtin.command:
+        cmd: needs-restarting -r
+      register: reboot_required_cmd
+      changed_when: false
+      failed_when: false
+      when: ansible_distribution == 'OracleLinux'
+
+  # --- 3.4. ГАРАНТИРОВАННЫЙ возврат KESL ---
+  always:
+    - name: Ensure KESL OAS task is running after OS update
+      ansible.builtin.command:
+        cmd: "{{ os_update_kesl_bin }} --start-task {{ kesl_oas_task.stdout }}"
+      register: kesl_started
+      when:
+        - os_update_kesl_manage | bool
+        - kesl_bin.stat.exists
+        - kesl_oas_task is defined
+        - kesl_oas_task.stdout | default('') | trim | length > 0
+        - kesl_stopped is defined
+        - kesl_stopped is changed
+
+# --- 4. Перезагрузка при необходимости ---
+- name: Reboot host if required
+  ansible.builtin.debug:
+    msg: "Reboot is required — triggering handler"
+  changed_when: true
+  notify: Reboot host
+  when:
+    - os_update_reboot | bool
+    - >
+      (ansible_distribution == 'Ubuntu' and reboot_required_file.stat.exists | default(false)) or
+      (ansible_distribution == 'OracleLinux' and reboot_required_cmd.rc | default(0) == 1)
+```
+
+📄 tasks/debian.yml (с dpkg_options против запросов PAM)
+
+```yaml
+---
+- name: Update apt cache (with lock retries)
+  ansible.builtin.apt:
+    update_cache: yes
+    cache_valid_time: 3600
+    dpkg_options: "{{ os_update_dpkg_options }}"
+  register: apt_cache_result
+  until: apt_cache_result is success
+  retries: "{{ os_update_dpkg_lock_retries }}"
+  delay: "{{ os_update_dpkg_lock_delay }}"
+
+- name: Ensure psmisc is installed (provides fuser)
+  ansible.builtin.apt:
+    name: psmisc
+    state: present
+    dpkg_options: "{{ os_update_dpkg_options }}"
+  register: psmisc_install
+  until: psmisc_install is success
+  retries: "{{ os_update_dpkg_lock_retries }}"
+  delay: "{{ os_update_dpkg_lock_delay }}"
+
+- name: Wait for dpkg locks to be released
+  ansible.builtin.shell: >
+    fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock
+    /var/cache/apt/archives/lock 2>/dev/null
+  register: dpkg_lock_check
+  until: dpkg_lock_check.rc != 0
+  retries: "{{ os_update_dpkg_lock_retries }}"
+  delay: "{{ os_update_dpkg_lock_delay }}"
+  changed_when: false
+  failed_when: false
+
+- name: Get list of held packages
+  ansible.builtin.command: apt-mark showhold
+  register: held_packages
+  changed_when: false
+  failed_when: false
+
+- name: Unhold packages if any are held
+  ansible.builtin.command: >-
+    apt-mark unhold {{ held_packages.stdout_lines | join(' ') }}
+  when: held_packages.stdout | default('') | trim | length > 0
+  register: unhold_result
+  changed_when: true
+
+- name: Update apt cache before upgrade
+  ansible.builtin.apt:
+    update_cache: yes
+    cache_valid_time: 0
+    dpkg_options: "{{ os_update_dpkg_options }}"
+  register: apt_update_result
+  until: apt_update_result is success
+  retries: "{{ os_update_dpkg_lock_retries }}"
+  delay: "{{ os_update_dpkg_lock_delay }}"
+
+- name: Upgrade all packages
+  ansible.builtin.apt:
+    upgrade: "{{ os_update_apt_upgrade_type }}"
+    update_cache: no
+    autoremove: yes
+    dpkg_options: "{{ os_update_dpkg_options }}"
+  register: apt_upgrade_result
+  until: apt_upgrade_result is success
+  retries: 5
+  delay: 30
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+    UCF_FORCE_CONFOLD: "1"
+
+- name: Write update log to control node
+  ansible.builtin.copy:
+    content: |
+      Timestamp: {{ ansible_date_time.iso8601 }}
+      Host: {{ inventory_hostname }}
+      OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+      === Held packages ===
+      {{ held_packages.stdout | default('No held packages') }}
+      === Unhold operation ===
+      {{ unhold_result.stdout | default('No unhold performed') }}
+      {{ unhold_result.stderr | default('') }}
+      === APT update ===
+      {{ apt_update_result.stdout | default('') }}
+      {{ apt_update_result.stderr | default('') }}
+      === APT upgrade ===
+      {{ apt_upgrade_result.stdout | default('') }}
+      {{ apt_upgrade_result.stderr | default('') }}
+    dest: "{{ os_update_log_dir }}/{{ inventory_hostname }}_os_update_{{ ansible_date_time.epoch }}.log"
+    mode: '0644'
+  delegate_to: localhost
+```
+
+📄 tasks/redhat.yml (с отключением rpmconf против запросов PAM)
+
+```yaml
+---
+- name: Wait for yum/dnf lock file to disappear
+  ansible.builtin.wait_for:
+    path: /var/run/yum.pid
+    state: absent
+    timeout: "{{ os_update_dnf_lock_timeout }}"
+
+- name: Ensure dnf-plugins-core is installed
+  ansible.builtin.dnf:
+    name: dnf-plugins-core
+    state: present
+  register: dnf_plugins_install
+  until: dnf_plugins_install is success
+  retries: 30
+  delay: 10
+
+- name: Try to install dnf-utils (provides needs-restarting)
+  ansible.builtin.dnf:
+    name: dnf-utils
+    state: present
+  register: dnf_utils_install
+  failed_when: false
+  changed_when: dnf_utils_install is success
+
+# --- Отключаем rpmconf, чтобы DNF не задавал вопросов по PAM ---
+- name: Ensure /etc/dnf/plugins directory exists
+  ansible.builtin.file:
+    path: /etc/dnf/plugins
+    state: directory
+    mode: '0755'
+  when: os_update_disable_rpmconf | bool
+
+- name: Disable rpmconf plugin to avoid interactive prompts
+  ansible.builtin.copy:
+    dest: /etc/dnf/plugins/rpmconf.conf
+    content: |
+      [main]
+      enabled = 0
+    mode: '0644'
+  when: os_update_disable_rpmconf | bool
+
+- name: Check for dnf versionlock entries
+  ansible.builtin.command: dnf versionlock list
+  register: versionlock_list
+  changed_when: false
+  failed_when: false
+
+- name: Clear versionlock entries if any are present
+  ansible.builtin.command: dnf versionlock clear
+  when: versionlock_list.stdout | default('') | trim | length > 0
+  register: versionlock_clear_result
+  changed_when: true
+
+- name: Update all installed packages
+  ansible.builtin.dnf:
+    name: '*'
+    state: latest
+    update_cache: yes
+    update_only: yes
+  register: dnf_upgrade_result
+
+- name: Write update log to control node
+  ansible.builtin.copy:
+    content: |
+      Timestamp: {{ ansible_date_time.iso8601 }}
+      Host: {{ inventory_hostname }}
+      OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+      === Versionlock entries ===
+      {{ versionlock_list.stdout | default('No versionlock entries') }}
+      === Versionlock clear ===
+      {{ versionlock_clear_result.stdout | default('No clear performed') }}
+      {{ versionlock_clear_result.stderr | default('') }}
+      === DNF upgrade ===
+      {{ dnf_upgrade_result.stdout | default('') }}
+      {{ dnf_upgrade_result.stderr | default('') }}
+    dest: "{{ os_update_log_dir }}/{{ inventory_hostname }}_os_update_{{ ansible_date_time.epoch }}.log"
+    mode: '0644'
+  delegate_to: localhost
+```
+
+📄 handlers/main.yml
+
+```yaml
+---
+- name: Reboot host
+  ansible.builtin.reboot:
+    reboot_timeout: "{{ os_update_reboot_timeout }}"
+    post_reboot_delay: "{{ os_update_post_reboot_delay }}"
+```
+
+📄 meta/main.yml
+
+```yaml
+---
+galaxy_info:
+  author: your_name
+  description: >-
+    Update OS packages for Ubuntu 22.04/24.04 and Oracle Linux 8/9,
+    with optional KESL file threat protection management, non-interactive
+    config conflict resolution (PAM) and reboot handling.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - jammy
+        - noble
+    - name: OracleLinux
+      versions:
+        - "8"
+        - "9"
+  galaxy_tags:
+    - update
+    - upgrade
+    - security
+    - kesl
+    - ubuntu
+    - oraclelinux
+dependencies: []
+```
+
+📄 README.md
+
+```markdown
+# os_update
+
+Обновление пакетов в **Ubuntu 22.04/24.04** и **Oracle Linux 8/9** с:
+- корректной обработкой блокировок пакетных менеджеров;
+- неинтерактивным разрешением конфликтов конфигов (PAM и др.);
+- **временной остановкой KESL** (если установлен) на время обновления
+  и гарантированным возвратом через `block/always`;
+- проверкой необходимости перезагрузки и логированием.
+
+## Переменные (`defaults/main.yml`)
+
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `os_update_log_dir` | `{{ playbook_dir }}/logs` | Куда писать логи |
+| `os_update_reboot` | `true` | Перезагружать при необходимости |
+| `os_update_reboot_timeout` | `600` | Таймаут перезагрузки |
+| `os_update_post_reboot_delay` | `30` | Пауза после перезагрузки |
+| `os_update_apt_upgrade_type` | `dist` | `dist` или `safe` |
+| `os_update_dpkg_options` | `force-confold,force-confdef` | Стратегия конфликтов конфигов (PAM → N) |
+| `os_update_disable_rpmconf` | `true` | Отключение `rpmconf` (OL) |
+| `os_update_kesl_manage` | `true` | Управлять ли KESL во время обновления |
+| `os_update_kesl_bin` | `/usr/bin/kesl-control` | Путь к `kesl-control` |
+
+## Логика KESL
+
+1. Если `/usr/bin/kesl-control` существует — определяется ID задачи `OAS`
+   (`File_Threat_Protection`), проверяется её состояние.
+2. Если задача **запущена** — она останавливается перед обновлением.
+3. Обновление ОС выполняется в блоке `block`.
+4. В `always` (срабатывает **всегда**, даже при ошибке обновления) задача
+   **возвращается в running**, если мы её останавливали. Если она изначально
+   была выключена — роль её **не запускает** (уважаем намеренное отключение).
+5. Если KESL не установлен — обновление выполняется без изменений.
+
+## Пример плейбука
+
+```yaml
+- hosts: all
+  become: true
+  roles:
+    - os_update
+```
+
+## Важно
+
+- Роль требует `become: true`.
+- При использовании KSC с «замком» на локальное управление задачами
+  `kesl-control --stop-task` вернёт ошибку доступа. Роль не упадёт на этом
+  (используется `failed_when: false` при обнаружении), но KESL не будет
+  остановлен — обновление при этом выполнится.
+- Для Ubuntu `dist-upgrade` может удалять пакеты; используйте
+  `os_update_apt_upgrade_type: safe`, если это недопустимо.
+```
+
+---
+
+🔍 Ключевые решения при объединении
+
+Вопрос Решение
+Как гарантировать запуск KESL обратно? block/always вокруг всего блока обновления (включая include_tasks, reboot-check)
+Что если KESL не установлен? Задачи KESL помечены when: kesl_bin.stat.exists, include_tasks выполняется всегда
+Что если первая KESL-задача упала? failed_when: false на discovery + проверки kesl_oas_task.stdout \| default('') \| length > 0 — последующие задачи просто пропускаются
+Что если KESL был изначально остановлен? Условие остановки search('Started\|Running') не сработает, kesl_stopped.changed = False, always не запустит задачу (уважаем намеренное отключение)
+Что если include_tasks упал? always всё равно выполнится → KESL вернётся в работу
+Что если KESL остановить не удалось (KSC lock)? Stop-task упадёт, always не запустит (т.к. kesl_stopped.changed = False), задача KESL останется в исходном состоянии
+Как избежать вопросов по PAM? Ubuntu: dpkg_options: force-confold,force-confdef + UCF_FORCE_CONFOLD=1; OL: отключение rpmconf
+Где выполняется reboot? После always (KESL уже возвращён), через handler
+
+Роль готова к запуску. Достаточно скопировать файлы и при необходимости переопределить os_update_kesl_manage: false, если управление KESL не требуется.
