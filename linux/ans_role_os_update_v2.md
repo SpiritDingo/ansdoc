@@ -1050,3 +1050,200 @@ dependencies: []
 Где выполняется reboot? После always (KESL уже возвращён), через handler
 
 Роль готова к запуску. Достаточно скопировать файлы и при необходимости переопределить os_update_kesl_manage: false, если управление KESL не требуется.
+
+_____
+_____
+_____
+_____
+
+Роль дополнена очисткой старых ядер с сохранением только двух последних версий. Логика встроена в существующий block/always с KESL: очистка выполняется после обновления пакетов, но до проверки необходимости перезагрузки, чтобы не удалить только что установленное ядро.
+
+⚙️ 1. Новые переменные в defaults/main.yml
+
+```yaml
+---
+# ... существующие переменные ...
+
+# --- Очистка старых ядер ---
+# Удалять ли старые версии ядра после обновления
+os_update_remove_old_kernels: true
+
+# Сколько последних версий ядра оставлять (минимум 2)
+os_update_keep_kernel_nr: 2
+
+# Настраивать ли installonly_limit в dnf.conf (Oracle Linux)
+os_update_configure_dnf_installonly: true
+```
+
+📄 2. Обновлённый tasks/debian.yml (Ubuntu)
+
+Добавляем задачи в конец debian.yml (после Upgrade all packages и до логирования):
+
+```yaml
+# ... существующие задачи (apt cache, psmisc, locks, held, upgrade) ...
+
+# --- Очистка старых ядер (Ubuntu) ---
+- name: Get list of installed kernel packages
+  ansible.builtin.shell: |
+    set -o pipefail
+    dpkg-query -W -f='${Package} ${Status}\n' 'linux-image-*' \
+      | awk '$NF == "installed" {print $1}' \
+      | grep -vE 'linux-image-(generic|virtual|aws|azure|gcp|kvm|oem|oracle|lowlatency)$' \
+      | sort -V
+  register: ubuntu_kernels_raw
+  changed_when: false
+  failed_when: false
+  when: os_update_remove_old_kernels | bool
+
+- name: Determine kernels to keep (current + previous + latest)
+  ansible.builtin.set_fact:
+    ubuntu_kernels_to_remove: >-
+      {{
+        ubuntu_kernels_raw.stdout_lines
+        | reject('search', ansible_kernel)
+        | list
+        | sort
+        | slice(0, ([0, (ubuntu_kernels_raw.stdout_lines | length) - (os_update_keep_kernel_nr | int)] | max))
+      }}
+  when:
+    - os_update_remove_old_kernels | bool
+    - ubuntu_kernels_raw.stdout_lines | default([]) | length > (os_update_keep_kernel_nr | int)
+
+- name: Remove old kernel packages (keep last {{ os_update_keep_kernel_nr }})
+  ansible.builtin.apt:
+    name: "{{ ubuntu_kernels_to_remove }}"
+    state: absent
+    purge: true
+    autoremove: true
+    dpkg_options: "{{ os_update_dpkg_options }}"
+  when:
+    - os_update_remove_old_kernels | bool
+    - ubuntu_kernels_to_remove | default([]) | length > 0
+  register: ubuntu_kernel_cleanup
+
+- name: Log kernel cleanup result
+  ansible.builtin.debug:
+    msg: >-
+      Removed old kernels: {{ ubuntu_kernels_to_remove | default([]) | join(', ') }}
+      (kept {{ os_update_keep_kernel_nr }} newest + running kernel)
+  when:
+    - os_update_remove_old_kernels | bool
+    - ubuntu_kernel_cleanup is changed
+```
+
+Почему это безопасно для Ubuntu:
+
+· Исключается текущее работающее ядро (reject('search', ansible_kernel)).
+· Мета-пакеты (linux-image-generic и т.п.) не удаляются — только конкретные версии.
+· Удаляются только те версии, что старше последних os_update_keep_kernel_nr.
+· purge: true удаляет и конфигурационные файлы, освобождая /boot.
+· Если ядер меньше или равно лимиту — очистка не выполняется.
+
+📄 3. Обновлённый tasks/redhat.yml (Oracle Linux)
+
+Добавляем задачи в конец redhat.yml:
+
+```yaml
+# ... существующие задачи (lock, dnf-plugins-core, versionlock, upgrade) ...
+
+# --- Очистка старых ядер (Oracle Linux) ---
+- name: Configure installonly_limit in dnf.conf (keep {{ os_update_keep_kernel_nr }} kernels)
+  ansible.builtin.lineinfile:
+    path: /etc/dnf/dnf.conf
+    regexp: '^installonly_limit\s*='
+    line: "installonly_limit={{ os_update_keep_kernel_nr }}"
+    state: present
+  when:
+    - os_update_remove_old_kernels | bool
+    - os_update_configure_dnf_installonly | bool
+
+- name: Remove old installonly packages (kernels) exceeding limit
+  ansible.builtin.command:
+    cmd: >-
+      dnf remove -y --oldinstallonly
+      --setopt installonly_limit={{ os_update_keep_kernel_nr }} kernel
+  register: redhat_kernel_cleanup
+  changed_when: redhat_kernel_cleanup.stdout | default('') is search('Removed|Удалено')
+  failed_when: false
+  when: os_update_remove_old_kernels | bool
+
+- name: Log kernel cleanup result
+  ansible.builtin.debug:
+    msg: >-
+      DNF oldinstallonly cleanup: {{ redhat_kernel_cleanup.stdout | default('no output') }}
+  when:
+    - os_update_remove_old_kernels | bool
+    - redhat_kernel_cleanup is defined
+    - redhat_kernel_cleanup.stdout | default('') | trim | length > 0
+```
+
+Почему это безопасно для Oracle Linux:
+
+· dnf remove --oldinstallonly автоматически пропускает текущее работающее ядро (документированное поведение).
+· --setopt installonly_limit=2 гарантирует, что останутся ровно две последние версии (включая текущую).
+· Настройка installonly_limit в /etc/dnf/dnf.conf предотвращает накопление старых ядер в будущем.
+· failed_when: false — если удалять нечего, задача не считается упавшей.
+
+📄 4. Обновлённый tasks/main.yml (фрагмент с очисткой)
+
+Очистка ядер должна выполняться внутри block, после include_tasks, но до проверки перезагрузки:
+
+```yaml
+    # --- 3.2. Обновление ОС (включает очистку ядер в debian.yml / redhat.yml) ---
+    - name: Include OS-specific update tasks
+      ansible.builtin.include_tasks: "{{ ansible_os_family | lower }}.yml"
+
+    # --- 3.3. Проверка необходимости перезагрузки ---
+    - name: Check for reboot-required flag file (Ubuntu)
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_file
+      when: ansible_distribution == 'Ubuntu'
+    # ... остальные задачи блока ...
+```
+
+Очистка уже встроена в debian.yml / redhat.yml, поэтому в main.yml дополнительных задач не требуется — include_tasks выполнит их в нужном порядке.
+
+📄 5. Обновлённый README.md (фрагмент)
+
+Добавьте в таблицу переменных:
+
+Переменная По умолчанию Описание
+os_update_remove_old_kernels true Удалять старые ядра после обновления
+os_update_keep_kernel_nr 2 Сколько последних версий ядра оставлять (мин. 2)
+os_update_configure_dnf_installonly true Настраивать installonly_limit в dnf.conf (OL)
+
+И раздел:
+
+```markdown
+## Очистка старых ядер
+
+После обновления пакетов роль удаляет старые версии ядра,
+оставляя `os_update_keep_kernel_nr` последних (по умолчанию **2**).
+
+- **Ubuntu**: удаляются конкретные пакеты `linux-image-<version>`,
+  кроме текущего работающего ядра и последних N версий. Мета-пакеты
+  (`linux-image-generic` и т.п.) не затрагиваются.
+- **Oracle Linux**: выполняется `dnf remove --oldinstallonly kernel`
+  с `installonly_limit=2`, а также настраивается `installonly_limit=2`
+  в `/etc/dnf/dnf.conf` для предотвращения накопления ядер в будущем.
+  Текущее работающее ядро никогда не удаляется.
+
+Чтобы отключить очистку:
+
+```yaml
+os_update_remove_old_kernels: false
+```
+
+```
+
+---
+
+### ✅ Итог
+
+| ОС | Команда очистки | Защита текущего ядра | Лимит |
+|---|---|---|---|
+| **Ubuntu** | `apt purge` конкретных `linux-image-*` | Исключается через `ansible_kernel` | `os_update_keep_kernel_nr` |
+| **Oracle Linux** | `dnf remove --oldinstallonly` | Встроено в DNF[reference:1] | `installonly_limit=2` + `dnf.conf` |
+
+Роль теперь полностью автоматизирует цикл **обновление → очистка старых ядер → проверка перезагрузки → возврат KESL**, сохраняя только две последние версии ядра на обеих поддерживаемых ОС.
