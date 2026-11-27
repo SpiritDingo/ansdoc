@@ -1247,3 +1247,76 @@ os_update_remove_old_kernels: false
 | **Oracle Linux** | `dnf remove --oldinstallonly` | Встроено в DNF[reference:1] | `installonly_limit=2` + `dnf.conf` |
 
 Роль теперь полностью автоматизирует цикл **обновление → очистка старых ядер → проверка перезагрузки → возврат KESL**, сохраняя только две последние версии ядра на обеих поддерживаемых ОС.
+
+_______
+_______
+_______
+_______
+
+Ошибка fatal: FAILED! при выполнении apt-mark unhold возникает из-за того, что один или несколько перечисленных пакетов не установлены в системе (например, ядра для gke или azure на текущем хосте), либо отсутствуют в кэше APT. Команда apt-mark завершается с ненулевым кодом возврата, если не может найти хотя бы один пакет из аргументов, что Ansible воспринимает как фатальный сбой.
+
+Чтобы роль не падала и корректно снимала удержание только с реально существующих пакетов, необходимо отфильтровать список перед вызовом apt-mark.
+
+🛠️ Исправленная задача в tasks/debian.yml
+
+Замените блок задач, связанный с удержанием (Get list of held packages и Unhold packages if any are held), на следующий:
+
+```yaml
+- name: Get list of held packages
+  ansible.builtin.command: apt-mark showhold
+  register: held_packages
+  changed_when: false
+  failed_when: false
+
+- name: Filter held packages that are actually installed
+  ansible.builtin.set_fact:
+    installed_held_packages: >-
+      {{
+        held_packages.stdout_lines
+        | select('in', ansible_facts.packages.keys() | default([]))
+        | list
+      }}
+  when: held_packages.stdout | default('') | trim | length > 0
+
+- name: Unhold packages if any are held and installed
+  ansible.builtin.command: >-
+    apt-mark unhold {{ installed_held_packages | join(' ') }}
+  when:
+    - installed_held_packages is defined
+    - installed_held_packages | length > 0
+  register: unhold_result
+  changed_when: true
+  failed_when: false
+```
+
+Важно: Для работы ansible_facts.packages необходимо, чтобы в системе был установлен пакет python3-apt (обычно он уже присутствует в стандартной поставке Ansible для Ubuntu). Если факты о пакетах не собраны, их можно предварительно собрать задачей ansible.builtin.package_facts: manager=auto.
+
+💡 Альтернативный (упрощённый) вариант
+
+Если не хочется использовать package_facts, можно просто игнорировать ошибку снятия удержания, логируя её:
+
+```yaml
+- name: Unhold packages if any are held
+  ansible.builtin.command: >-
+    apt-mark unhold {{ held_packages.stdout_lines | join(' ') }}
+  when: held_packages.stdout | default('') | trim | length > 0
+  register: unhold_result
+  changed_when: true
+  failed_when: false
+
+- name: Warn if unhold failed
+  ansible.builtin.debug:
+    msg: "Не удалось снять удержание с некоторых пакетов (возможно, они не установлены): {{ unhold_result.stderr | default('') }}"
+  when:
+    - unhold_result is defined
+    - unhold_result.rc is defined
+    - unhold_result.rc != 0
+```
+
+В этом случае роль продолжит обновление, но в логах останется предупреждение о том, какие именно пакеты не удалось обработать.
+
+🔍 Почему это произошло на вашем хосте
+
+На скриншоте видны пакеты linux-headers-5.15.0-1032-gke, linux-headers-5.15.0-1038-azure, linux-headers-5.15.0-1044-azure — это заголовки ядер для специфических облачных платформ (Google Kubernetes Engine, Microsoft Azure). На вашем сервере они помечены как «удерживаемые» (hold), но фактически отсутствуют в системе. apt-mark showhold показывает их, потому что запись об удержании осталась в базе dpkg, а команда unhold не может найти сами пакеты для обработки.
+
+Исправленная задача выше решит эту проблему: она будет снимать удержание только с тех пакетов, которые реально установлены, и не будет падать на отсутствующих.
