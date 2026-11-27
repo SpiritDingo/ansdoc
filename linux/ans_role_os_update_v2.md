@@ -1322,3 +1322,57 @@ _______
 На скриншоте видны пакеты linux-headers-5.15.0-1032-gke, linux-headers-5.15.0-1038-azure, linux-headers-5.15.0-1044-azure — это заголовки ядер для специфических облачных платформ (Google Kubernetes Engine, Microsoft Azure). На вашем сервере они помечены как «удерживаемые» (hold), но фактически отсутствуют в системе. apt-mark showhold показывает их, потому что запись об удержании осталась в базе dpkg, а команда unhold не может найти сами пакеты для обработки.
 
 Исправленная задача выше решит эту проблему: она будет снимать удержание только с тех пакетов, которые реально установлены, и не будет падать на отсутствующих.
+
+
+___
+
+
+
+Ошибка 'dict object' has no attribute 'packages' возникает из-за того, что встроенный факт ansible_facts.packages не заполняется автоматически при стандартном сборе фактов. Его нужно явно собрать с помощью модуля ansible.builtin.package_facts.
+
+Также важно учитывать: если вызвать package_facts и сразу в том же задании обратиться к ansible_facts.packages, факт может не успеть обновиться в текущем контексте. Решение — разделить сбор фактов и фильтрацию на два отдельных шага.
+
+🛠️ Исправленный фрагмент для tasks/debian.yml
+
+Замените текущий блок фильтрации (Filter held packages that are actually installed) на следующие три задачи:
+
+```yaml
+- name: Get list of held packages
+  ansible.builtin.command: apt-mark showhold
+  register: held_packages
+  changed_when: false
+  failed_when: false
+
+- name: Gather installed packages facts
+  ansible.builtin.package_facts:
+    manager: auto
+  when: held_packages.stdout | default('') | trim | length > 0
+
+- name: Filter held packages that are actually installed
+  ansible.builtin.set_fact:
+    installed_held_packages: >-
+      {{
+        held_packages.stdout_lines
+        | select('in', ansible_facts.packages | default({}) | list)
+        | list
+      }}
+  when: held_packages.stdout | default('') | trim | length > 0
+
+- name: Unhold packages if any are held and installed
+  ansible.builtin.command: >-
+    apt-mark unhold {{ installed_held_packages | join(' ') }}
+  when:
+    - installed_held_packages is defined
+    - installed_held_packages | length > 0
+  register: unhold_result
+  changed_when: true
+  failed_when: false
+```
+
+Что изменилось:
+
+· Добавлен ansible.builtin.package_facts (manager: auto) — он заполняет ansible_facts.packages списком установленных пакетов.
+· Добавлена защита | default({}) на случай, если факт по какой-то причине не собрался — тогда фильтр просто вернёт пустой список вместо падения.
+· Сбор фактов вынесен в отдельную задачу перед set_fact, чтобы избежать проблемы с асинхронным обновлением фактов.
+
+После этого роль будет снимать удержание только с тех пакетов, которые реально установлены, и не будет падать на отсутствующих пакетах (как в случае с linux-headers-...-gke и ...-azure на ваших серверах).
