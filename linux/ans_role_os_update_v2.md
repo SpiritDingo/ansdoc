@@ -1458,3 +1458,646 @@ scp_if_ssh = True
 Если обновления выполняются на многих хостах одновременно, добавьте serial: 1 (или serial: 10%) в плейбук — это снизит конкуренцию за блокировки на каждом хосте.
 
 После этих изменений роль будет ждать до 20 минут снятия блокировки и не упадёт, если фоновое обновление затянется.
+
+______
+______
+______
+______
+______
+
+Ниже представлена полная, финальная версия Ansible-роли os_update, которая объединяет в себе все обсуждённые улучшения: поддержку Ubuntu и Oracle Linux, обработку интерактивных запросов PAM, управление KESL через block/always, безопасное удаление старых ядер, корректную работу с удерживаемыми пакетами (apt-mark hold) и агрессивное, но безопасное снятие блокировок dpkg.
+
+📁 Структура роли
+
+```text
+os_update/
+├── README.md
+├── defaults/
+│   └── main.yml
+├── handlers/
+│   └── main.yml
+├── meta/
+│   └── main.yml
+├── tasks/
+│   ├── main.yml
+│   ├── debian.yml
+│   └── redhat.yml
+└── vars/
+    └── main.yml
+```
+
+---
+
+📄 defaults/main.yml
+
+```yaml
+---
+# --- Общие настройки ---
+os_update_log_dir: "{{ playbook_dir }}/logs"
+os_update_reboot: true
+os_update_reboot_timeout: 600
+os_update_post_reboot_delay: 30
+
+# --- Обработка конфигурационных файлов (PAM и др.) ---
+# force-confold: сохранить текущую версию (N), force-confdef: авто-принятие если не менялся
+os_update_dpkg_options: "force-confold,force-confdef"
+os_update_disable_rpmconf: true
+
+# --- Настройки APT ---
+os_update_apt_upgrade_type: dist
+
+# --- Управление блокировками DPKG ---
+os_update_dpkg_lock_wait_seconds: 300
+os_update_dpkg_force_unlock: true
+
+# --- Очистка старых ядер ---
+os_update_remove_old_kernels: true
+os_update_keep_kernel_nr: 2
+os_update_configure_dnf_installonly: true
+
+# --- KESL (Kaspersky Endpoint Security for Linux) ---
+os_update_kesl_manage: true
+os_update_kesl_bin: /usr/bin/kesl-control
+os_update_kesl_task_pattern: "/Name: File_Threat_Protection|Type: OAS/"
+```
+
+📄 vars/main.yml
+
+```yaml
+---
+os_update_dpkg_lock_retries: 60
+os_update_dpkg_lock_delay: 5
+os_update_dnf_lock_timeout: 300
+```
+
+📄 tasks/main.yml
+
+```yaml
+---
+# --- 1. Подготовка и валидация ---
+- name: Ensure OS facts are gathered
+  ansible.builtin.setup:
+    gather_subset:
+      - min
+  when: ansible_distribution is not defined
+
+- name: Validate that OS is supported
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution in ['Ubuntu', 'OracleLinux']
+    fail_msg: >-
+      Unsupported OS: {{ ansible_distribution | default('unknown') }}.
+      This role supports only Ubuntu and Oracle Linux.
+
+- name: Ensure log directory exists on control node
+  ansible.builtin.file:
+    path: "{{ os_update_log_dir }}"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  run_once: true
+
+# --- 2. Определение KESL ---
+- name: Detect KESL installation
+  ansible.builtin.stat:
+    path: "{{ os_update_kesl_bin }}"
+  register: kesl_bin
+
+# --- 3. Блок обновления с управлением KESL ---
+- name: OS update with KESL file threat protection management
+  block:
+    # --- 3.1. Остановка KESL ---
+    - name: Get KESL OAS task ID
+      ansible.builtin.shell: |
+        set -o pipefail
+        {{ os_update_kesl_bin }} --get-task-list \
+          | awk '{{ os_update_kesl_task_pattern }} {found=1} found && /ID:/ {print $2; exit}'
+      register: kesl_oas_task
+      changed_when: false
+      failed_when: false
+      when:
+        - os_update_kesl_manage | bool
+        - kesl_bin.stat.exists
+
+    - name: Get KESL OAS task state
+      ansible.builtin.shell: >-
+        {{ os_update_kesl_bin }} --get-task-state {{ kesl_oas_task.stdout }}
+      register: kesl_oas_state
+      changed_when: false
+      failed_when: false
+      when:
+        - os_update_kesl_manage | bool
+        - kesl_bin.stat.exists
+        - kesl_oas_task.stdout | default('') | trim | length > 0
+
+    - name: Stop KESL OAS task before OS update
+      ansible.builtin.command:
+        cmd: "{{ os_update_kesl_bin }} --stop-task {{ kesl_oas_task.stdout }}"
+      register: kesl_stopped
+      when:
+        - os_update_kesl_manage | bool
+        - kesl_bin.stat.exists
+        - kesl_oas_task.stdout | default('') | trim | length > 0
+        - (kesl_oas_state.stdout | default('')) is search('Started|Running')
+
+    # --- 3.2. Обновление ОС ---
+    - name: Include OS-specific update tasks
+      ansible.builtin.include_tasks: "{{ ansible_os_family | lower }}.yml"
+
+    # --- 3.3. Проверка необходимости перезагрузки ---
+    - name: Check for reboot-required flag file (Ubuntu)
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_file
+      when: ansible_distribution == 'Ubuntu'
+
+    - name: Check if reboot is required (Oracle Linux)
+      ansible.builtin.command:
+        cmd: needs-restarting -r
+      register: reboot_required_cmd
+      changed_when: false
+      failed_when: false
+      when: ansible_distribution == 'OracleLinux'
+
+  # --- 3.4. ГАРАНТИРОВАННЫЙ возврат KESL ---
+  always:
+    - name: Ensure KESL OAS task is running after OS update
+      ansible.builtin.command:
+        cmd: "{{ os_update_kesl_bin }} --start-task {{ kesl_oas_task.stdout }}"
+      when:
+        - os_update_kesl_manage | bool
+        - kesl_bin.stat.exists
+        - kesl_oas_task is defined
+        - kesl_oas_task.stdout | default('') | trim | length > 0
+        - kesl_stopped is defined
+        - kesl_stopped is changed
+
+# --- 4. Перезагрузка при необходимости ---
+- name: Reboot host if required
+  ansible.builtin.debug:
+    msg: "Reboot is required — triggering handler"
+  changed_when: true
+  notify: Reboot host
+  when:
+    - os_update_reboot | bool
+    - >
+      (ansible_distribution == 'Ubuntu' and reboot_required_file.stat.exists | default(false)) or
+      (ansible_distribution == 'OracleLinux' and reboot_required_cmd.rc | default(0) == 1)
+
+# --- 5. Возврат фоновых обновлений Ubuntu ---
+- name: Re-enable apt-daily timers
+  ansible.builtin.debug:
+    msg: "Re-enabling background APT timers"
+  changed_when: true
+  notify: Re-enable apt-daily timers
+  when: ansible_distribution == 'Ubuntu'
+```
+
+📄 tasks/debian.yml
+
+```yaml
+---
+# --- 1. Отключение фоновых обновлений ---
+- name: Stop unattended-upgrades and apt-daily timers
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+  loop:
+    - unattended-upgrades.service
+    - apt-daily.service
+    - apt-daily-upgrade.service
+    - apt-daily.timer
+    - apt-daily-upgrade.timer
+  failed_when: false
+
+- name: Disable apt-daily timers during update
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: false
+  loop:
+    - apt-daily.timer
+    - apt-daily-upgrade.timer
+  failed_when: false
+
+# --- 2. Управление блокировками DPKG ---
+- name: Wait for dpkg locks to be released (timeout {{ os_update_dpkg_lock_wait_seconds }}s)
+  ansible.builtin.shell: |
+    set -o pipefail
+    timeout {{ os_update_dpkg_lock_wait_seconds }} bash -c '
+      while fuser /var/lib/dpkg/lock-frontend \
+                  /var/lib/dpkg/lock \
+                  /var/cache/apt/archives/lock >/dev/null 2>&1; do
+        sleep 3
+      done
+    '
+  register: dpkg_lock_wait
+  changed_when: false
+  failed_when: false
+
+- name: Identify process holding dpkg lock
+  ansible.builtin.shell: |
+    set -o pipefail
+    fuser /var/lib/dpkg/lock-frontend 2>/dev/null | tr -d ' \n'
+  register: dpkg_lock_pid
+  changed_when: false
+  failed_when: false
+  when:
+    - dpkg_lock_wait.rc | default(0) != 0
+    - os_update_dpkg_force_unlock | bool
+
+- name: Verify lock holder is apt/dpkg process
+  ansible.builtin.command:
+    cmd: "ps -p {{ dpkg_lock_pid.stdout }} -o comm="
+  register: dpkg_lock_proc
+  changed_when: false
+  failed_when: false
+  when:
+    - dpkg_lock_wait.rc | default(0) != 0
+    - os_update_dpkg_force_unlock | bool
+    - dpkg_lock_pid.stdout | default('') | trim | length > 0
+
+- name: Force release dpkg lock (kill process)
+  ansible.builtin.command:
+    cmd: "kill -9 {{ dpkg_lock_pid.stdout }}"
+  when:
+    - dpkg_lock_wait.rc | default(0) != 0
+    - os_update_dpkg_force_unlock | bool
+    - dpkg_lock_pid.stdout | default('') | trim | length > 0
+    - dpkg_lock_proc.stdout | default('') is search('apt|dpkg|unattended')
+  register: dpkg_kill_result
+
+- name: Wait for killed process to disappear
+  ansible.builtin.wait_for:
+    path: "/proc/{{ dpkg_lock_pid.stdout }}"
+    state: absent
+    timeout: 30
+  when:
+    - dpkg_kill_result is changed
+    - dpkg_lock_pid.stdout | default('') | trim | length > 0
+
+- name: Remove stale dpkg lock files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /var/lib/dpkg/lock-frontend
+    - /var/lib/dpkg/lock
+    - /var/cache/apt/archives/lock
+    - /var/lib/apt/lists/lock
+  when: dpkg_lock_wait.rc | default(0) != 0
+
+- name: Reconfigure dpkg after forced lock release
+  ansible.builtin.command:
+    cmd: dpkg --configure -a
+  register: dpkg_reconfigure
+  changed_when: dpkg_reconfigure.stdout | default('') | trim | length > 0
+  failed_when: false
+  when: dpkg_lock_wait.rc | default(0) != 0
+
+# --- 3. Работа с удерживаемыми (held) пакетами ---
+- name: Get list of held packages
+  ansible.builtin.command: apt-mark showhold
+  register: held_packages
+  changed_when: false
+  failed_when: false
+
+- name: Gather installed packages facts
+  ansible.builtin.package_facts:
+    manager: auto
+  when: held_packages.stdout | default('') | trim | length > 0
+
+- name: Filter held packages that are actually installed
+  ansible.builtin.set_fact:
+    installed_held_packages: >-
+      {{
+        held_packages.stdout_lines
+        | select('in', ansible_facts.packages | default({}) | list)
+        | list
+      }}
+  when: held_packages.stdout | default('') | trim | length > 0
+
+- name: Unhold installed packages
+  ansible.builtin.command: >-
+    apt-mark unhold {{ installed_held_packages | join(' ') }}
+  when:
+    - installed_held_packages is defined
+    - installed_held_packages | length > 0
+  register: unhold_result
+  changed_when: true
+  failed_when: false
+
+# --- 4. Обновление пакетов ---
+- name: Configure global APT lock timeout
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/99-ansible-lock-timeout
+    content: 'DPkg::Lock::Timeout "-1";'
+    mode: '0644'
+
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: yes
+    cache_valid_time: 0
+    dpkg_options: "{{ os_update_dpkg_options }}"
+    lock_timeout: 600
+  register: apt_update_result
+  until: apt_update_result is success
+  retries: 5
+  delay: 30
+
+- name: Upgrade all packages
+  ansible.builtin.apt:
+    upgrade: "{{ os_update_apt_upgrade_type }}"
+    update_cache: no
+    autoremove: yes
+    dpkg_options: "{{ os_update_dpkg_options }}"
+    lock_timeout: 600
+  register: apt_upgrade_result
+  until: apt_upgrade_result is success
+  retries: 5
+  delay: 30
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+    UCF_FORCE_CONFOLD: "1"
+
+# --- 5. Очистка старых ядер ---
+- name: Get list of installed kernel packages
+  ansible.builtin.shell: |
+    set -o pipefail
+    dpkg-query -W -f='${Package} ${Status}\n' 'linux-image-*' \
+      | awk '$NF == "installed" {print $1}' \
+      | grep -vE 'linux-image-(generic|virtual|aws|azure|gcp|kvm|oem|oracle|lowlatency)$' \
+      | sort -V
+  register: ubuntu_kernels_raw
+  changed_when: false
+  failed_when: false
+  when: os_update_remove_old_kernels | bool
+
+- name: Determine kernels to keep (current + previous + latest)
+  ansible.builtin.set_fact:
+    ubuntu_kernels_to_remove: >-
+      {{
+        ubuntu_kernels_raw.stdout_lines
+        | reject('search', ansible_kernel)
+        | list
+        | sort
+        | slice(0, ([0, (ubuntu_kernels_raw.stdout_lines | length) - (os_update_keep_kernel_nr | int)] | max))
+      }}
+  when:
+    - os_update_remove_old_kernels | bool
+    - ubuntu_kernels_raw.stdout_lines | default([]) | length > (os_update_keep_kernel_nr | int)
+
+- name: Remove old kernel packages (keep last {{ os_update_keep_kernel_nr }})
+  ansible.builtin.apt:
+    name: "{{ ubuntu_kernels_to_remove }}"
+    state: absent
+    purge: true
+    autoremove: true
+    dpkg_options: "{{ os_update_dpkg_options }}"
+    lock_timeout: 300
+  when:
+    - os_update_remove_old_kernels | bool
+    - ubuntu_kernels_to_remove | default([]) | length > 0
+  register: ubuntu_kernel_cleanup
+
+# --- 6. Логирование ---
+- name: Write update log to control node
+  ansible.builtin.copy:
+    content: |
+      Timestamp: {{ ansible_date_time.iso8601 }}
+      Host: {{ inventory_hostname }}
+      OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+      === Held packages ===
+      {{ held_packages.stdout | default('No held packages') }}
+      === Unhold operation ===
+      {{ unhold_result.stdout | default('No unhold performed') }}
+      {{ unhold_result.stderr | default('') }}
+      === APT update ===
+      {{ apt_update_result.stdout | default('') }}
+      {{ apt_update_result.stderr | default('') }}
+      === APT upgrade ===
+      {{ apt_upgrade_result.stdout | default('') }}
+      {{ apt_upgrade_result.stderr | default('') }}
+      === Kernel cleanup ===
+      {{ ubuntu_kernel_cleanup.stdout | default('') }}
+    dest: "{{ os_update_log_dir }}/{{ inventory_hostname }}_os_update_{{ ansible_date_time.epoch }}.log"
+    mode: '0644'
+  delegate_to: localhost
+```
+
+📄 tasks/redhat.yml
+
+```yaml
+---
+- name: Wait for yum/dnf lock file to disappear
+  ansible.builtin.wait_for:
+    path: /var/run/yum.pid
+    state: absent
+    timeout: "{{ os_update_dnf_lock_timeout }}"
+
+- name: Ensure dnf-plugins-core is installed
+  ansible.builtin.dnf:
+    name: dnf-plugins-core
+    state: present
+  register: dnf_plugins_install
+  until: dnf_plugins_install is success
+  retries: 30
+  delay: 10
+
+- name: Try to install dnf-utils (provides needs-restarting)
+  ansible.builtin.dnf:
+    name: dnf-utils
+    state: present
+  register: dnf_utils_install
+  failed_when: false
+  changed_when: dnf_utils_install is success
+
+# --- Отключение rpmconf для предотвращения запросов по PAM ---
+- name: Ensure /etc/dnf/plugins directory exists
+  ansible.builtin.file:
+    path: /etc/dnf/plugins
+    state: directory
+    mode: '0755'
+  when: os_update_disable_rpmconf | bool
+
+- name: Disable rpmconf plugin to avoid interactive prompts
+  ansible.builtin.copy:
+    dest: /etc/dnf/plugins/rpmconf.conf
+    content: |
+      [main]
+      enabled = 0
+    mode: '0644'
+  when: os_update_disable_rpmconf | bool
+
+# --- Очистка versionlock ---
+- name: Check for dnf versionlock entries
+  ansible.builtin.command: dnf versionlock list
+  register: versionlock_list
+  changed_when: false
+  failed_when: false
+
+- name: Clear versionlock entries if any are present
+  ansible.builtin.command: dnf versionlock clear
+  when: versionlock_list.stdout | default('') | trim | length > 0
+  register: versionlock_clear_result
+  changed_when: true
+
+# --- Обновление пакетов ---
+- name: Update all installed packages
+  ansible.builtin.dnf:
+    name: '*'
+    state: latest
+    update_cache: yes
+    update_only: yes
+  register: dnf_upgrade_result
+
+# --- Очистка старых ядер ---
+- name: Configure installonly_limit in dnf.conf (keep {{ os_update_keep_kernel_nr }} kernels)
+  ansible.builtin.lineinfile:
+    path: /etc/dnf/dnf.conf
+    regexp: '^installonly_limit\s*='
+    line: "installonly_limit={{ os_update_keep_kernel_nr }}"
+    state: present
+  when:
+    - os_update_remove_old_kernels | bool
+    - os_update_configure_dnf_installonly | bool
+
+- name: Remove old installonly packages (kernels) exceeding limit
+  ansible.builtin.command:
+    cmd: >-
+      dnf remove -y --oldinstallonly
+      --setopt installonly_limit={{ os_update_keep_kernel_nr }} kernel
+  register: redhat_kernel_cleanup
+  changed_when: redhat_kernel_cleanup.stdout | default('') is search('Removed|Удалено')
+  failed_when: false
+  when: os_update_remove_old_kernels | bool
+
+# --- Логирование ---
+- name: Write update log to control node
+  ansible.builtin.copy:
+    content: |
+      Timestamp: {{ ansible_date_time.iso8601 }}
+      Host: {{ inventory_hostname }}
+      OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+      === Versionlock entries ===
+      {{ versionlock_list.stdout | default('No versionlock entries') }}
+      === Versionlock clear ===
+      {{ versionlock_clear_result.stdout | default('No clear performed') }}
+      {{ versionlock_clear_result.stderr | default('') }}
+      === DNF upgrade ===
+      {{ dnf_upgrade_result.stdout | default('') }}
+      {{ dnf_upgrade_result.stderr | default('') }}
+      === Kernel cleanup ===
+      {{ redhat_kernel_cleanup.stdout | default('') }}
+    dest: "{{ os_update_log_dir }}/{{ inventory_hostname }}_os_update_{{ ansible_date_time.epoch }}.log"
+    mode: '0644'
+  delegate_to: localhost
+```
+
+📄 handlers/main.yml
+
+```yaml
+---
+- name: Reboot host
+  ansible.builtin.reboot:
+    reboot_timeout: "{{ os_update_reboot_timeout }}"
+    post_reboot_delay: "{{ os_update_post_reboot_delay }}"
+
+- name: Re-enable apt-daily timers
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop:
+    - apt-daily.timer
+    - apt-daily-upgrade.timer
+  failed_when: false
+```
+
+📄 meta/main.yml
+
+```yaml
+---
+galaxy_info:
+  author: your_name
+  description: >-
+    Update OS packages for Ubuntu 22.04/24.04 and Oracle Linux 8/9,
+    with KESL management, old kernel removal, robust dpkg lock handling,
+    and non-interactive config resolution.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - jammy
+        - noble
+    - name: OracleLinux
+      versions:
+        - "8"
+        - "9"
+  galaxy_tags:
+    - update
+    - upgrade
+    - kesl
+    - ubuntu
+    - oraclelinux
+dependencies: []
+```
+
+📄 README.md
+
+```markdown
+# os_update
+
+Комплексная Ansible-роль для обновления **Ubuntu 22.04/24.04** и **Oracle Linux 8/9**.
+
+## Возможности
+- Валидация поддерживаемых ОС.
+- **Обработка блокировок**: ожидание освобождения `dpkg`/`yum` с возможностью принудительного снятия «зависших» блокировок.
+- **Неинтерактивность**: автоматический выбор «оставить текущую версию» при конфликтах конфигов (PAM и др.) на обеих ОС.
+- **KESL**: временная остановка защиты от файловых угроз перед обновлением и гарантированный возврат в работу через `block/always`.
+- **Очистка ядер**: удаление старых версий ядра с сохранением последних `os_update_keep_kernel_nr` (по умолчанию 2).
+- **Логирование**: сохранение подробных логов на управляющий узел.
+
+## Ключевые переменные
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `os_update_log_dir` | `{{ playbook_dir }}/logs` | Директория для логов |
+| `os_update_reboot` | `true` | Перезагружать хост при необходимости |
+| `os_update_apt_upgrade_type` | `dist` | Тип обновления apt (`dist` или `safe`) |
+| `os_update_dpkg_options` | `force-confold,force-confdef` | Стратегия разрешения конфликтов (выбор N) |
+| `os_update_disable_rpmconf` | `true` | Отключение плагина `rpmconf` на Oracle Linux |
+| `os_update_dpkg_lock_wait_seconds` | `300` | Сколько ждать снятия блокировки перед kill |
+| `os_update_dpkg_force_unlock` | `true` | Убивать ли процесс, удерживающий блокировку |
+| `os_update_remove_old_kernels` | `true` | Удалять старые ядра |
+| `os_update_keep_kernel_nr` | `2` | Сколько последних ядер оставлять |
+| `os_update_kesl_manage` | `true` | Управлять ли KESL во время обновления |
+
+## Пример использования
+```yaml
+- hosts: all
+  become: true
+  roles:
+    - os_update
+```
+
+## Важно
+- Требуется `become: true`.
+- Для работы `package_facts` (фильтрация held-пакетов) на Ubuntu нужен `python3-apt`.
+- При отключении KESL через KSC политику (замок) роль не упадёт, но KESL не будет остановлен.
+```
+
+---
+
+✅ Что решает эта версия (все накопленные исправления)
+
+1. Ошибка dict object has no attribute 'packages' — исправлена добавлением модуля ansible.builtin.package_facts и фильтрацией held-пакетов.
+2. Падение apt-mark unhold на отсутствующих пакетах — фильтр select('in', ansible_facts.packages.keys()) убирает несуществующие ядра (вроде gke/azure).
+3. Зависание/падение на блокировке dpkg — добавлен механизм ожидания (до 5 минут) и принудительного снятия (kill только для процессов apt/dpkg + dpkg --configure -a).
+4. Запросы по PAM — Ubuntu использует force-confold и UCF_FORCE_CONFOLD=1, Oracle Linux отключает rpmconf.
+5. Сохранение KESL — остановка только если задача была запущена, гарантированный запуск в always.
+6. Накопление ядер — Ubuntu удаляет пакеты linux-image-*, OL настраивает installonly_limit=2 и вызывает dnf remove --oldinstallonly.
+7. Сетевые предупреждения sftp — (опционально) добавьте в ansible.cfg:
+   ```ini
+   [ssh_connection]
+   scp_if_ssh = True
+   ```
