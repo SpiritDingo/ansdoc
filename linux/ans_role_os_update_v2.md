@@ -1376,3 +1376,85 @@ ___
 · Сбор фактов вынесен в отдельную задачу перед set_fact, чтобы избежать проблемы с асинхронным обновлением фактов.
 
 После этого роль будет снимать удержание только с тех пакетов, которые реально установлены, и не будет падать на отсутствующих пакетах (как в случае с linux-headers-...-gke и ...-azure на ваших серверах).
+
+_____
+
+
+Ошибка на скриншоте — это не сбой сети и не поломка роли, а классическая ситуация, когда роль корректно ждёт освобождения блокировки dpkg, но на целевых хостах в этот момент уже работает фоновое обновление.
+
+Сообщения sftp transfer mechanism failed — это лишь предупреждение о резервном методе копирования файлов (Ansible переключается на scp), оно не ломает обновление. Основная проблема — таймаут ожидания dpkg.
+
+🔍 Почему происходит таймаут блокировки
+
+1. Фоновые обновления Ubuntu: на серверах работают таймеры unattended-upgrades (apt-daily.timer, apt-daily-upgrade.timer), которые удерживают dpkg долгое время. Ваша проверка fuser видит активный процесс и начинает ждать.
+2. Слишком короткое окно ожидания: 60 попыток по 5 секунд дают всего 5 минут. Установка обновлений безопасности (особенно ядра) может занимать больше времени.
+3. Неэффективный цикл: конструкция с until: dpkg_lock_check.rc != 0 может работать нестабильно, если fuser завершается с кодом 0 даже при отсутствии блокировки (например, из-за прав доступа).
+
+🛠️ Исправление в tasks/debian.yml
+
+Замените блок Wait for dpkg locks to be released на следующий, а также добавьте lock_timeout в модули apt:
+
+```yaml
+- name: Wait for dpkg locks to be released
+  ansible.builtin.shell: |
+    set -o pipefail
+    while fuser /var/lib/dpkg/lock-frontend \
+                /var/lib/dpkg/lock \
+                /var/cache/apt/archives/lock >/dev/null 2>&1; do
+      sleep 5
+    done
+  register: dpkg_lock_wait
+  retries: 120           # 120 * 10 сек = 20 минут
+  delay: 10
+  until: dpkg_lock_wait.rc == 0
+  changed_when: false
+  failed_when: false
+```
+
+И добавьте lock_timeout в задачи Update apt cache before upgrade и Upgrade all packages:
+
+```yaml
+- name: Update apt cache before upgrade
+  ansible.builtin.apt:
+    update_cache: yes
+    cache_valid_time: 0
+    dpkg_options: "{{ os_update_dpkg_options }}"
+    lock_timeout: 300          # <-- ключевое добавление
+  register: apt_update_result
+  until: apt_update_result is success
+  retries: 10
+  delay: 30
+
+- name: Upgrade all packages
+  ansible.builtin.apt:
+    upgrade: "{{ os_update_apt_upgrade_type }}"
+    update_cache: no
+    autoremove: yes
+    dpkg_options: "{{ os_update_dpkg_options }}"
+    lock_timeout: 600          # <-- ключевое добавление
+  register: apt_upgrade_result
+  until: apt_upgrade_result is success
+  retries: 10
+  delay: 30
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+```
+
+lock_timeout передаёт apt опцию -o DPkg::Lock::Timeout=..., и apt сам ждёт освобождения блокировки вместо мгновенного падения.
+
+⚙️ Устранение предупреждений sftp
+
+Чтобы убрать предупреждения, добавьте в ansible.cfg (или в переменные окружения):
+
+```ini
+[ssh_connection]
+scp_if_ssh = True
+```
+
+Это заставит Ansible сразу использовать scp вместо sftp, что часто работает стабильнее на серверах с нестандартной конфигурацией SSH.
+
+💡 Дополнительная рекомендация
+
+Если обновления выполняются на многих хостах одновременно, добавьте serial: 1 (или serial: 10%) в плейбук — это снизит конкуренцию за блокировки на каждом хосте.
+
+После этих изменений роль будет ждать до 20 минут снятия блокировки и не упадёт, если фоновое обновление затянется.
