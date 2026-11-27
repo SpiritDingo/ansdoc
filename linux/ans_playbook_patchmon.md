@@ -8,7 +8,7 @@
   hosts: all
   become: yes
   vars:
-    patchmon_url: "https://patchmon.nizhpharm.ru"
+    patchmon_url: "https://patchmon.server.ru"
     patchmon_token_key: "patchmon_ae_..."  # Подставьте полный ключ из ссылки
     patchmon_token_secret: "..."           # Секрет (если требуется, см. примечание ниже)
 
